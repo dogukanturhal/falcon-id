@@ -1,0 +1,36 @@
+{{- if .Values.linkerd.policy.enabled }}
+---
+# AuthorizationPolicy — grants access to the Server for requests that
+# satisfy ANY ONE of the referenced requiredAuthenticationRefs.
+#
+# With two refs (MeshTLSAuthentication + NetworkAuthentication), a
+# request is allowed if EITHER:
+#   - it carries a valid mTLS identity listed in allowed-callers, OR
+#   - it originates from the kubelet probe CIDR.
+#
+# The Server's accessPolicy determines what happens to requests that
+# fail both refs:
+#   - audit: log authz.name=audit (observation mode, default)
+#   - deny:  return HTTP 403 (enforcement mode, post-observation)
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-authz
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ include "falcon-id.fullname" . }}-http
+  requiredAuthenticationRefs:
+    - group: policy.linkerd.io
+      kind: MeshTLSAuthentication
+      name: {{ include "falcon-id.fullname" . }}-allowed-callers-ns
+    {{- if .Values.linkerd.policy.allowKubeletProbes }}
+    - group: policy.linkerd.io
+      kind: NetworkAuthentication
+      name: {{ include "falcon-id.fullname" . }}-probe-network
+    {{- end }}
+{{- end }}

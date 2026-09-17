@@ -1,0 +1,38 @@
+{{- /*
+  Linkerd Server — pprof
+  Defines :6060 (the Go runtime profiling listener) as a meshed surface
+  that the AuthorizationPolicy in authorizationpolicy-pprof.yaml gates.
+
+  Why a dedicated Server CR rather than reusing the falcon-id app Server:
+  pprof is a different trust tier (operator debugging) and must be
+  reachable by a different SA set than the public OAuth port. Two
+  Server CRs = two independent AuthzPolicy bindings.
+
+  proxyProtocol: HTTP/1
+  Same rationale as templates/server.yaml — the Go runtime/pprof
+  package serves plaintext HTTP/1.1, so declaring HTTP/2 would force
+  the Linkerd proxy down the wrong codepath. (See server.yaml header
+  for the prior incident that motivated this comment.)
+*/ -}}
+{{- if and .Values.pprof.enabled .Values.linkerd.policy.enabled }}
+apiVersion: policy.linkerd.io/v1beta3
+kind: Server
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-pprof
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+    falcon-id.hexxlock.com/surface: pprof
+spec:
+  port: pprof
+  proxyProtocol: HTTP/1
+  # Default to deny — only the SAs listed in the companion
+  # AuthorizationPolicy can reach :6060. No audit phase here: pprof is
+  # a fresh internal-only surface with zero current callers, so audit
+  # would just leak debug requests through unblocked. Audit is the
+  # right pattern for migrating an existing surface, not standing up
+  # a new one.
+  accessPolicy: deny
+  podSelector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+{{- end }}

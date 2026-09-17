@@ -1,0 +1,38 @@
+{{- if .Values.serviceMonitor.enabled -}}
+# Prometheus scrape config for falcon-id's /metrics endpoint.
+#
+# Lives in the same namespace as the Service so no cross-namespace RBAC is
+# required. The `release: kube-prometheus-stack` label matches the selector
+# on the deployed Prometheus instance so this resource is picked up
+# automatically by the operator — no manual apply needed.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+    # MUST match the `serviceMonitorSelector` on the Prometheus CR.
+    # kube-prometheus-stack sets this to `release=<release-name>` by default.
+    release: {{ .Values.serviceMonitor.prometheusRelease | default "kube-prometheus-stack" | quote }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace | quote }}
+  selector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval | default "30s" | quote }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout | default "10s" | quote }}
+      {{- with .Values.serviceMonitor.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.serviceMonitor.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end -}}

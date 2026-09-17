@@ -1,0 +1,69 @@
+{{- if .Values.apisix.routeSync.enabled }}
+# PostSync Job that pushes falcon-id routes to the APISIX Admin API.
+# Workaround for the APISIX Ingress Controller v2.0.1 bug where CRDs
+# are not always reconciled.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-route-sync
+  namespace: apisix
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: sync
+          # Explicit docker.io/ prefix — Kyverno restrict-image-registries
+          # mutation rule (normalize-image-references, FF6) auto-gens for
+          # Pod kind only; Job specs reach the validate rule with the
+          # bare name unchanged and get rejected. Using the canonical
+          # `docker.io/` form sidesteps the auto-gen gap entirely.
+          # Surfaced 2026-05-04 during phase-2b MR4 e2e: Argo couldn't
+          # apply the Job because Kyverno blocked admission.
+          image: docker.io/curlimages/curl:latest
+          command: ["sh", "-c"]
+          args:
+            - |
+              ADMIN_KEY=$(cat /etc/apisix-admin/admin)
+              APISIX_URL="{{ .Values.apisix.adminUrl }}"
+              SVC="{{ include "falcon-id.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
+              {{- if .Values.apisix.routes.enabled }}
+              # Consolidated id.hexxlock.com routes
+              curl -s -X PUT "$APISIX_URL/apisix/admin/routes/{{ include "falcon-id.fullname" . }}-discovery" \
+                -H "X-API-KEY: $ADMIN_KEY" -H "Content-Type: application/json" \
+                -d "{\"uri\":\"/.well-known/*\",\"host\":\"{{ .Values.apisix.routes.host }}\",\"priority\":10,\"upstream\":{\"type\":\"roundrobin\",\"nodes\":{\"$SVC\":1}}}"
+              curl -s -X PUT "$APISIX_URL/apisix/admin/routes/{{ include "falcon-id.fullname" . }}-health" \
+                -H "X-API-KEY: $ADMIN_KEY" -H "Content-Type: application/json" \
+                -d "{\"uris\":[\"/health\",\"/health/*\",\"/ready\"],\"host\":\"{{ .Values.apisix.routes.host }}\",\"priority\":10,\"upstream\":{\"type\":\"roundrobin\",\"nodes\":{\"$SVC\":1}}}"
+              curl -s -X PUT "$APISIX_URL/apisix/admin/routes/{{ include "falcon-id.fullname" . }}-routes" \
+                -H "X-API-KEY: $ADMIN_KEY" -H "Content-Type: application/json" \
+                -d "{\"uri\":\"/*\",\"host\":\"{{ .Values.apisix.routes.host }}\",\"priority\":5,\"upstream\":{\"type\":\"roundrobin\",\"nodes\":{\"$SVC\":1}}}"
+              {{- end }}
+              echo "Routes synced."
+          volumeMounts:
+            - name: admin-key
+              mountPath: /etc/apisix-admin
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            runAsUser: 100
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: admin-key
+          secret:
+            secretName: {{ .Values.apisix.adminKeySecret }}
+      nodeSelector:
+        hexxlock.com/tier: ops
+{{- end }}

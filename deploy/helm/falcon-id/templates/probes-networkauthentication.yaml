@@ -1,0 +1,31 @@
+{{- if and .Values.linkerd.policy.enabled .Values.linkerd.policy.allowKubeletProbes }}
+---
+# NetworkAuthentication for kubelet liveness/readiness probes.
+#
+# Kubelet probes do NOT originate from a meshed caller — they come from
+# the node's kubelet on the host network and hit the pod directly. They
+# cannot present a mesh identity, so MeshTLSAuthentication alone would
+# reject them and the pod would fail readiness → restart loop.
+#
+# The correct tier-1 pattern (Linkerd docs "Restricting Access To
+# Services") is a companion NetworkAuthentication matching the cluster's
+# pod-and-node CIDR, bound via a separate AuthorizationPolicy with the
+# same targetRef (the Server).
+#
+# probeCIDRs defaults to RFC1918 /8 ranges that the cluster's pod +
+# node network falls within. Tighten per-env in the GitOps repository
+# values if you know your exact CIDRs (e.g. 10.42.0.0/16 for pods +
+# 10.0.20.0/24 for nodes on this cluster).
+apiVersion: policy.linkerd.io/v1alpha1
+kind: NetworkAuthentication
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-probe-network
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  networks:
+    {{- range .Values.linkerd.policy.probeCIDRs }}
+    - cidr: {{ . | quote }}
+    {{- end }}
+{{- end }}

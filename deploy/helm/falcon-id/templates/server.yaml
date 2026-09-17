@@ -1,0 +1,42 @@
+{{- if .Values.linkerd.policy.enabled }}
+---
+# Linkerd Server — defines the HTTP surface of falcon-id for the mesh
+# policy machinery. Required before AuthorizationPolicy / MeshTLS /
+# Network authentications can reference a target.
+#
+# accessPolicy (Linkerd 2.16+):
+#   audit  — matching requests that violate the bound AuthorizationPolicy
+#            are logged (authz.name=audit) but NOT blocked. Tier-1
+#            migration pattern: roll out in audit, harvest logs for
+#            legitimate callers, then flip to deny.
+#   deny   — unmatched requests are rejected with HTTP 403. Target state
+#            after the audit observation window.
+#
+# proxyProtocol: HTTP/1
+#   falcon-id serves plaintext HTTP/1.1 on :8010. The app calls
+#   `http.Server{...}.ListenAndServe()` (cmd/main.go) without any
+#   `h2c.NewHandler` wrapping, so Go's net/http only auto-negotiates
+#   HTTP/2 over TLS via ALPN — which does NOT apply to the plaintext
+#   mesh port. A previous revision declared `proxyProtocol: HTTP/2`
+#   based on a misunderstanding of Go's h2c behaviour; that forced
+#   the Linkerd proxy down the HTTP/2 codepath, which failed to parse
+#   HTTP/1.1 request lines, which in turn motivated an imperative
+#   `config.linkerd.io/skip-inbound-ports: "8010"` workaround that
+#   bypassed the mesh entirely (no mTLS, no AuthzPolicy, no telemetry).
+#   Declaring HTTP/1 explicitly matches the wire protocol and lets
+#   the Linkerd proxy + Server CR policy machinery work as intended.
+apiVersion: policy.linkerd.io/v1beta3
+kind: Server
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-http
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+  port: http
+  proxyProtocol: HTTP/1
+  accessPolicy: {{ .Values.linkerd.policy.accessPolicy | default "audit" | quote }}
+{{- end }}

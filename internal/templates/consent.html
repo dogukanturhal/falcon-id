@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authorize — Falcon ID</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: linear-gradient(to bottom right, #f8fafc, #ffffff, #eef2ff);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            color: #020817;
+        }
+        .card {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            box-shadow: 0 20px 25px -5px rgba(2,8,23,0.06), 0 8px 10px -6px rgba(2,8,23,0.05);
+            padding: 40px;
+            width: 100%;
+            max-width: 440px;
+        }
+        .app-header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+        .app-logo {
+            width: 56px;
+            height: 56px;
+            border-radius: 12px;
+            margin-bottom: 12px;
+        }
+        .app-name {
+            font-size: 20px;
+            font-weight: 700;
+        }
+        .prompt {
+            text-align: center;
+            color: #64748b;
+            font-size: 15px;
+            margin-bottom: 24px;
+        }
+        .scopes {
+            list-style: none;
+            margin-bottom: 28px;
+        }
+        .scopes li {
+            padding: 10px 14px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .scopes li::before {
+            content: "\2713";
+            color: #34c759;
+            font-weight: 700;
+            font-size: 16px;
+        }
+        .actions {
+            display: flex;
+            gap: 12px;
+        }
+        .btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .btn-allow {
+            background: #2563eb;
+            color: #fff;
+        }
+        .btn-allow:hover { background: #1d4ed8; }
+        .btn-deny {
+            background: #e2e8f0;
+            color: #020817;
+        }
+        .btn-deny:hover { background: #d1d1d6; }
+        .branding-footer {
+            margin-top: 28px;
+            padding-top: 16px;
+            border-top: 1px solid #e2e8f0;
+            font-size: 12px;
+            color: #64748b;
+            text-align: center;
+            line-height: 1.6;
+        }
+        .branding-footer a {
+            color: #2563eb;
+            text-decoration: none;
+            margin: 0 4px;
+        }
+        .branding-footer a:hover { text-decoration: underline; }
+        .branding-footer .sep { color: #d1d1d6; margin: 0 4px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="app-header">
+            {{if .ClientLogo}}
+            <img class="app-logo" src="{{.ClientLogo}}" alt="{{.ClientName}}">
+            {{end}}
+            <div class="app-name">{{.ClientName}}</div>
+            {{if .ClientURI}}
+            <div style="font-size: 13px; color: #64748b; margin-top: 4px;">
+                <a href="{{.ClientURI}}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline;">{{.ClientURI}}</a>
+            </div>
+            {{end}}
+        </div>
+        <div class="prompt">wants to access your Falcon ID account</div>
+        <ul class="scopes">
+            {{range .Scopes}}
+            <li>{{.Description}}</li>
+            {{end}}
+        </ul>
+        <div class="actions">
+            <form method="POST" action="/oauth/consent" style="flex:1;display:flex;">
+                <input type="hidden" name="client_id" value="{{.ClientID}}">
+                <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+                <input type="hidden" name="scope" value="{{.Scope}}">
+                <input type="hidden" name="state" value="{{.State}}">
+                <input type="hidden" name="nonce" value="{{.Nonce}}">
+                <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
+                <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+                <input type="hidden" name="response_type" value="{{.ResponseType}}">
+                <input type="hidden" name="approved" value="false">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="btn btn-deny" style="width:100%;">Deny</button>
+            </form>
+            <form method="POST" action="/oauth/consent" style="flex:1;display:flex;">
+                <input type="hidden" name="client_id" value="{{.ClientID}}">
+                <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+                <input type="hidden" name="scope" value="{{.Scope}}">
+                <input type="hidden" name="state" value="{{.State}}">
+                <input type="hidden" name="nonce" value="{{.Nonce}}">
+                <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
+                <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+                <input type="hidden" name="response_type" value="{{.ResponseType}}">
+                <input type="hidden" name="approved" value="true">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="btn btn-allow" style="width:100%;">Allow</button>
+            </form>
+        </div>
+        {{if or .TosURL .PolicyURL .ContactEmail}}
+        <div class="branding-footer">
+            By continuing, you agree to {{.ClientName}}'s
+            {{if .TosURL}}<a href="{{.TosURL}}" target="_blank" rel="noopener noreferrer">Terms of Service</a>{{end}}
+            {{if and .TosURL .PolicyURL}}<span class="sep">·</span>{{end}}
+            {{if .PolicyURL}}<a href="{{.PolicyURL}}" target="_blank" rel="noopener noreferrer">Privacy Policy</a>{{end}}
+            {{if and (or .TosURL .PolicyURL) .ContactEmail}}<br>{{end}}
+            {{if .ContactEmail}}Contact: <a href="mailto:{{.ContactEmail}}">{{.ContactEmail}}</a>{{end}}
+        </div>
+        {{end}}
+    </div>
+</body>
+</html>

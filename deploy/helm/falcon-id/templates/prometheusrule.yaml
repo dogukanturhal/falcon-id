@@ -1,0 +1,486 @@
+{{- /*
+  PrometheusRule — independent alerting watchdog for falcon-id.
+
+  Why this is separate from the canary AnalysisTemplate:
+
+    The AnalysisTemplate (templates/analysistemplate.yaml) only runs
+    DURING a canary step — between rollout starts and ends. It cannot
+    detect a degradation that develops on a stable, non-rolling
+    deployment (e.g. a slow pgxpool drift from cert rotation, an
+    upstream PG slowdown). For those classes the right tool is a
+    Prometheus alert that fires whenever the success rate drops
+    below threshold, regardless of whether a rollout is in progress.
+
+  Why aggregate query (no pod-cohort filter):
+
+    Same rationale as the AnalysisTemplate — falcon-id /oauth/*
+    traffic is low (~4 req/h on /oauth/authorize). Pod-cohort
+    statistics aren't viable; aggregate is. Math: at full traffic,
+    a sustained drop below 99% means at least one cohort is
+    misbehaving on a non-trivial fraction of requests.
+
+  Why path coverage matches the AnalysisTemplate:
+
+    Single-source-of-truth for "what success looks like for the IdP".
+    If the canary gate uses oauth/auth + auth-login paths, the alert
+    watchdog should use the same set so the alert and the canary
+    converge on the same definition of healthy.
+
+  Doc: https://prometheus-operator.dev/docs/operator/api/#prometheusrule
+*/ -}}
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+    {{- if .Values.serviceMonitor.prometheusRelease }}
+    release: {{ .Values.serviceMonitor.prometheusRelease }}
+    {{- end }}
+spec:
+  groups:
+    - name: falcon-id.oauth
+      interval: 30s
+      rules:
+        # Catches the 2026-05-01 outage shape: every /oauth/authorize
+        # returning 4xx for sustained period. Threshold 0.99 over 10m,
+        # alert fires after 2m of sustained breach. PagerDuty severity
+        # critical because every product depends on this surface.
+        #
+        # Volume gate (`AND ... > 0.05 req/s`): at low traffic the ratio
+        # is dominated by individual failures — a single failed request
+        # in a window with ~10 successes drops the ratio to 0.909,
+        # tripping the alert despite the service being healthy. Verified
+        # live: /oauth/authorize sees ~4 req/h (header doc above), so a
+        # 10m window holds 0-2 samples. 0.05 req/s = ~30 req in 10m,
+        # which is the floor below which a 99% threshold isn't
+        # statistically meaningful. The companion FalconIdOAuthAuthorizeNoSuccess
+        # alert below covers the absolute-zero-success failure shape
+        # without needing a ratio.
+        - alert: FalconIdOAuthSuccessRateLow
+          expr: |
+            sum(rate(iam_http_requests_total{
+              service="{{ include "falcon-id.fullname" . }}",
+              namespace="{{ .Release.Namespace }}",
+              path=~"/oauth/(authorize|token|introspect|userinfo|revoke)|/api/v1/auth/(login|logout|refresh)",
+              status=~"2..|3.."
+            }[10m])) /
+            sum(rate(iam_http_requests_total{
+              service="{{ include "falcon-id.fullname" . }}",
+              namespace="{{ .Release.Namespace }}",
+              path=~"/oauth/(authorize|token|introspect|userinfo|revoke)|/api/v1/auth/(login|logout|refresh)"
+            }[10m])) < 0.99
+            and
+            sum(rate(iam_http_requests_total{
+              service="{{ include "falcon-id.fullname" . }}",
+              namespace="{{ .Release.Namespace }}",
+              path=~"/oauth/(authorize|token|introspect|userinfo|revoke)|/api/v1/auth/(login|logout|refresh)"
+            }[10m])) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+          annotations:
+            summary: "falcon-id OAuth success rate below 99% for 2m+"
+            description: |
+              Aggregate /oauth/* + /api/v1/auth/{login,logout,refresh} success rate
+              on falcon-id has been below 99% for at least 2 minutes. Every OIDC
+              relying party (Talon, ArgoCD, Grafana, Harbor, customer portal)
+              depends on this surface — a sustained drop here is a cluster-wide
+              IAM outage.
+              Diagnostic checklist:
+                1. /health/ready on each falcon-id pod — which dependency unhealthy?
+                2. /health/live-deep — is iam_oauth_clients reachable?
+                3. seq_scan / idx_scan counters on iam_oauth_clients (PG side) —
+                   are queries actually reaching the table?
+                4. ERROR-level logs in the pod for "OAuth client lookup failed" —
+                   surfaces the underlying pgx / SQLSTATE error since MR !94.
+              Runbook: docs/runbooks/oauth-success-rate-low.md
+        # Catches the failure mode that today's bug actually produced:
+        # zero successful /oauth/authorize for a sustained period.
+        # Distinct from the rate-based alert because at low traffic
+        # the rate alert needs ~30 req/10m before its 99% ratio is
+        # meaningful; this zero-success indicator fires much earlier.
+        #
+        # Volume floor (`>= 5`, was `> 0`): /oauth/authorize sees only
+        # ~4 req/h (see header), so a plain `> 0` fired critical on a
+        # SINGLE incidental 4xx landing in an otherwise-idle 10m window
+        # (a scanner/probe, or one misconfigured client with a bad
+        # redirect_uri). Verified 2026-07-19: the alert fired on windows
+        # holding exactly 1 request. Requiring >= 5 authorize attempts
+        # with ZERO successes means multiple independent flows are all
+        # failing — the real 2026-05-01 outage shape (RPs retry, so a
+        # genuine outage clears 5 easily) — while a lone bad request no
+        # longer pages. 5 stays well below the rate alert's ~30-req
+        # floor, so "fire faster at low traffic" is preserved: the
+        # 5..29 req/10m band is covered here, >=30 by the ratio alert.
+        - alert: FalconIdOAuthAuthorizeNoSuccess
+          expr: |
+            sum(increase(iam_http_requests_total{
+              service="{{ include "falcon-id.fullname" . }}",
+              namespace="{{ .Release.Namespace }}",
+              path="/oauth/authorize",
+              status=~"2..|3.."
+            }[10m])) == 0
+            and
+            sum(increase(iam_http_requests_total{
+              service="{{ include "falcon-id.fullname" . }}",
+              namespace="{{ .Release.Namespace }}",
+              path="/oauth/authorize"
+            }[10m])) >= 5
+          for: 1m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+          annotations:
+            summary: "falcon-id /oauth/authorize: zero successes across 5+ attempts in 10m"
+            description: |
+              /oauth/authorize saw at least 5 attempts in the last 10m but produced
+              zero successful (2xx/3xx) responses — multiple independent OAuth flows
+              are all failing. This is the literal shape of the 2026-05-01 outage —
+              a SQL drift / pool-broken / handler regression that turns every OAuth
+              flow into a 4xx. (The >= 5 floor keeps a lone incidental 4xx in an
+              idle window from paging; see the rule comment.)
+              Diagnostic: same checklist as FalconIdOAuthSuccessRateLow.
+
+    # ----------------------------------------------------------------- #
+    # OIDC Single Logout (BCL) — tier-1 SLO restoration alerts
+    # (Phase 6 of the 2026-05-10 plan).
+    #
+    # Three failure modes to watch:
+    #
+    # 1. Regression sentinel — Sign Out fan-out finds zero RPs to
+    #    notify on the platform tenant. This is the literal shape of
+    #    the 2026-05-07 fresh-initdb regression: BCL/FCL URIs lost
+    #    from iam_oauth_clients, NotifyLogout silently returns nil.
+    #    Page on-call: any non-zero rate on the platform tenant
+    #    means SLO is broken estate-wide.
+    #
+    # 2. Outbox dead row — drainer transitioned a row to
+    #    status='dead' (retry budget exhausted or non-retryable 4xx).
+    #    Each dead row = one user-session not propagated to one RP =
+    #    real partial-logout audit risk on the privileged-tools
+    #    estate. Page on-call.
+    #
+    # 3. Outbox queue depth — drainer can't keep up. Indicates
+    #    receiver outage or drainer crash-loop. Warn at 50 sustained.
+    # ----------------------------------------------------------------- #
+        - alert: FalconIdSLOZeroFanOut
+          expr: |
+            sum by (tenant_id) (rate(iam_oauth_bcl_no_clients_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+            slo: bcl
+          annotations:
+            summary: "falcon-id BCL: Sign Out fan-out found zero RPs"
+            description: |
+              tenant_id={{`{{ $labels.tenant_id }}`}} reached the OP-side BCL
+              fan-out path in the last 5m but had ZERO RPs registered with a
+              backchannel_logout_uri. This is the literal shape of the
+              2026-05-07 fresh-initdb regression — iam_oauth_clients lost
+              its BCL URI seed.
+
+              Recovery: bumping rotationGeneration on the falcon-id Argo App
+              forces the bootstrapOAuthClientSLOSeed boot hook to re-run
+              and converge the URIs from oauthClientSLOSeedMatrix.
+
+              Refs:
+                docs/audits/2026-05-10-slo-bcl-fcl-regression.md
+                cmd/oauth_client_slo_bootstrap.go
+                docs/security/slo-compensating-controls.md (in platform monorepo)
+
+        - alert: FalconIdSLOOutboxDeadRow
+          expr: |
+            sum by (rp_client_id) (increase(iam_oauth_bcl_outbox_dead_total[10m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+            slo: bcl
+          annotations:
+            summary: "falcon-id BCL outbox: row entered terminal dead state"
+            description: |
+              rp_client_id={{`{{ $labels.rp_client_id }}`}} had at least one
+              outbox row exhaust the retry budget (1s/5s/30s/5m/30m,
+              5 retries) or be rejected with a non-retryable 4xx in the
+              last 10m. Each dead row is one user session NOT propagated
+              to one RP — partial-logout audit risk.
+
+              Diagnostic:
+                psql ... -c "SELECT id, sub, sid, last_error, attempt_count
+                             FROM iam_oauth_logout_outbox
+                             WHERE rp_client_id='{{`{{ $labels.rp_client_id }}`}}'
+                               AND status='dead'
+                             ORDER BY created_at DESC LIMIT 10;"
+
+              Recovery: triage receiver health; if recoverable, manual UPDATE
+              status='pending', next_retry_at=now() to re-enqueue. NEVER mass-
+              transition dead → sent (loses audit signal).
+
+        - alert: FalconIdSLOOutboxQueueDeep
+          expr: |
+            iam_oauth_bcl_outbox_pending > 50
+          for: 10m
+          labels:
+            severity: warning
+            service: falcon-id
+            tier: identity
+            slo: bcl
+          annotations:
+            summary: "falcon-id BCL outbox queue depth >50 for 10m+"
+            description: |
+              Pending rows in iam_oauth_logout_outbox have exceeded 50 for
+              10+ minutes. The drainer ticks every 5s with a 50-row batch
+              size, so under steady state the queue should remain <50.
+
+              Likely causes:
+                1. A receiver is slow/unreachable (check
+                   iam_oauth_bcl_deliveries_total{status="timeout"|"server_error"}
+                   by client_id).
+                2. Drainer is crash-looping (check pod logs for
+                   BackchannelLogoutDrainer.drainOnce errors).
+                3. Advisory-lock contention with another replica (HA
+                   replicas=1 currently — should never trip).
+
+        - alert: FalconIdSLOFCLZeroFanOut
+          expr: |
+            sum by (tenant_id) (rate(iam_oauth_fcl_no_clients_total[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+            service: falcon-id
+            tier: identity
+            slo: fcl
+          annotations:
+            summary: "falcon-id FCL: Sign Out iframe pane found zero RPs"
+            description: |
+              tenant_id={{`{{ $labels.tenant_id }}`}} hit the FCL iframe-render
+              path with zero RPs registered. Less critical than BCL (FCL is the
+              browser-iframe path; BCL is the server-to-server path that does
+              the load-bearing cascade), but still indicates the same shape of
+              regression. Refs same as FalconIdSLOZeroFanOut.
+
+    # ---------------------------------------------------------------- #
+    #
+    # ZTNA Phase 6 — CAEP outbox + drainer
+    #
+    # Source: internal/metrics/caep_outbox.go
+    # Drainer: internal/services/caep_outbox_drainer.go
+    #
+    # These alerts MUST be in place BEFORE flipping
+    # CAEP_OUTBOX_ENABLED=true in any environment values.yaml. The
+    # drainer goroutine only spawns when the flag is true; the alerts
+    # exercise the metrics emitted by that goroutine. Flipping the
+    # flag without the alerts in place would be a tier-1 violation
+    # (memory: internal engineering notes).
+    #
+    # ---------------------------------------------------------------- #
+    - name: falcon-id.caep
+      interval: 30s
+      rules:
+        # Drainer-alive watchdog. iam_caep_outbox_drainer_iterations_total
+        # increments at least once per TickInterval (default 5s) so
+        # ANY 1-minute window MUST contain ≥ 12 increments. Rate 0
+        # for 60s means the goroutine is wedged (PG connection
+        # starvation, deadlock, signal-handler hang) or the deployment
+        # is down.
+        #
+        # Guard: alert is gated by FalconIdCAEPOutboxEnabled (below)
+        # because a healthy-zero state exists when CAEP_OUTBOX_ENABLED
+        # is false. The label-based gate matches drainer presence.
+        # FALSE-POSITIVE FIX 2026-07-31 — the previous expression was
+        #
+        #   rate(iam_caep_outbox_drainer_iterations_total[2m]) == 0
+        #   and on() iam_caep_outbox_drainer_iterations_total > 0
+        #
+        # and it fired PRECISELY BECAUSE ERRORS STOPPED HAPPENING.
+        #
+        # The counter is labelled by `outcome` (no_rows / error / ...)
+        # and by `pod`. The old expression grouped by neither:
+        #
+        #   * the left side evaluated per-series, so the `outcome="error"`
+        #     series matched `rate == 0` as soon as no NEW errors
+        #     occurred — which is the HEALTHY steady state;
+        #   * `and on()` joins on the EMPTY label set, so it is satisfied
+        #     if ANY series anywhere is > 0. It therefore never
+        #     constrained the match to the same pod, let alone the same
+        #     outcome.
+        #
+        # Net effect: one transient burst of drain errors permanently
+        # latches a CRITICAL alert, because the error counter freezes at
+        # a non-zero value and its rate goes to 0 forever. Observed live
+        # on 2026-07-31: pod n2729 carried outcome="error" = 13 (8 of
+        # them during a cluster-wide restart), zero errors in the
+        # following 15 minutes, and the alert fired continuously — while
+        # all three pods were ticking at exactly 0.2/s, i.e. one tick
+        # per 5s TickInterval, perfectly healthy.
+        #
+        # A critical alert that fires when a fault CLEARS is worse than
+        # no alert: it masks the real wedge it exists to catch.
+        #
+        # Fixed expression sums across outcomes and joins per-pod, which
+        # is what "the goroutine has not ticked" actually means: a pod
+        # whose drainer is alive contributes iterations under SOME
+        # outcome, so only a genuinely wedged pod sums to zero. The
+        # second clause keeps the original intent of not alerting on a
+        # drainer that has never started (CAEP_OUTBOX_ENABLED=false).
+        - alert: FalconIdCAEPOutboxDrainerStalled
+          expr: |
+            sum by (pod) (rate(iam_caep_outbox_drainer_iterations_total[2m])) == 0
+            and on (pod)
+            sum by (pod) (iam_caep_outbox_drainer_iterations_total) > 0
+          for: 1m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+            slo: caep_delivery
+            adr: "0040"
+          annotations:
+            summary: "falcon-id CAEP outbox drainer wedged (zero ticks)"
+            description: |
+              The CAEPOutboxDrainer goroutine has not ticked in the
+              last 2 minutes despite having ticked at some point since
+              boot. Expected cadence is one tick per TickInterval
+              (5s default). Investigate:
+                1) Pod logs for "CAEPOutboxDrainer.drainOnce" Warn lines
+                2) pg_locks for advisory lock = 0x6F61_6C6F_6361_6570 ("oalocaep") starvation
+                3) iam_caep_event_outbox table for pending row buildup
+              Runbook: refer to ADR 0040 Phase 6 §Operational expectations.
+
+        # Pending queue depth. At normal load the outbox should drain
+        # within one TickInterval (5s default × BatchSize 50 rows =
+        # 600 rows/min ceiling). Sustained > 50 (one batch worth)
+        # for 10 minutes means downstream receivers are slowing the
+        # drainer (timeouts dominate) or the row-insert rate is
+        # overrunning capacity.
+        - alert: FalconIdCAEPOutboxQueueDeep
+          expr: |
+            iam_caep_outbox_pending > 50
+          for: 10m
+          labels:
+            severity: warning
+            service: falcon-id
+            tier: identity
+            slo: caep_delivery
+            adr: "0040"
+          annotations:
+            summary: "falcon-id CAEP outbox queue depth sustained above batch size"
+            description: |
+              iam_caep_event_outbox pending count = {{`{{ $value }}`}}
+              has been above BatchSize (50) for 10m. Check:
+                1) Receiver health (Talon /events endpoint, RP-side SSF receivers)
+                2) Drainer tick duration: iam_caep_outbox_drainer_tick_seconds p99
+                3) attempt_count distribution in the outbox table
+              Likely cause: a receiver (Talon, accounts BFF, or one of the
+              external RPs) is responding slow → drainer per-row HTTP timeouts
+              eating tick budget. RFC 8935 §3 says deliver-and-forget; we
+              MUST NOT block the tick on a slow receiver.
+
+        # Dead-letter detector. ANY dead row is a tier-1 incident —
+        # the CAEP event will NEVER be delivered to the named receiver,
+        # which means a security-relevant identity-state transition was
+        # silently lost. The downstream effect depends on event_type:
+        #   - credential-change: stale session may persist past
+        #     password change (vault break-glass class)
+        #   - session-revoked: revoked session continues serving
+        #     (auth bypass class)
+        # Both classes warrant immediate page.
+        - alert: FalconIdCAEPOutboxDeadRow
+          expr: |
+            sum by (event_type, reason_class) (increase(iam_caep_outbox_dead_total[10m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+            slo: caep_delivery
+            adr: "0040"
+          annotations:
+            summary: "falcon-id CAEP outbox row dead-lettered (event_type={{`{{ $labels.event_type }}`}}, reason={{`{{ $labels.reason_class }}`}})"
+            description: |
+              {{`{{ $value | printf "%.0f" }}`}} CAEP event(s) of type
+              {{`{{ $labels.event_type }}`}} entered status='dead' in the last
+              10 minutes with reason_class={{`{{ $labels.reason_class }}`}}.
+
+              The named receiver(s) NEVER got these events. Each row is
+              persisted in iam_caep_event_outbox with status='dead' and
+              the originating subject (subject_iss + subject_sub) — use
+              that to identify affected users/sessions.
+
+              Reason classes:
+                http_4xx_nonretryable: receiver rejected the SET shape
+                retry_budget_exhausted: 5 attempts ≈ 35.6m, all failed
+                transport_permanent: DNS/cert/connect failure beyond budget
+                build_failure: SET construction (signing/payload) failed
+
+              Runbook actions:
+                1) Identify affected rows: SELECT id, target_uri, event_type, last_error
+                   FROM iam_caep_event_outbox WHERE status='dead' AND created_at > now() - interval '15 minutes';
+                2) Reach out to receiver operator if external RP
+                3) Decide replay strategy: receivers MUST deduplicate by jti
+                   so re-INSERTing the same payload with status='pending' is
+                   safe IF the original delivery is genuinely lost.
+
+        # Drainer tick latency. p99 above 10s for 5 minutes indicates
+        # the per-row HTTP delivery is hitting its 5s timeout
+        # frequently OR PG row-lock contention is stalling the tick.
+        # Soft warning; FalconIdCAEPOutboxDrainerStalled covers the
+        # hard-wedged case above.
+        - alert: FalconIdCAEPOutboxDrainerSlow
+          expr: |
+            histogram_quantile(0.99, sum(rate(iam_caep_outbox_drainer_tick_seconds_bucket[5m])) by (le)) > 10
+          for: 5m
+          labels:
+            severity: warning
+            service: falcon-id
+            tier: identity
+            slo: caep_delivery
+            adr: "0040"
+          annotations:
+            summary: "falcon-id CAEP drainer tick p99 > 10s"
+            description: |
+              The 99th percentile drainer tick duration over the last 5m
+              is {{`{{ $value | printf "%.1f" }}`}}s. Expected baseline is
+              sub-100ms (idle ticks) or sub-1s (drained ticks). Persistent
+              elevation suggests:
+                1) Receiver HTTP timeouts dominating the in-tx delivery loop
+                2) PG advisory-lock contention with another replica
+                3) pgxpool starvation
+              Investigate iam_caep_outbox_delivery_outcomes_total{outcome="retry"}
+              by event_type to identify which receiver is slowing the drainer.
+
+        # Build-failure detector. A non-zero build_error rate means
+        # the signing path (keys.ActiveKey + JWT construction) or the
+        # event_data unmarshal is failing. These are always falcon-id
+        # bugs (not receiver-side) — page on first occurrence.
+        - alert: FalconIdCAEPOutboxBuildFailure
+          expr: |
+            sum(increase(iam_caep_outbox_delivery_outcomes_total{outcome="build_error"}[5m])) > 0
+          for: 1m
+          labels:
+            severity: critical
+            service: falcon-id
+            tier: identity
+            slo: caep_delivery
+            adr: "0040"
+          annotations:
+            summary: "falcon-id CAEP SET build failure — signer/payload bug"
+            description: |
+              {{`{{ $value | printf "%.0f" }}`}} CAEP outbox row(s) failed
+              SET construction in the last 5m. This is ALWAYS a falcon-id
+              bug (keys.ActiveKey error, malformed event_data, or signing
+              path regression). Receivers were never contacted.
+
+              Check pod logs for: "CAEPOutboxDrainer.deliverRow" or
+              "buildSET" Error lines. Cross-check the keys subsystem
+              health via iam_oauth_* signer alerts.
+{{- end }}

@@ -1,0 +1,107 @@
+{{- if .Values.keystoneMigrationGate.enabled }}
+---
+# ---------------------------------------------------------------------------
+# Keystone migration deploy-ordering gate (Argo CD PreSync hook)
+# ---------------------------------------------------------------------------
+# Fail-closed guard for the 2026-07-21 OAuth migration-gap P1 outage.
+#
+# falcon-id's schema migrations are applied in production by the Keystone
+# MigrationBundle operator (GitOps via the SEPARATE the GitOps repository repo),
+# NOT by this workload. Every bundle header mandates the deploy-ordering rule:
+# apply the bundle FIRST, verify, THEN roll the code. The a52ed36 merge broke
+# that rule — it shipped migration 0009 + code writing iam_oauth_tokens.
+# token_family_id but no bundle, so the column never existed and every
+# /oauth/token exchange 400'd cluster-wide.
+#
+# This PreSync Job runs BEFORE Argo syncs the falcon-id Rollout. It runs the
+# keystone-migration-gate binary baked into THIS release's image (so the check
+# uses the exact migration HEAD the incoming code was built against — the lock
+# is embedded via //go:embed) and asserts that HEAD bundle version is recorded
+# in the database's keystone_schema_migrations tracking table. If the schema is
+# behind the code, the gate exits non-zero, the PreSync hook fails, and Argo
+# ABORTS the sync — the new image never rolls. Argo retries on the next
+# reconcile, so once the bundle lands the deploy proceeds automatically.
+#
+# Scope note: this checks the PRIMARY (main) database reachable via DATABASE_URL
+# — the schema that carries iam_oauth_tokens for the platform realm where the
+# outage occurred. Fleet-wide per-tenant verification is a broader check tracked
+# in docs/adr/0001-keystone-migration-bundle-deploy-ordering.md.
+#
+# Lifecycle mirrors spicedb-schema-hook.yaml:
+#   - hook: PreSync
+#   - hook-delete-policy: BeforeHookCreation,HookSucceeded  (keep FAILED job for
+#     triage; prune stale failed job before the next attempt)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-keystone-migration-gate
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keystone-migration-gate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    # Run early among PreSync hooks — nothing else must depend on the code
+    # having rolled, and a fast fail here short-circuits the whole sync.
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  activeDeadlineSeconds: {{ .Values.keystoneMigrationGate.activeDeadlineSeconds | default 120 }}
+  backoffLimit: {{ .Values.keystoneMigrationGate.backoffLimit | default 2 }}
+  ttlSecondsAfterFinished: {{ .Values.keystoneMigrationGate.ttlSecondsAfterFinished | default 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "falcon-id.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: keystone-migration-gate
+      annotations:
+        # One-shot Job: opt out of the Linkerd data plane so the sidecar does
+        # not keep the Pod running after the gate exits (same rationale as the
+        # spicedb schema hook). The DB connection uses sslmode=require, so
+        # losing mTLS on this short PreSync window does not widen the threat
+        # model — the check only READS keystone_schema_migrations.
+        linkerd.io/inject: disabled
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "falcon-id.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecret }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keystone-migration-gate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+          # DATABASE_URL is projected into <fullname>-vault by the falcon-id
+          # ExternalSecret — the same Secret the main container consumes.
+          envFrom:
+            - secretRef:
+                name: {{ include "falcon-id.fullname" . }}-vault
+          command:
+            - ./keystone-migration-gate
+          args:
+            - --schema={{ .Values.keystoneMigrationGate.schema | default "public" }}
+            - --tracking-table={{ .Values.keystoneMigrationGate.trackingTable | default "keystone_schema_migrations" }}
+            - --timeout={{ .Values.keystoneMigrationGate.timeout | default "15s" }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits:   {cpu: 250m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

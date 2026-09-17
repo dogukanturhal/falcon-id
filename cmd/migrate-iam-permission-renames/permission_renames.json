@@ -1,0 +1,1534 @@
+[
+  {
+    "old": "accounting:bank-reconciliation:create",
+    "new": "accounting:bank_reconciliation:create"
+  },
+  {
+    "old": "accounting:bank-reconciliation:read",
+    "new": "accounting:bank_reconciliation:read"
+  },
+  {
+    "old": "accounting:cost-centers:read",
+    "new": "accounting:cost_centers:read"
+  },
+  {
+    "old": "accounting:exchange-rates:create",
+    "new": "accounting:exchange_rates:create"
+  },
+  {
+    "old": "accounting:exchange-rates:delete",
+    "new": "accounting:exchange_rates:delete"
+  },
+  {
+    "old": "accounting:exchange-rates:read",
+    "new": "accounting:exchange_rates:read"
+  },
+  {
+    "old": "accounting:exchange-rates:update",
+    "new": "accounting:exchange_rates:update"
+  },
+  {
+    "old": "accounting:fiscal-periods:read",
+    "new": "accounting:fiscal_periods:read"
+  },
+  {
+    "old": "accounting:journal-entries:create",
+    "new": "accounting:journal_entries:create"
+  },
+  {
+    "old": "accounting:journal-entries:read",
+    "new": "accounting:journal_entries:read"
+  },
+  {
+    "old": "accounting:journal-entries:reverse",
+    "new": "accounting:journal_entries:reverse"
+  },
+  {
+    "old": "accounting:tax-codes:create",
+    "new": "accounting:tax_codes:create"
+  },
+  {
+    "old": "accounting:tax-codes:delete",
+    "new": "accounting:tax_codes:delete"
+  },
+  {
+    "old": "accounting:tax-codes:read",
+    "new": "accounting:tax_codes:read"
+  },
+  {
+    "old": "accounting:tax-codes:update",
+    "new": "accounting:tax_codes:update"
+  },
+  {
+    "old": "car-rental:corporate-accounts:create",
+    "new": "car-rental:corporate_accounts:create"
+  },
+  {
+    "old": "car-rental:corporate-accounts:delete",
+    "new": "car-rental:corporate_accounts:delete"
+  },
+  {
+    "old": "car-rental:corporate-accounts:read",
+    "new": "car-rental:corporate_accounts:read"
+  },
+  {
+    "old": "car-rental:corporate-accounts:update",
+    "new": "car-rental:corporate_accounts:update"
+  },
+  {
+    "old": "car-rental:damage-reports:create",
+    "new": "car-rental:damage_reports:create"
+  },
+  {
+    "old": "car-rental:damage-reports:read",
+    "new": "car-rental:damage_reports:read"
+  },
+  {
+    "old": "car-rental:damage-reports:update",
+    "new": "car-rental:damage_reports:update"
+  },
+  {
+    "old": "car-rental:fee-rules:create",
+    "new": "car-rental:fee_rules:create"
+  },
+  {
+    "old": "car-rental:fee-rules:delete",
+    "new": "car-rental:fee_rules:delete"
+  },
+  {
+    "old": "car-rental:fee-rules:read",
+    "new": "car-rental:fee_rules:read"
+  },
+  {
+    "old": "car-rental:fee-rules:update",
+    "new": "car-rental:fee_rules:update"
+  },
+  {
+    "old": "car-rental:rate-plans:create",
+    "new": "car-rental:rate_plans:create"
+  },
+  {
+    "old": "car-rental:rate-plans:delete",
+    "new": "car-rental:rate_plans:delete"
+  },
+  {
+    "old": "car-rental:rate-plans:read",
+    "new": "car-rental:rate_plans:read"
+  },
+  {
+    "old": "car-rental:rate-plans:update",
+    "new": "car-rental:rate_plans:update"
+  },
+  {
+    "old": "car-rental:vehicle-categories:create",
+    "new": "car-rental:vehicle_categories:create"
+  },
+  {
+    "old": "car-rental:vehicle-categories:delete",
+    "new": "car-rental:vehicle_categories:delete"
+  },
+  {
+    "old": "car-rental:vehicle-categories:read",
+    "new": "car-rental:vehicle_categories:read"
+  },
+  {
+    "old": "car-rental:vehicle-categories:update",
+    "new": "car-rental:vehicle_categories:update"
+  },
+  {
+    "old": "cmms:condition-monitoring:create",
+    "new": "cmms:condition_monitoring:create"
+  },
+  {
+    "old": "cmms:condition-monitoring:delete",
+    "new": "cmms:condition_monitoring:delete"
+  },
+  {
+    "old": "cmms:condition-monitoring:read",
+    "new": "cmms:condition_monitoring:read"
+  },
+  {
+    "old": "cmms:condition-monitoring:update",
+    "new": "cmms:condition_monitoring:update"
+  },
+  {
+    "old": "cmms:job-plans:read",
+    "new": "cmms:job_plans:read"
+  },
+  {
+    "old": "cmms:maintenance-budgets:create",
+    "new": "cmms:maintenance_budgets:create"
+  },
+  {
+    "old": "cmms:maintenance-budgets:delete",
+    "new": "cmms:maintenance_budgets:delete"
+  },
+  {
+    "old": "cmms:maintenance-budgets:read",
+    "new": "cmms:maintenance_budgets:read"
+  },
+  {
+    "old": "cmms:maintenance-budgets:update",
+    "new": "cmms:maintenance_budgets:update"
+  },
+  {
+    "old": "cmms:maintenance-documents:create",
+    "new": "cmms:maintenance_documents:create"
+  },
+  {
+    "old": "cmms:maintenance-documents:delete",
+    "new": "cmms:maintenance_documents:delete"
+  },
+  {
+    "old": "cmms:maintenance-documents:read",
+    "new": "cmms:maintenance_documents:read"
+  },
+  {
+    "old": "cmms:maintenance-documents:update",
+    "new": "cmms:maintenance_documents:update"
+  },
+  {
+    "old": "cmms:maintenance-plans:create",
+    "new": "cmms:maintenance_plans:create"
+  },
+  {
+    "old": "cmms:maintenance-plans:delete",
+    "new": "cmms:maintenance_plans:delete"
+  },
+  {
+    "old": "cmms:maintenance-plans:read",
+    "new": "cmms:maintenance_plans:read"
+  },
+  {
+    "old": "cmms:maintenance-requests:create",
+    "new": "cmms:maintenance_requests:create"
+  },
+  {
+    "old": "cmms:maintenance-requests:delete",
+    "new": "cmms:maintenance_requests:delete"
+  },
+  {
+    "old": "cmms:maintenance-requests:read",
+    "new": "cmms:maintenance_requests:read"
+  },
+  {
+    "old": "cmms:maintenance-requests:update",
+    "new": "cmms:maintenance_requests:update"
+  },
+  {
+    "old": "cmms:safety-incidents:read",
+    "new": "cmms:safety_incidents:read"
+  },
+  {
+    "old": "cmms:safety-inspections:read",
+    "new": "cmms:safety_inspections:read"
+  },
+  {
+    "old": "cmms:spare-parts:admin",
+    "new": "cmms:spare_parts:admin"
+  },
+  {
+    "old": "cmms:spare-parts:read",
+    "new": "cmms:spare_parts:read"
+  },
+  {
+    "old": "cmms:vendor-performance:create",
+    "new": "cmms:vendor_performance:create"
+  },
+  {
+    "old": "cmms:vendor-performance:delete",
+    "new": "cmms:vendor_performance:delete"
+  },
+  {
+    "old": "cmms:vendor-performance:read",
+    "new": "cmms:vendor_performance:read"
+  },
+  {
+    "old": "cmms:vendor-performance:update",
+    "new": "cmms:vendor_performance:update"
+  },
+  {
+    "old": "cmms:work-order-comments:read",
+    "new": "cmms:work_order_comments:read"
+  },
+  {
+    "old": "cmms:work-order-sla:read",
+    "new": "cmms:work_order_sla:read"
+  },
+  {
+    "old": "cmms:work-orders:create",
+    "new": "cmms:work_orders:create"
+  },
+  {
+    "old": "cmms:work-orders:read",
+    "new": "cmms:work_orders:read"
+  },
+  {
+    "old": "cmms:work-permits:read",
+    "new": "cmms:work_permits:read"
+  },
+  {
+    "old": "cmms:work-shifts:create",
+    "new": "cmms:work_shifts:create"
+  },
+  {
+    "old": "cmms:work-shifts:read",
+    "new": "cmms:work_shifts:read"
+  },
+  {
+    "old": "crm:audit-logs:admin",
+    "new": "crm:audit_logs:admin"
+  },
+  {
+    "old": "crm:data-pipeline:create",
+    "new": "crm:data_pipeline:create"
+  },
+  {
+    "old": "crm:data-pipeline:read",
+    "new": "crm:data_pipeline:read"
+  },
+  {
+    "old": "crm:gdpr-requests:admin",
+    "new": "crm:gdpr_requests:admin"
+  },
+  {
+    "old": "crm:public-web-forms:create",
+    "new": "crm:public_web_forms:create"
+  },
+  {
+    "old": "fico:account-determination:create",
+    "new": "fico:account_determination:create"
+  },
+  {
+    "old": "fico:account-determination:delete",
+    "new": "fico:account_determination:delete"
+  },
+  {
+    "old": "fico:account-determination:read",
+    "new": "fico:account_determination:read"
+  },
+  {
+    "old": "fico:account-determination:update",
+    "new": "fico:account_determination:update"
+  },
+  {
+    "old": "fico:accounts-payable:create",
+    "new": "fico:accounts_payable:create"
+  },
+  {
+    "old": "fico:accounts-payable:manage_open_items",
+    "new": "fico:accounts_payable:manage_open_items"
+  },
+  {
+    "old": "fico:accounts-payable:manage_payment_runs",
+    "new": "fico:accounts_payable:manage_payment_runs"
+  },
+  {
+    "old": "fico:accounts-payable:read",
+    "new": "fico:accounts_payable:read"
+  },
+  {
+    "old": "fico:accounts-receivable:create",
+    "new": "fico:accounts_receivable:create"
+  },
+  {
+    "old": "fico:accounts-receivable:read",
+    "new": "fico:accounts_receivable:read"
+  },
+  {
+    "old": "fico:bank-statements:create",
+    "new": "fico:bank_statements:create"
+  },
+  {
+    "old": "fico:bank-statements:delete",
+    "new": "fico:bank_statements:delete"
+  },
+  {
+    "old": "fico:bank-statements:read",
+    "new": "fico:bank_statements:read"
+  },
+  {
+    "old": "fico:cost-centers:create",
+    "new": "fico:cost_centers:create"
+  },
+  {
+    "old": "fico:cost-centers:execute_allocation",
+    "new": "fico:cost_centers:execute_allocation"
+  },
+  {
+    "old": "fico:cost-centers:manage_activity_types",
+    "new": "fico:cost_centers:manage_activity_types"
+  },
+  {
+    "old": "fico:cost-centers:manage_overhead_rates",
+    "new": "fico:cost_centers:manage_overhead_rates"
+  },
+  {
+    "old": "fico:cost-centers:read",
+    "new": "fico:cost_centers:read"
+  },
+  {
+    "old": "fico:cost-centers:update",
+    "new": "fico:cost_centers:update"
+  },
+  {
+    "old": "fico:costing-sheets:create",
+    "new": "fico:costing_sheets:create"
+  },
+  {
+    "old": "fico:costing-sheets:delete",
+    "new": "fico:costing_sheets:delete"
+  },
+  {
+    "old": "fico:costing-sheets:read",
+    "new": "fico:costing_sheets:read"
+  },
+  {
+    "old": "fico:costing-sheets:update",
+    "new": "fico:costing_sheets:update"
+  },
+  {
+    "old": "fico:credit-management:read",
+    "new": "fico:credit_management:read"
+  },
+  {
+    "old": "fico:fixed-assets:create",
+    "new": "fico:fixed_assets:create"
+  },
+  {
+    "old": "fico:fixed-assets:depreciate",
+    "new": "fico:fixed_assets:depreciate"
+  },
+  {
+    "old": "fico:fixed-assets:manage_classes",
+    "new": "fico:fixed_assets:manage_classes"
+  },
+  {
+    "old": "fico:fixed-assets:read",
+    "new": "fico:fixed_assets:read"
+  },
+  {
+    "old": "fico:fixed-assets:update",
+    "new": "fico:fixed_assets:update"
+  },
+  {
+    "old": "fico:general-ledger:create",
+    "new": "fico:general_ledger:create"
+  },
+  {
+    "old": "fico:general-ledger:manage_subledger",
+    "new": "fico:general_ledger:manage_subledger"
+  },
+  {
+    "old": "fico:general-ledger:read",
+    "new": "fico:general_ledger:read"
+  },
+  {
+    "old": "fico:general-ledger:update",
+    "new": "fico:general_ledger:update"
+  },
+  {
+    "old": "fico:internal-orders:read",
+    "new": "fico:internal_orders:read"
+  },
+  {
+    "old": "fico:journal-entries:approve",
+    "new": "fico:journal_entries:approve"
+  },
+  {
+    "old": "fico:journal-entries:create",
+    "new": "fico:journal_entries:create"
+  },
+  {
+    "old": "fico:journal-entries:post",
+    "new": "fico:journal_entries:post"
+  },
+  {
+    "old": "fico:journal-entries:read",
+    "new": "fico:journal_entries:read"
+  },
+  {
+    "old": "fico:journal-entries:reverse",
+    "new": "fico:journal_entries:reverse"
+  },
+  {
+    "old": "fico:journal-entries:submit",
+    "new": "fico:journal_entries:submit"
+  },
+  {
+    "old": "fico:profit-centers:create",
+    "new": "fico:profit_centers:create"
+  },
+  {
+    "old": "fico:profit-centers:read",
+    "new": "fico:profit_centers:read"
+  },
+  {
+    "old": "fico:profit-centers:update",
+    "new": "fico:profit_centers:update"
+  },
+  {
+    "old": "finance:cash-flow-forecasts:actualize",
+    "new": "finance:cash_flow_forecasts:actualize"
+  },
+  {
+    "old": "finance:cash-flow-forecasts:create",
+    "new": "finance:cash_flow_forecasts:create"
+  },
+  {
+    "old": "finance:cash-flow-forecasts:read",
+    "new": "finance:cash_flow_forecasts:read"
+  },
+  {
+    "old": "finance:cash-flow-positions:create",
+    "new": "finance:cash_flow_positions:create"
+  },
+  {
+    "old": "finance:cash-flow-positions:read",
+    "new": "finance:cash_flow_positions:read"
+  },
+  {
+    "old": "finance:cash-flow-positions:update_balance",
+    "new": "finance:cash_flow_positions:update_balance"
+  },
+  {
+    "old": "finance:cash-flow-transfers:approve",
+    "new": "finance:cash_flow_transfers:approve"
+  },
+  {
+    "old": "finance:cash-flow-transfers:cancel",
+    "new": "finance:cash_flow_transfers:cancel"
+  },
+  {
+    "old": "finance:cash-flow-transfers:complete",
+    "new": "finance:cash_flow_transfers:complete"
+  },
+  {
+    "old": "finance:cash-flow-transfers:create",
+    "new": "finance:cash_flow_transfers:create"
+  },
+  {
+    "old": "finance:cash-flow-transfers:read",
+    "new": "finance:cash_flow_transfers:read"
+  },
+  {
+    "old": "finance:credit-notes:apply",
+    "new": "finance:credit_notes:apply"
+  },
+  {
+    "old": "finance:credit-notes:approve",
+    "new": "finance:credit_notes:approve"
+  },
+  {
+    "old": "finance:credit-notes:create",
+    "new": "finance:credit_notes:create"
+  },
+  {
+    "old": "finance:credit-notes:manage_items",
+    "new": "finance:credit_notes:manage_items"
+  },
+  {
+    "old": "finance:credit-notes:read",
+    "new": "finance:credit_notes:read"
+  },
+  {
+    "old": "finance:credit-notes:void",
+    "new": "finance:credit_notes:void"
+  },
+  {
+    "old": "finance:expense-categories:read",
+    "new": "finance:expense_categories:read"
+  },
+  {
+    "old": "finance:expense-policies:read",
+    "new": "finance:expense_policies:read"
+  },
+  {
+    "old": "finance:expense-reports:approve",
+    "new": "finance:expense_reports:approve"
+  },
+  {
+    "old": "finance:expense-reports:create",
+    "new": "finance:expense_reports:create"
+  },
+  {
+    "old": "finance:expense-reports:manage_items",
+    "new": "finance:expense_reports:manage_items"
+  },
+  {
+    "old": "finance:expense-reports:process",
+    "new": "finance:expense_reports:process"
+  },
+  {
+    "old": "finance:expense-reports:read",
+    "new": "finance:expense_reports:read"
+  },
+  {
+    "old": "finance:expense-reports:reject",
+    "new": "finance:expense_reports:reject"
+  },
+  {
+    "old": "finance:expense-reports:submit",
+    "new": "finance:expense_reports:submit"
+  },
+  {
+    "old": "finance:tax-jurisdictions:activate",
+    "new": "finance:tax_jurisdictions:activate"
+  },
+  {
+    "old": "finance:tax-jurisdictions:create",
+    "new": "finance:tax_jurisdictions:create"
+  },
+  {
+    "old": "finance:tax-jurisdictions:deactivate",
+    "new": "finance:tax_jurisdictions:deactivate"
+  },
+  {
+    "old": "finance:tax-jurisdictions:read",
+    "new": "finance:tax_jurisdictions:read"
+  },
+  {
+    "old": "finance:tax-jurisdictions:update",
+    "new": "finance:tax_jurisdictions:update"
+  },
+  {
+    "old": "finance:tax-payments:create",
+    "new": "finance:tax_payments:create"
+  },
+  {
+    "old": "finance:tax-payments:read",
+    "new": "finance:tax_payments:read"
+  },
+  {
+    "old": "finance:tax-payments:update",
+    "new": "finance:tax_payments:update"
+  },
+  {
+    "old": "finance:tax-rates:activate",
+    "new": "finance:tax_rates:activate"
+  },
+  {
+    "old": "finance:tax-rates:create",
+    "new": "finance:tax_rates:create"
+  },
+  {
+    "old": "finance:tax-rates:deactivate",
+    "new": "finance:tax_rates:deactivate"
+  },
+  {
+    "old": "finance:tax-rates:read",
+    "new": "finance:tax_rates:read"
+  },
+  {
+    "old": "finance:tax-rates:update",
+    "new": "finance:tax_rates:update"
+  },
+  {
+    "old": "finance:tax-returns:accept",
+    "new": "finance:tax_returns:accept"
+  },
+  {
+    "old": "finance:tax-returns:create",
+    "new": "finance:tax_returns:create"
+  },
+  {
+    "old": "finance:tax-returns:file",
+    "new": "finance:tax_returns:file"
+  },
+  {
+    "old": "finance:tax-returns:prepare",
+    "new": "finance:tax_returns:prepare"
+  },
+  {
+    "old": "finance:tax-returns:read",
+    "new": "finance:tax_returns:read"
+  },
+  {
+    "old": "finance:tax-returns:reject",
+    "new": "finance:tax_returns:reject"
+  },
+  {
+    "old": "finance:tax-returns:submit",
+    "new": "finance:tax_returns:submit"
+  },
+  {
+    "old": "finance:tax-returns:update",
+    "new": "finance:tax_returns:update"
+  },
+  {
+    "old": "hotel-pms:group-bookings:create",
+    "new": "hotel-pms:group_bookings:create"
+  },
+  {
+    "old": "hotel-pms:group-bookings:read",
+    "new": "hotel-pms:group_bookings:read"
+  },
+  {
+    "old": "hotel-pms:group-bookings:update",
+    "new": "hotel-pms:group_bookings:update"
+  },
+  {
+    "old": "hotel-pms:night-audit:create",
+    "new": "hotel-pms:night_audit:create"
+  },
+  {
+    "old": "hotel-pms:night-audit:read",
+    "new": "hotel-pms:night_audit:read"
+  },
+  {
+    "old": "hotel-pms:rate-plans:create",
+    "new": "hotel-pms:rate_plans:create"
+  },
+  {
+    "old": "hotel-pms:rate-plans:delete",
+    "new": "hotel-pms:rate_plans:delete"
+  },
+  {
+    "old": "hotel-pms:rate-plans:read",
+    "new": "hotel-pms:rate_plans:read"
+  },
+  {
+    "old": "hotel-pms:rate-plans:update",
+    "new": "hotel-pms:rate_plans:update"
+  },
+  {
+    "old": "hotel-pms:room-types:create",
+    "new": "hotel-pms:room_types:create"
+  },
+  {
+    "old": "hotel-pms:room-types:delete",
+    "new": "hotel-pms:room_types:delete"
+  },
+  {
+    "old": "hotel-pms:room-types:read",
+    "new": "hotel-pms:room_types:read"
+  },
+  {
+    "old": "hotel-pms:room-types:update",
+    "new": "hotel-pms:room_types:update"
+  },
+  {
+    "old": "hr:approval-callback:receive",
+    "new": "hr:approval_callback:receive"
+  },
+  {
+    "old": "hr:change-history:read",
+    "new": "hr:change_history:read"
+  },
+  {
+    "old": "hr:custom-fields:create",
+    "new": "hr:custom_fields:create"
+  },
+  {
+    "old": "hr:custom-fields:delete",
+    "new": "hr:custom_fields:delete"
+  },
+  {
+    "old": "hr:custom-fields:read",
+    "new": "hr:custom_fields:read"
+  },
+  {
+    "old": "hr:custom-fields:update",
+    "new": "hr:custom_fields:update"
+  },
+  {
+    "old": "hr:hcm-settings:create",
+    "new": "hr:hcm_settings:create"
+  },
+  {
+    "old": "hr:hcm-settings:delete",
+    "new": "hr:hcm_settings:delete"
+  },
+  {
+    "old": "hr:hcm-settings:read",
+    "new": "hr:hcm_settings:read"
+  },
+  {
+    "old": "hr:hcm-settings:update",
+    "new": "hr:hcm_settings:update"
+  },
+  {
+    "old": "hr:holiday-calendar:create",
+    "new": "hr:holiday_calendar:create"
+  },
+  {
+    "old": "hr:holiday-calendar:delete",
+    "new": "hr:holiday_calendar:delete"
+  },
+  {
+    "old": "hr:holiday-calendar:read",
+    "new": "hr:holiday_calendar:read"
+  },
+  {
+    "old": "hr:leave-enhancements:create",
+    "new": "hr:leave_enhancements:create"
+  },
+  {
+    "old": "hr:leave-enhancements:delete",
+    "new": "hr:leave_enhancements:delete"
+  },
+  {
+    "old": "hr:leave-enhancements:read",
+    "new": "hr:leave_enhancements:read"
+  },
+  {
+    "old": "hr:one-on-ones:create",
+    "new": "hr:one_on_ones:create"
+  },
+  {
+    "old": "hr:one-on-ones:delete",
+    "new": "hr:one_on_ones:delete"
+  },
+  {
+    "old": "hr:one-on-ones:read",
+    "new": "hr:one_on_ones:read"
+  },
+  {
+    "old": "hr:one-on-ones:update",
+    "new": "hr:one_on_ones:update"
+  },
+  {
+    "old": "hr:work-schedule:create",
+    "new": "hr:work_schedule:create"
+  },
+  {
+    "old": "hr:work-schedule:delete",
+    "new": "hr:work_schedule:delete"
+  },
+  {
+    "old": "hr:work-schedule:read",
+    "new": "hr:work_schedule:read"
+  },
+  {
+    "old": "inventory:abc-classification:read",
+    "new": "inventory:abc_classification:read"
+  },
+  {
+    "old": "inventory:abc-classification:recalculate",
+    "new": "inventory:abc_classification:recalculate"
+  },
+  {
+    "old": "inventory:abc-classification:update",
+    "new": "inventory:abc_classification:update"
+  },
+  {
+    "old": "inventory:cross-dock:create",
+    "new": "inventory:cross_dock:create"
+  },
+  {
+    "old": "inventory:cross-dock:read",
+    "new": "inventory:cross_dock:read"
+  },
+  {
+    "old": "inventory:cycle-counts:create",
+    "new": "inventory:cycle_counts:create"
+  },
+  {
+    "old": "inventory:cycle-counts:execute_physical_inventory",
+    "new": "inventory:cycle_counts:execute_physical_inventory"
+  },
+  {
+    "old": "inventory:cycle-counts:read",
+    "new": "inventory:cycle_counts:read"
+  },
+  {
+    "old": "inventory:movement-types:create",
+    "new": "inventory:movement_types:create"
+  },
+  {
+    "old": "inventory:movement-types:delete",
+    "new": "inventory:movement_types:delete"
+  },
+  {
+    "old": "inventory:movement-types:read",
+    "new": "inventory:movement_types:read"
+  },
+  {
+    "old": "inventory:movement-types:update",
+    "new": "inventory:movement_types:update"
+  },
+  {
+    "old": "inventory:purchase-orders:approve",
+    "new": "inventory:purchase_orders:approve"
+  },
+  {
+    "old": "inventory:purchase-orders:create",
+    "new": "inventory:purchase_orders:create"
+  },
+  {
+    "old": "inventory:purchase-orders:read",
+    "new": "inventory:purchase_orders:read"
+  },
+  {
+    "old": "inventory:purchase-orders:receive_callback",
+    "new": "inventory:purchase_orders:receive_callback"
+  },
+  {
+    "old": "inventory:stock-movements:create",
+    "new": "inventory:stock_movements:create"
+  },
+  {
+    "old": "inventory:stock-movements:delete",
+    "new": "inventory:stock_movements:delete"
+  },
+  {
+    "old": "inventory:stock-movements:read",
+    "new": "inventory:stock_movements:read"
+  },
+  {
+    "old": "invoicing:tax-rates:create",
+    "new": "invoicing:tax_rates:create"
+  },
+  {
+    "old": "invoicing:tax-rates:delete",
+    "new": "invoicing:tax_rates:delete"
+  },
+  {
+    "old": "invoicing:tax-rates:read",
+    "new": "invoicing:tax_rates:read"
+  },
+  {
+    "old": "invoicing:tax-rates:update",
+    "new": "invoicing:tax_rates:update"
+  },
+  {
+    "old": "marketing:ab-tests:create",
+    "new": "marketing:ab_tests:create"
+  },
+  {
+    "old": "marketing:ab-tests:delete",
+    "new": "marketing:ab_tests:delete"
+  },
+  {
+    "old": "marketing:ab-tests:update",
+    "new": "marketing:ab_tests:update"
+  },
+  {
+    "old": "marketing:ad-accounts:create",
+    "new": "marketing:ad_accounts:create"
+  },
+  {
+    "old": "marketing:ad-accounts:delete",
+    "new": "marketing:ad_accounts:delete"
+  },
+  {
+    "old": "marketing:ad-accounts:read",
+    "new": "marketing:ad_accounts:read"
+  },
+  {
+    "old": "marketing:ad-accounts:update",
+    "new": "marketing:ad_accounts:update"
+  },
+  {
+    "old": "marketing:ad-analytics:read",
+    "new": "marketing:ad_analytics:read"
+  },
+  {
+    "old": "marketing:ad-audiences:create",
+    "new": "marketing:ad_audiences:create"
+  },
+  {
+    "old": "marketing:ad-audiences:delete",
+    "new": "marketing:ad_audiences:delete"
+  },
+  {
+    "old": "marketing:ad-audiences:read",
+    "new": "marketing:ad_audiences:read"
+  },
+  {
+    "old": "marketing:ad-audiences:update",
+    "new": "marketing:ad_audiences:update"
+  },
+  {
+    "old": "marketing:ad-campaigns:read",
+    "new": "marketing:ad_campaigns:read"
+  },
+  {
+    "old": "marketing:ad-connector-status:read",
+    "new": "marketing:ad_connector_status:read"
+  },
+  {
+    "old": "marketing:ad-creatives:create",
+    "new": "marketing:ad_creatives:create"
+  },
+  {
+    "old": "marketing:ad-creatives:delete",
+    "new": "marketing:ad_creatives:delete"
+  },
+  {
+    "old": "marketing:ad-creatives:read",
+    "new": "marketing:ad_creatives:read"
+  },
+  {
+    "old": "marketing:ad-creatives:update",
+    "new": "marketing:ad_creatives:update"
+  },
+  {
+    "old": "marketing:ad-drafts:create",
+    "new": "marketing:ad_drafts:create"
+  },
+  {
+    "old": "marketing:ad-drafts:delete",
+    "new": "marketing:ad_drafts:delete"
+  },
+  {
+    "old": "marketing:ad-drafts:read",
+    "new": "marketing:ad_drafts:read"
+  },
+  {
+    "old": "marketing:ad-drafts:update",
+    "new": "marketing:ad_drafts:update"
+  },
+  {
+    "old": "marketing:ad-lead-forms:create",
+    "new": "marketing:ad_lead_forms:create"
+  },
+  {
+    "old": "marketing:ad-lead-forms:read",
+    "new": "marketing:ad_lead_forms:read"
+  },
+  {
+    "old": "marketing:ad-lead-forms:update",
+    "new": "marketing:ad_lead_forms:update"
+  },
+  {
+    "old": "marketing:ad-pixels:create",
+    "new": "marketing:ad_pixels:create"
+  },
+  {
+    "old": "marketing:ad-pixels:delete",
+    "new": "marketing:ad_pixels:delete"
+  },
+  {
+    "old": "marketing:ad-pixels:read",
+    "new": "marketing:ad_pixels:read"
+  },
+  {
+    "old": "marketing:ad-pixels:update",
+    "new": "marketing:ad_pixels:update"
+  },
+  {
+    "old": "marketing:ai-campaign-builder:create",
+    "new": "marketing:ai_campaign_builder:create"
+  },
+  {
+    "old": "marketing:ai-campaign-builder:read",
+    "new": "marketing:ai_campaign_builder:read"
+  },
+  {
+    "old": "marketing:ai-content:create",
+    "new": "marketing:ai_content:create"
+  },
+  {
+    "old": "marketing:ai-content:read",
+    "new": "marketing:ai_content:read"
+  },
+  {
+    "old": "marketing:channel-integrations:create",
+    "new": "marketing:channel_integrations:create"
+  },
+  {
+    "old": "marketing:channel-integrations:delete",
+    "new": "marketing:channel_integrations:delete"
+  },
+  {
+    "old": "marketing:channel-integrations:update",
+    "new": "marketing:channel_integrations:update"
+  },
+  {
+    "old": "marketing:click-tracking:create",
+    "new": "marketing:click_tracking:create"
+  },
+  {
+    "old": "marketing:click-tracking:read",
+    "new": "marketing:click_tracking:read"
+  },
+  {
+    "old": "marketing:cookie-consent-banner:create",
+    "new": "marketing:cookie_consent_banner:create"
+  },
+  {
+    "old": "marketing:cookie-consent-banner:delete",
+    "new": "marketing:cookie_consent_banner:delete"
+  },
+  {
+    "old": "marketing:cookie-consent-banner:update",
+    "new": "marketing:cookie_consent_banner:update"
+  },
+  {
+    "old": "marketing:frequency-cap:create",
+    "new": "marketing:frequency_cap:create"
+  },
+  {
+    "old": "marketing:frequency-cap:update",
+    "new": "marketing:frequency_cap:update"
+  },
+  {
+    "old": "marketing:push-notifications:create",
+    "new": "marketing:push_notifications:create"
+  },
+  {
+    "old": "marketing:push-notifications:delete",
+    "new": "marketing:push_notifications:delete"
+  },
+  {
+    "old": "marketing:push-notifications:read",
+    "new": "marketing:push_notifications:read"
+  },
+  {
+    "old": "marketing:social-accounts:create",
+    "new": "marketing:social_accounts:create"
+  },
+  {
+    "old": "marketing:social-accounts:delete",
+    "new": "marketing:social_accounts:delete"
+  },
+  {
+    "old": "marketing:social-accounts:read",
+    "new": "marketing:social_accounts:read"
+  },
+  {
+    "old": "marketing:social-accounts:update",
+    "new": "marketing:social_accounts:update"
+  },
+  {
+    "old": "marketing:social-posts:create",
+    "new": "marketing:social_posts:create"
+  },
+  {
+    "old": "marketing:social-posts:delete",
+    "new": "marketing:social_posts:delete"
+  },
+  {
+    "old": "marketing:social-posts:read",
+    "new": "marketing:social_posts:read"
+  },
+  {
+    "old": "marketing:social-posts:update",
+    "new": "marketing:social_posts:update"
+  },
+  {
+    "old": "marketing:workflow-templates:create",
+    "new": "marketing:workflow_templates:create"
+  },
+  {
+    "old": "marketing:workflow-templates:read",
+    "new": "marketing:workflow_templates:read"
+  },
+  {
+    "old": "mm:goods-receipts:cancel",
+    "new": "mm:goods_receipts:cancel"
+  },
+  {
+    "old": "mm:goods-receipts:create",
+    "new": "mm:goods_receipts:create"
+  },
+  {
+    "old": "mm:goods-receipts:inspect",
+    "new": "mm:goods_receipts:inspect"
+  },
+  {
+    "old": "mm:goods-receipts:post",
+    "new": "mm:goods_receipts:post"
+  },
+  {
+    "old": "mm:goods-receipts:read",
+    "new": "mm:goods_receipts:read"
+  },
+  {
+    "old": "mm:goods-receipts:reverse",
+    "new": "mm:goods_receipts:reverse"
+  },
+  {
+    "old": "mm:purchase-info-records:create",
+    "new": "mm:purchase_info_records:create"
+  },
+  {
+    "old": "mm:purchase-info-records:read",
+    "new": "mm:purchase_info_records:read"
+  },
+  {
+    "old": "mm:purchase-info-records:set_preferred",
+    "new": "mm:purchase_info_records:set_preferred"
+  },
+  {
+    "old": "mm:purchase-info-records:update",
+    "new": "mm:purchase_info_records:update"
+  },
+  {
+    "old": "mm:purchase-orders:approve",
+    "new": "mm:purchase_orders:approve"
+  },
+  {
+    "old": "mm:purchase-orders:cancel",
+    "new": "mm:purchase_orders:cancel"
+  },
+  {
+    "old": "mm:purchase-orders:close",
+    "new": "mm:purchase_orders:close"
+  },
+  {
+    "old": "mm:purchase-orders:confirm_delivery",
+    "new": "mm:purchase_orders:confirm_delivery"
+  },
+  {
+    "old": "mm:purchase-orders:create",
+    "new": "mm:purchase_orders:create"
+  },
+  {
+    "old": "mm:purchase-orders:manage_items",
+    "new": "mm:purchase_orders:manage_items"
+  },
+  {
+    "old": "mm:purchase-orders:read",
+    "new": "mm:purchase_orders:read"
+  },
+  {
+    "old": "mm:purchase-orders:reject",
+    "new": "mm:purchase_orders:reject"
+  },
+  {
+    "old": "mm:purchase-orders:send",
+    "new": "mm:purchase_orders:send"
+  },
+  {
+    "old": "mm:purchase-orders:submit",
+    "new": "mm:purchase_orders:submit"
+  },
+  {
+    "old": "mm:purchase-orders:update",
+    "new": "mm:purchase_orders:update"
+  },
+  {
+    "old": "mm:purchase-requisitions:convert_to_po",
+    "new": "mm:purchase_requisitions:convert_to_po"
+  },
+  {
+    "old": "mm:purchase-requisitions:create",
+    "new": "mm:purchase_requisitions:create"
+  },
+  {
+    "old": "mm:purchase-requisitions:read",
+    "new": "mm:purchase_requisitions:read"
+  },
+  {
+    "old": "mm:purchase-requisitions:update",
+    "new": "mm:purchase_requisitions:update"
+  },
+  {
+    "old": "mm:vendor-invoices:block",
+    "new": "mm:vendor_invoices:block"
+  },
+  {
+    "old": "mm:vendor-invoices:create",
+    "new": "mm:vendor_invoices:create"
+  },
+  {
+    "old": "mm:vendor-invoices:payment",
+    "new": "mm:vendor_invoices:payment"
+  },
+  {
+    "old": "mm:vendor-invoices:post",
+    "new": "mm:vendor_invoices:post"
+  },
+  {
+    "old": "mm:vendor-invoices:read",
+    "new": "mm:vendor_invoices:read"
+  },
+  {
+    "old": "mm:vendor-invoices:reject",
+    "new": "mm:vendor_invoices:reject"
+  },
+  {
+    "old": "mm:vendor-invoices:submit",
+    "new": "mm:vendor_invoices:submit"
+  },
+  {
+    "old": "mm:vendor-invoices:three_way_match",
+    "new": "mm:vendor_invoices:three_way_match"
+  },
+  {
+    "old": "mm:vendor-invoices:unblock",
+    "new": "mm:vendor_invoices:unblock"
+  },
+  {
+    "old": "mm:vendor-invoices:verify",
+    "new": "mm:vendor_invoices:verify"
+  },
+  {
+    "old": "plm:approval-callback:receive",
+    "new": "plm:approval_callback:receive"
+  },
+  {
+    "old": "plm:mass-changes:read",
+    "new": "plm:mass_changes:read"
+  },
+  {
+    "old": "plm:phase-gates:create",
+    "new": "plm:phase_gates:create"
+  },
+  {
+    "old": "plm:phase-gates:read",
+    "new": "plm:phase_gates:read"
+  },
+  {
+    "old": "plm:where-used:read",
+    "new": "plm:where_used:read"
+  },
+  {
+    "old": "pm:time-tracking:create",
+    "new": "pm:time_tracking:create"
+  },
+  {
+    "old": "pm:time-tracking:delete",
+    "new": "pm:time_tracking:delete"
+  },
+  {
+    "old": "pm:time-tracking:read",
+    "new": "pm:time_tracking:read"
+  },
+  {
+    "old": "pm:time-tracking:update",
+    "new": "pm:time_tracking:update"
+  },
+  {
+    "old": "ppscm:demand-planning:read",
+    "new": "ppscm:demand_planning:read"
+  },
+  {
+    "old": "ppscm:production-orders:create",
+    "new": "ppscm:production_orders:create"
+  },
+  {
+    "old": "ppscm:production-orders:delete",
+    "new": "ppscm:production_orders:delete"
+  },
+  {
+    "old": "ppscm:production-orders:manage_genealogy",
+    "new": "ppscm:production_orders:manage_genealogy"
+  },
+  {
+    "old": "ppscm:production-orders:pass_quality_gate",
+    "new": "ppscm:production_orders:pass_quality_gate"
+  },
+  {
+    "old": "ppscm:production-orders:read",
+    "new": "ppscm:production_orders:read"
+  },
+  {
+    "old": "ppscm:production-orders:report_scrap",
+    "new": "ppscm:production_orders:report_scrap"
+  },
+  {
+    "old": "ppscm:production-orders:update",
+    "new": "ppscm:production_orders:update"
+  },
+  {
+    "old": "ppscm:production-orders:view_genealogy",
+    "new": "ppscm:production_orders:view_genealogy"
+  },
+  {
+    "old": "ppscm:shop-floor:read",
+    "new": "ppscm:shop_floor:read"
+  },
+  {
+    "old": "ppscm:shop-floor:update",
+    "new": "ppscm:shop_floor:update"
+  },
+  {
+    "old": "ppscm:work-centers:create",
+    "new": "ppscm:work_centers:create"
+  },
+  {
+    "old": "ppscm:work-centers:delete",
+    "new": "ppscm:work_centers:delete"
+  },
+  {
+    "old": "ppscm:work-centers:manage_capacity",
+    "new": "ppscm:work_centers:manage_capacity"
+  },
+  {
+    "old": "ppscm:work-centers:read",
+    "new": "ppscm:work_centers:read"
+  },
+  {
+    "old": "ppscm:work-centers:update",
+    "new": "ppscm:work_centers:update"
+  },
+  {
+    "old": "qms:approval-callback:receive",
+    "new": "qms:approval_callback:receive"
+  },
+  {
+    "old": "qms:change-control:approve",
+    "new": "qms:change_control:approve"
+  },
+  {
+    "old": "qms:change-control:create",
+    "new": "qms:change_control:create"
+  },
+  {
+    "old": "qms:change-control:delete",
+    "new": "qms:change_control:delete"
+  },
+  {
+    "old": "qms:change-control:read",
+    "new": "qms:change_control:read"
+  },
+  {
+    "old": "qms:change-control:update",
+    "new": "qms:change_control:update"
+  },
+  {
+    "old": "qms:control-plans:approve",
+    "new": "qms:control_plans:approve"
+  },
+  {
+    "old": "qms:control-plans:create",
+    "new": "qms:control_plans:create"
+  },
+  {
+    "old": "qms:control-plans:delete",
+    "new": "qms:control_plans:delete"
+  },
+  {
+    "old": "qms:control-plans:read",
+    "new": "qms:control_plans:read"
+  },
+  {
+    "old": "qms:control-plans:update",
+    "new": "qms:control_plans:update"
+  },
+  {
+    "old": "qms:cost-of-quality:create",
+    "new": "qms:cost_of_quality:create"
+  },
+  {
+    "old": "qms:cost-of-quality:delete",
+    "new": "qms:cost_of_quality:delete"
+  },
+  {
+    "old": "qms:cost-of-quality:read",
+    "new": "qms:cost_of_quality:read"
+  },
+  {
+    "old": "qms:cost-of-quality:update",
+    "new": "qms:cost_of_quality:update"
+  },
+  {
+    "old": "qms:eight-d:approve",
+    "new": "qms:eight_d:approve"
+  },
+  {
+    "old": "qms:eight-d:create",
+    "new": "qms:eight_d:create"
+  },
+  {
+    "old": "qms:eight-d:delete",
+    "new": "qms:eight_d:delete"
+  },
+  {
+    "old": "qms:eight-d:read",
+    "new": "qms:eight_d:read"
+  },
+  {
+    "old": "qms:eight-d:update",
+    "new": "qms:eight_d:update"
+  },
+  {
+    "old": "qms:qms-audit-trail:read",
+    "new": "qms:qms_audit_trail:read"
+  },
+  {
+    "old": "qms:sampling-plans:read",
+    "new": "qms:sampling_plans:read"
+  },
+  {
+    "old": "qms:supplier-quality:approve",
+    "new": "qms:supplier_quality:approve"
+  },
+  {
+    "old": "qms:supplier-quality:create",
+    "new": "qms:supplier_quality:create"
+  },
+  {
+    "old": "qms:supplier-quality:read",
+    "new": "qms:supplier_quality:read"
+  },
+  {
+    "old": "qms:supplier-quality:update",
+    "new": "qms:supplier_quality:update"
+  },
+  {
+    "old": "sd:ai-insights:read",
+    "new": "sd:ai_insights:read"
+  },
+  {
+    "old": "sd:document-flow:read",
+    "new": "sd:document_flow:read"
+  },
+  {
+    "old": "sd:sales-orders:allocate_batch",
+    "new": "sd:sales_orders:allocate_batch"
+  },
+  {
+    "old": "sd:sales-orders:check_atp",
+    "new": "sd:sales_orders:check_atp"
+  },
+  {
+    "old": "sd:sales-orders:create",
+    "new": "sd:sales_orders:create"
+  },
+  {
+    "old": "sd:sales-orders:delete",
+    "new": "sd:sales_orders:delete"
+  },
+  {
+    "old": "sd:sales-orders:read",
+    "new": "sd:sales_orders:read"
+  },
+  {
+    "old": "sd:sales-orders:update",
+    "new": "sd:sales_orders:update"
+  },
+  {
+    "old": "sd:shipment-tracking:read",
+    "new": "sd:shipment_tracking:read"
+  },
+  {
+    "old": "sd:shipment-tracking:update",
+    "new": "sd:shipment_tracking:update"
+  },
+  {
+    "old": "travel-agency:credit-notes:create",
+    "new": "travel-agency:credit_notes:create"
+  },
+  {
+    "old": "travel-agency:credit-notes:read",
+    "new": "travel-agency:credit_notes:read"
+  },
+  {
+    "old": "travel-agency:markup-rules:create",
+    "new": "travel-agency:markup_rules:create"
+  },
+  {
+    "old": "travel-agency:markup-rules:delete",
+    "new": "travel-agency:markup_rules:delete"
+  },
+  {
+    "old": "travel-agency:markup-rules:read",
+    "new": "travel-agency:markup_rules:read"
+  },
+  {
+    "old": "travel-agency:markup-rules:update",
+    "new": "travel-agency:markup_rules:update"
+  },
+  {
+    "old": "travel-agency:supplier-payments:create",
+    "new": "travel-agency:supplier_payments:create"
+  },
+  {
+    "old": "travel-agency:supplier-payments:read",
+    "new": "travel-agency:supplier_payments:read"
+  }
+]

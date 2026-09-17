@@ -1,0 +1,15 @@
+apiVersion: v2
+name: falcon-id
+description: HexxLock identity plane — OIDC, JWT issuance, MFA, RBAC, authz via SpiceDB + OPA
+type: application
+version: 0.2.0
+appVersion: "0.1.0"
+maintainers:
+  - name: HexxLock Platform Team
+    email: platform@hexxlock.com
+keywords:
+  - identity
+  - oidc
+  - authentication
+  - authorization
+  - mfa

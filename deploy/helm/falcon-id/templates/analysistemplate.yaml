@@ -1,0 +1,314 @@
+{{- /*
+  Argo Rollouts AnalysisTemplate — canary 5xx-rate gate for falcon-id.
+
+  Referenced by the Rollout in templates/rollout.yaml when the canary
+  step list calls out an `analysis:` block referencing this template
+  by name.
+
+  Why server-error-only (Google SRE / Argo Rollouts canonical pattern,
+  2026-05-16 refactor from the prior 2xx+3xx success-rate design):
+
+    1. Google SRE Workbook ch. 16 "Canarying Releases" explicitly
+       carves out 4xx: "we can work around problems like this by
+       excluding 400-level codes from our canary evaluation."
+       https://sre.google/workbook/canarying-releases/
+       Keycloak's official SLI doc filters on outcome=SERVER_ERROR
+       only with a <0.1%/30d target.
+       https://www.keycloak.org/observability/keycloak-service-level-indicators
+
+       4xx responses from an IdP are LEGITIMATE client behavior at
+       baseline — bad credentials → 401, expired state → 400, missing
+       client_id → 400, scope mismatch → 400, csrf token miss → 403,
+       client-disconnect mid-request → 400/499. The prior 2xx|3xx
+       success-rate query treated all of these as failures, which
+       made the ratio drift around 0.98-0.99 on healthy steady-state
+       traffic. Canary aborts fired on baseline noise, not on real
+       regressions (verified 2026-05-16 — the prior MR-182 canary
+       aborted at result=0.9876 with zero new image-side defects;
+       same context-canceled 400s appeared in the stable pods).
+
+    2. The replacement signal is the 5xx server-error rate: failures
+       that the IdP itself attributes to its own code path (panics,
+       unhandled DB errors, dependency timeouts, OOM kills). These
+       are the canary-sensitive signal — a regression in the new
+       version manifests as 5xx, not 4xx.
+
+    3. failureCondition (hard abort, > 0.5%) is independent of
+       successCondition (soft floor, <= 0.1%) — this is the Akuity-
+       documented pattern: keep the green-zone tight, but only hard-
+       abort on genuinely catastrophic error rates so transient
+       Prometheus-side flakes don't trip the rollout. Akuity 2025:
+       https://akuity.io/blog/automating-blue-green-and-canary-deployments-with-argo-rollouts
+
+    4. consecutiveErrorLimit: tolerates Prometheus-side hiccups
+       (scrape failure, query timeout) without conflating them with
+       upstream errors. Same Akuity recommendation.
+
+    5. Aggregate query, no pod-hash filter (kept from prior design).
+       At our traffic volumes (~tens of /oauth/authorize per minute),
+       a 10% canary cohort serves too few requests for per-pod-hash
+       Prometheus aggregation to be statistically meaningful within
+       a 2-5min analysis window. The aggregate query CATCHES regressions
+       via dilution math: at 10% canary weight, a fully-broken canary
+       (100% 5xx) lifts aggregate 5xx-rate from baseline ~0.001 to
+       ~0.1 — well above the 0.5% hard-abort threshold. Partial
+       regressions (50% 5xx on the new pods) → ~5% aggregate, still
+       trips. Once cluster traffic is high enough to support per-pod-
+       hash statistics (~10x current /oauth/authorize qps), a future
+       MR will add `rollouts_pod_template_hash` filtering and a
+       canary-vs-stable delta metric as the Argo Rollouts canonical
+       pattern (issue #2706).
+       https://github.com/argoproj/argo-rollouts/discussions/2706
+
+    6. Path coverage spans the IdP success-path surface —
+       /oauth/(authorize|token|introspect|userinfo|revoke), JWKS,
+       and /api/v1/auth/(logout|refresh). /api/v1/auth/login is
+       EXCLUDED — bot scans + credential-stuffing concentrate
+       there and inflate the 4xx rate, and a regression on /login
+       surfaces on /oauth/token anyway (token-mint depends on
+       a successful login). Health/metrics endpoints also excluded
+       so probe traffic can't mask broken OAuth flow.
+
+    7. Window: rate() range is tied to `.Values.rollouts.canary.analysis.range`
+       (default 3m — see values.yaml), NOT hardcoded, and is sized to the
+       SHORTEST `pause:` in the step ladder (rollout.yaml's step-2 pause is
+       3m), not the longest. A window wider than the shortest pause means
+       part of every measurement's rate() lookback predates that step's
+       setWeight and still reflects the PRIOR (lower) canary weight — see
+       fix (b) below for the arithmetic that caught this.
+
+    8. FIXED 2026-09-06 (row t-486, two defects found in audit):
+
+       (a) FAIL-OPEN: the previous successCondition was
+           `len(result) == 0 || result[0] <= 0.001 || result[0] != result[0]`
+           while failureCondition was `len(result) > 0 && result[0] > 0.005`.
+           Both an empty Prometheus vector (broken query, relabeled/renamed
+           metric, ServiceMonitor down, ServiceMonitor never picked up the
+           canary pods) and genuine no-traffic look IDENTICAL to Prometheus
+           — `sum(rate(...))` over zero matching series returns an empty
+           vector in both cases, and clamp_min() does not rescue an empty
+           vector (it only floors non-empty scalars). The old
+           successCondition treated that empty vector as an automatic PASS,
+           so a broken metrics pipeline during a canary would sail every
+           sample straight to Successful with zero real observations —
+           the analysis gate would pass while blind. successCondition now
+           requires `len(result) > 0` before checking the threshold, and
+           failureCondition now explicitly fires on `len(result) == 0` or
+           NaN, so an absent/broken metric FAILS the analysis (counts
+           against failureLimit) instead of silently passing it. This
+           mirrors the community-documented fix for
+           https://github.com/argoproj/argo-rollouts/issues/1466 ("invert
+           the len(result) guard so empty means failure") rather than
+           inventing new thresholds, and makes successCondition symmetric
+           with the failureCondition guard style this file already used.
+           Near-zero-sample behavior with this fix: if the canary genuinely
+           receives zero requests in range, every sample FAILS (not
+           passes, not silently skipped) — after failureLimit=3 is
+           exceeded (4th failed sample) the rollout aborts. That is a
+           deliberate fail-closed choice: falcon-id is the auth tier, and
+           a canary step that received no traffic to evaluate has not
+           demonstrated it's safe, so it must not be waved through as
+           successful. (The 2026-05-07 false-abort-on-no-traffic incident
+           this fail-open code was originally written to fix is still
+           avoided in the common case: real no-traffic during an active
+           canary window is rare precisely because 10% traffic weight is
+           still routed there — see point 5 above; a step that truly gets
+           zero requests for its whole window now correctly resolves
+           Failed with a clear reason instead of a blind Successful.)
+
+       (b) WINDOW COULD NOT OBSERVE step 2: range was hardcoded to `[5m]`
+           in both halves of the query while rollout.yaml's step-2 pause
+           is only 3m (`pause: { duration: 3m }`). interval=30s/count=5
+           only govern how the AnalysisRun samples Prometheus — they do
+           NOT change what each sample's rate() window covers. With a
+           3-minute pause and a 5-minute rate() window, EVERY measurement
+           in step 2's AnalysisRun had a window reaching back 2 minutes
+           before setWeight:50 took effect, into step 1's 10%-weight
+           period — see values.yaml for the full arithmetic. Range is now
+           `.Values.rollouts.canary.analysis.range` (default 3m), matching
+           the SHORTER of the two pauses so every sample's window is fully
+           contained within the weight period it's meant to be observing,
+           at both steps.
+
+       (c) NUMERATOR STRUCTURALLY ABSENT, NOT LOW-VOLUME (fixed
+           2026-09-07, rows t-486/t-609): (a) made an absent Prometheus
+           result FAIL, on the theory that "no data" meant either a
+           genuinely quiet canary step or a broken metrics pipeline —
+           both real risks worth failing closed on. It missed a third
+           case: falcon-id has recorded ZERO 5xx responses on this path
+           set in its entire retention, so the `status=~"5.."` time
+           series has never been created (Prometheus creates series
+           lazily per label combination) and `sum(rate(...{status=~
+           "5.."}[3m]))` returns an EMPTY vector FOREVER, regardless of
+           how much total traffic exists — PromQL vector division drops
+           non-matching sides, so `empty / <anything, even a real
+           number>` is also empty. Verified live 2026-09-07: the
+           denominator (all-paths sum) was non-empty in all 481 samples
+           over the preceding 24h (min 0.02 req/s) while the numerator
+           alone was empty every time and `sum(increase(...{status=~
+           "5.."}[30d]))` returned no series at all. This is why
+           revisions 141 and 142 both aborted with "assessed Failed" —
+           not insufficient traffic (there was always something to
+           divide by), but a query that can structurally never resolve
+           to anything but empty while the service stays perfectly
+           healthy on this error class. No amount of widening the
+           window or raising traffic would have fixed it. The numerator
+           now reads `(sum(rate(...)) or vector(0))`: when the 5xx
+           series is absent, PromQL's `or` substitutes a literal 0
+           (definitely-zero-errors, a real measurement) instead of
+           leaving the query empty (could-not-measure). The moment a
+           real 5xx occurs, its series is created, `rate()` returns a
+           genuine non-zero value, and `or vector(0)`'s right side is
+           never reached — failure detection is unchanged. The
+           denominator intentionally keeps NO such fallback: an empty
+           denominator still means zero traffic hit any of these paths
+           for the whole window, which must still fail closed per (a).
+
+  Doc: https://argoproj.github.io/argo-rollouts/features/analysis/
+*/ -}}
+{{- if .Values.rollouts.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  # Name intentionally short / NOT fullname-prefixed because the
+  # Rollout's step list references this name as a string literal in
+  # values.yaml — `templateName: falcon-id-canary-success-rate`.
+  # AnalysisTemplate is namespace-scoped so collision is bounded to
+  # one falcon-id release per namespace, which is the model anyway.
+  # Name retained as `-success-rate` (the AT's role from a consumer
+  # perspective is unchanged — it's still the canary gate; the
+  # internal implementation switched from success-ratio to 5xx-rate).
+  name: falcon-id-canary-success-rate
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  args:
+    - name: service-name
+      value: {{ include "falcon-id.fullname" . | quote }}
+    - name: namespace
+      value: {{ .Release.Namespace | quote }}
+  metrics:
+    - name: oauth-5xx-rate
+      # interval — how often the metric is sampled during the canary
+      # step. 30s matches the default Prometheus scrape interval
+      # for the falcon-id ServiceMonitor.
+      interval: {{ .Values.rollouts.canary.analysis.interval | default "30s" }}
+      # count — total number of measurements the AnalysisRun takes
+      # before resolving Successful. 5 × 30s = 150s, fits the canary
+      # step pause budget with margin.
+      count: {{ .Values.rollouts.canary.analysis.count | default 5 }}
+      # successCondition — sample passes ONLY when data is present AND
+      # the aggregate 5xx-rate is at or below 0.1% (Keycloak/IdP-industry
+      # norm). `len(result) > 0` is REQUIRED — an empty Prometheus vector
+      # (broken query, renamed metric, ServiceMonitor down) must not be
+      # treated as a pass. clamp_min(...) in the PromQL below only
+      # protects against divide-by-zero on a NON-empty vector; it cannot
+      # rescue a query that returns no series at all. See file header
+      # item 8(a) (fixed 2026-09-06, row t-486) for the fail-open this
+      # replaced and why "no data" was NOT a safe default to treat as
+      # healthy on the auth tier.
+      successCondition: {{ .Values.rollouts.canary.analysis.successCondition | default "len(result) > 0 && result[0] <= 0.001" | quote }}
+      # failureCondition — independent hard-abort threshold. Fires if the
+      # metric is ABSENT/NaN (len(result) == 0 || result[0] != result[0])
+      # — an errored/absent metric must fail the analysis, not pass it —
+      # or if 5xx-rate spikes above 0.5%, abort immediately regardless of
+      # failureLimit. Keeps successCondition tight (gates "did we even
+      # ship a green rollout") while failureCondition catches actual prod
+      # outage shapes AND broken-observability shapes alike.
+      failureCondition: {{ .Values.rollouts.canary.analysis.failureCondition | default "len(result) == 0 || result[0] != result[0] || result[0] > 0.005" | quote }}
+      # failureLimit — consecutive samples below the successCondition
+      # before the canary aborts on soft signal. 3 × 30s = 90s.
+      failureLimit: {{ .Values.rollouts.canary.analysis.failureLimit | default 3 }}
+      # consecutiveErrorLimit — tolerate Prometheus-side flakes
+      # (scrape failure, query timeout) without conflating them with
+      # upstream falcon-id errors. Same Akuity recommendation.
+      consecutiveErrorLimit: {{ .Values.rollouts.canary.analysis.consecutiveErrorLimit | default 4 }}
+      provider:
+        prometheus:
+          address: {{ .Values.rollouts.canary.analysis.prometheusAddress | default "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090" | quote }}
+          # 5xx-rate = sum(5xx requests) / sum(all requests).
+          # clamp_min(denominator, 0.001) makes the ratio defined
+          # even at zero traffic (returns ~0, treat as healthy) WHEN
+          # the vector is non-empty — see successCondition/failureCondition
+          # above for the empty-vector (no series at all) case, which
+          # clamp_min cannot fix.
+          # Steady-state baseline is <0.0005 (we're well below
+          # the Keycloak <0.001 SLI target on the stable fleet);
+          # canary regressions in the 5xx surface trip the 0.005
+          # failureCondition quickly via the dilution math
+          # documented in the file header.
+          #
+          # Range is `.Values.rollouts.canary.analysis.range` (default
+          # 3m), NOT hardcoded — it MUST stay <= the shortest `pause:`
+          # in rollout.yaml's step ladder (currently 3m at step 2) so
+          # every sample's lookback window is fully contained within the
+          # weight period it's evaluating. See file header item 8(b)
+          # (fixed 2026-09-06, row t-486) for the arithmetic: a 5m window
+          # against a 3m pause pulled 2 of every 5 minutes from the PRIOR,
+          # lower canary weight.
+          #
+          # `or vector(0)` on the NUMERATOR ONLY (fixed 2026-09-07, row
+          # t-486/t-609, defect 8(c)): Prometheus creates a counter's
+          # time series lazily, per distinct label combination, the
+          # first time it is observed. falcon-id has recorded ZERO
+          # 5xx responses on this path set in its entire retention
+          # (confirmed via `sum(increase(...{status=~"5.."}[30d]))` ==
+          # empty result, live, 2026-09-07) — so the `status=~"5.."`
+          # series has NEVER been created, and
+          # `sum(rate(...{status=~"5.."}[3m]))` returns an EMPTY vector
+          # forever, independent of total traffic volume. PromQL vector
+          # division drops non-matching sides, so `empty / <anything>`
+          # is ALSO empty — the whole query resolves empty on every
+          # single measurement, tripping failureCondition's
+          # `len(result) == 0` and hard-failing the analysis every time,
+          # which is what stalled falcon-id's canary at revisions 141/142
+          # (t-609). This is NOT the traffic-volume problem it looked
+          # like: the DENOMINATOR (all-paths sum) was confirmed non-empty
+          # in every one of 481 samples over the preceding 24h (min
+          # 0.02 req/s, i.e. the aggregate query always has something to
+          # divide by) — only the 5xx-specific numerator is structurally
+          # absent, and would stay absent at ANY traffic volume for as
+          # long as the service keeps its current 0-observed-5xx record.
+          # Widening the window or raising traffic would not have fixed
+          # this. `or vector(0)` substitutes a literal 0 when the 5xx
+          # series is absent, so "definitely zero errors" now correctly
+          # resolves to ratio 0 (Successful) instead of being
+          # indistinguishable from "could not measure anything" (Failed).
+          # It does NOT weaken failure detection: the moment a real 5xx
+          # occurs, its label combination is created, `rate()` returns a
+          # real non-zero series, and the numerator's `or vector(0)`
+          # fallback is never reached (the left side of `or` already has
+          # a value, so PromQL never evaluates the right side). The
+          # DENOMINATOR is deliberately left WITHOUT this fallback: an
+          # empty denominator means literally no traffic at all hit any
+          # of these paths for the whole window, which (per 8(a)) must
+          # still fail closed rather than be waved through.
+          query: |
+            (
+              sum(
+                rate(
+                  iam_http_requests_total{
+                    service="{{ `{{args.service-name}}` }}",
+                    namespace="{{ `{{args.namespace}}` }}",
+                    path=~"/oauth/(authorize|token|introspect|userinfo|revoke|jwks)|/api/v1/auth/(logout|refresh)|/.well-known/jwks.json",
+                    status=~"5.."
+                  }[{{ .Values.rollouts.canary.analysis.range | default "3m" }}]
+                )
+              )
+              or vector(0)
+            )
+            /
+            clamp_min(
+              sum(
+                rate(
+                  iam_http_requests_total{
+                    service="{{ `{{args.service-name}}` }}",
+                    namespace="{{ `{{args.namespace}}` }}",
+                    path=~"/oauth/(authorize|token|introspect|userinfo|revoke|jwks)|/api/v1/auth/(logout|refresh)|/.well-known/jwks.json"
+                  }[{{ .Values.rollouts.canary.analysis.range | default "3m" }}]
+                )
+              ),
+              0.001
+            )
+{{- end }}

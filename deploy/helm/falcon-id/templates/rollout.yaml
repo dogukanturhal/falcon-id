@@ -1,0 +1,71 @@
+{{- /*
+  Argo Rollouts canary delivery for falcon-id.
+
+  Why a chart-level Rollout vs the default Deployment:
+    The 2026-05-01 OAuth outage shipped 100% in one cutover because
+    the chart was Deployment-based. With a canary strategy, the same
+    bug would have surfaced at 10% traffic — the AnalysisTemplate
+    queries Prometheus for /oauth/authorize success rate and
+    aborts the rollout if the canary's success rate falls below the
+    baseline. The single-pod outage would have been auto-rolled back
+    in <2 minutes instead of running for 4 hours.
+
+  Why `rollouts.enabled: false` is the chart default:
+    falcon-id is THE auth tier — every product depends on it. We do
+    not enable a brand-new rollout mechanism on the most critical
+    workload as a first user. Operators flip
+    rollouts.enabled=true in their environment overlay AFTER:
+      1. argo-rollouts controller is verified running in the cluster
+      2. The Prometheus successCondition has been validated against
+         prod traffic patterns (initial guess: 99% over 10m window —
+         validated 2026-05-01, lives in templates/analysistemplate.yaml)
+
+  Pod template parity with deployment.yaml:
+    The shared body lives in `define "falcon-id.podTemplate"` in
+    templates/_helpers.tpl. Both templates render the identical pod
+    spec — there is no duplication to drift.
+
+  Doc: https://argoproj.github.io/argo-rollouts/features/canary/
+*/ -}}
+{{- if .Values.rollouts.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+    {{- with .Values.deploymentAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+  strategy:
+    canary:
+      # Stable+canary services share the chart's existing Service —
+      # Argo Rollouts manages selector mutation between revisions.
+      # The chart does not declare a separate canary Service so the
+      # public id.hexxlock.com host transparently fronts both cohorts.
+      #
+      # Analysis is referenced via `analysis:` blocks inside the
+      # `steps:` list (see values.yaml — each step that gates on
+      # success rate names the AnalysisTemplate). The Rollout's
+      # spec.strategy.canary.analysis FIELD is NOT used here — that
+      # accepts only `{templates: [...]}` for background analysis,
+      # which conflicts with our step-gated approach. AnalysisTemplate
+      # configuration (interval, threshold, Prometheus address) lives
+      # in templates/analysistemplate.yaml driven by the same
+      # .Values.rollouts.canary.analysis values block.
+      {{- with .Values.rollouts.canary.steps }}
+      steps:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- include "falcon-id.podTemplate" . | nindent 2 }}
+{{- end }}
