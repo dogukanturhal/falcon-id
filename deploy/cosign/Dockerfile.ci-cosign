@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# syntax=docker/dockerfile:1.7
+#
+# ci-cosign — small alpine image with cosign + curl + ca-certificates
+# pre-installed for sign/verify jobs across falcon-id, talon, and any
+# other HexxLock repo that needs cosign at build time.
+#
+# Why this exists
+# ===============
+# Until 2026-06-06, the .install-cosign template in each repo's CI
+# downloaded cosign from github.com/sigstore/cosign/releases at every
+# job start. Repeated 504s from GitHub's release CDN (falcon-id master
+# pipelines #9243, #9246, #9269 today alone) blocked the sign:falcon-id
+# stage, which blocked the deploy chain. Same pattern in talon's
+# sign:talon + sign:tools + verify:* jobs.
+#
+# Tier-1 supply-chain principle: own the runtime image used to verify
+# the integrity of OTHER images. Don't trust GitHub's CDN at every job.
+# This image is pinned to a specific cosign version + alpine version,
+# rebuilt only when one of them rolls.
+#
+# Build + publish
+# ===============
+# This Dockerfile is built by hand (or by the build:ci-cosign job in
+# this repo's .gitlab-ci.yml on cosign upgrades — TBD) and pushed to
+# the real, live-referenced path (the .gitlab-ci.yml `image:` lines in
+# falcon-id and talon both pull from here — corrected 2026-09-08, the
+# registry.example.com/... path below was never the actual
+# push target):
+#
+#     internal.example.com/ci-tools/ci-cosign:v2.6.3
+#
+# Build:
+#     docker build --build-arg COSIGN_VERSION=v2.6.3 \
+#                  --build-arg COSIGN_SHA256=<see below> \
+#                  -t internal.example.com/ci-tools/ci-cosign:v2.6.3 \
+#                  -f deploy/cosign/Dockerfile.ci-cosign \
+#                  deploy/cosign
+# Push (after `docker login internal.example.com`):
+#     docker push internal.example.com/ci-tools/ci-cosign:v2.6.3
+#
+# Image is small (~40MB). Pull time from cluster ~2s warm, ~6s cold.
+# Compare to runtime-install pattern: ~5s when GitHub is healthy,
+# ∞ when GitHub is having a 504 incident (verified live today).
+#
+# Bumping cosign:
+#   1. Edit COSIGN_VERSION + COSIGN_SHA256 (paste from
+#      https://github.com/sigstore/cosign/releases verified release page).
+#   2. Rebuild + push under a NEW tag — do NOT overwrite an existing
+#      tag in place. talon's .gitlab-ci.yml pins the same repository
+#      at v2.4.1 across 4 job definitions; retagging in place would
+#      silently change talon's CI too. Publish the new version under
+#      its own tag and repoint only the consumer(s) that need it.
+#   3. Update the image: lines in the consuming repo's .gitlab-ci.yml
+#      to the new tag (single grep'able point per repo — see
+#      .install-cosign anchor removal in the same MR).
+#
+# 2026-09-08: bumped falcon-id to v2.6.3 (t-482) for a current,
+# reliably-releasing cosign build. NOTE: this is NOT to pick up
+# `--new-bundle-format` (cosign v2.6.0+) — that flag was investigated
+# and RULED OUT for this cluster: the deployed Kyverno (v1.13.0)
+# vendors cosign v2.4.0, and its only code path that can parse
+# new-bundle-format content (verifyImages[].type: SigstoreBundle)
+# unconditionally requires keyless/Fulcio identity verification,
+# which this cluster cannot do (Sigstore public-good egress is
+# blocked — see verify-cosign-signatures-example.yaml). falcon-id's
+# sign/verify jobs stay on cosign's plain/legacy signature +
+# attestation format end-to-end; see the t-482 root-cause comment on
+# sign:falcon-id in .gitlab-ci.yml for the full chain. talon
+# intentionally left on v2.4.1 in this change — out of scope,
+# untouched, still passing under its own Kyverno policies.
+
+ARG ALPINE_VERSION=3.20
+
+FROM mirror.gcr.io/library/alpine:${ALPINE_VERSION}
+
+# Pin to a verified release. Bump together. SHA-256 is from
+# https://github.com/sigstore/cosign/releases/download/v2.6.3/cosign_checksums.txt
+# (signed by sigstore's release key; verified out-of-band before this
+# Dockerfile lands).
+ARG COSIGN_VERSION=v2.6.3
+# SHA-256 verified out-of-band from
+# https://github.com/sigstore/cosign/releases/download/v2.6.3/cosign_checksums.txt
+# on 2026-09-08. Bumped from v2.4.1 for t-482: a current, reliable
+# cosign release — NOT for --new-bundle-format, which is deliberately
+# unused here (ruled out against this cluster's Kyverno v1.13.0; see
+# the note above and the sign:falcon-id root-cause comment in
+# .gitlab-ci.yml).
+ARG COSIGN_SHA256=7c78a7f2efc00088bd788a758db6e0928e79f3e0eb83eb5d3c499ed98da4c4f4
+
+LABEL org.opencontainers.image.title="ci-cosign" \
+      org.opencontainers.image.description="Pre-baked cosign + curl + ca-certificates for HexxLock CI sign/verify jobs" \
+      org.opencontainers.image.source="https://github.com/dogukanturhal/falcon-id" \
+      org.opencontainers.image.licenses="proprietary"
+
+RUN apk add --no-cache \
+        ca-certificates \
+        curl \
+        bash \
+ && curl -sSfL -o /usr/local/bin/cosign \
+      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+ && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
+ && chmod +x /usr/local/bin/cosign \
+ && cosign version
+
+# No USER directive — CI jobs run as root inside the runner container.
+# No ENTRYPOINT — GitLab CI scripts run via bash; image just provides tools.

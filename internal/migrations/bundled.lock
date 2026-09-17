@@ -1,0 +1,48 @@
+# falcon-id migration -> Keystone release-vehicle lock (bundled.lock)
+# -----------------------------------------------------------------------------
+# Source of truth for "which internal/migrations/000N_*.sql has a RELEASED
+# Keystone bundle (or baseline)". Enforced by `go run ./hack/bundle-lock-check`
+# (CI stage `lint`, allow_failure:false) and consumed by the PR-time schema-gap
+# test. See internal/migrations/bundlelock and docs/adr/0001-keystone-migration-bundle-deploy-ordering.md.
+#
+# WHY: falcon-id migrations are applied in prod by the Keystone MigrationBundle
+# operator in the SEPARATE the GitOps repository repo, NOT by pkg/database.Migrator.
+# The 2026-07-21 P1 SSO outage happened because migration 0009 shipped with code
+# that wrote iam_oauth_tokens.token_family_id, but no bundle was ever rendered,
+# so the column never got added and every /oauth/token exchange 400'd. This lock
+# makes the migration<->bundle mapping visible to falcon-id CI so a migration can
+# never merge without its released bundle being recorded here.
+#
+# DISCIPLINE — when you add a migration internal/migrations/000N_<name>.sql:
+#   1. Render + MERGE its Keystone MigrationBundle in the GitOps repository
+#      (platform/keystone/resources/falcon-id/migration-bundles/falcon-id-v0.232.NNN.yaml)
+#      and let the operator APPLY it (deploy-ordering gate: schema before code).
+#   2. Add a line below: <file>  <bundle-version|baseline>  <sha256-of-file>
+#      Compute the digest with:  sha256sum internal/migrations/000N_<name>.sql
+#   3. CI `bundle-lock-check` fails until both the entry and the file agree.
+#
+# FORMAT:  <migration-file>  <vehicle>  <sha256-hex>
+#   vehicle = released bundle version "v0.232.NNN"  OR  "baseline" (DDL folded
+#             into the Keystone SchemaDefinition schema-definition-main.yaml).
+# NOTE: NNN is Keystone's monotonic bundle counter, independent of the migration
+#       number (0006->258, 0007->259, 0008->261, 0009->262). There is no on-disk
+#       0006 migration.
+# t-500 (2026-09-05): bundle 255 originally carried BOTH 0001 and 0002. Only
+# 0001 was ever actually applied to prod (hot-patched 2026-06-03); 0002 was
+# incorrectly recorded as applied alongside it because Keystone's ledger keys
+# on bundle version alone, not per-file. iam_team_invitations did not exist
+# live. 0002 is re-vehicled to its own bundle, v0.232.264, which Keystone
+# will dispatch as a genuinely new (non-AlreadyApplied) execution.
+# -----------------------------------------------------------------------------
+
+0001_tenant_settings_phase2.sql        v0.232.255   519ed98f3ab5245676c21612e7ba4dc9caf9526f8a220d3dd71be930d0872766
+0002_team_invitations_phase2.sql       v0.232.264   be990b68e8083a1c0d9b150465cdd990f4163b6b118f07ced6a1ed3e3c50b1a2
+0003_caep_event_outbox.sql             v0.232.256   cc5c9813da110eea5eda236f7a37713cf89b8528579c606eb29e6e76c0d60094
+0003_user_preferences.sql              v0.232.254   e4d3649c0b58fe121d6927f5ff291ea8f76ecea219af6d3a9c90db819307c72a
+0004_iam_devices.sql                   baseline     91256a828d9e032262c9c5faabf6ca87abc7fb285b5257504b30d91e06aa13d7
+0005_user_recovery_methods.sql         v0.232.257   9d33e8c1162e0f15bf7ae8c91bbb4cb7ac02ba3c730872692e24a29b352b80d0
+0007_iam_device_preregistrations.sql   v0.232.259   0c98ed6d2a1feb180f3ce1815c78c5dc1207caeb408ddedd87c841ddd08bf571
+0008_iam_devices_hw_identity.sql       v0.232.261   0f98e70f53a3141f779d83101c68d87f340b47acb38cf7c261b0c14a1b065191
+0009_oauth_token_family.sql            v0.232.262   cc2e3bf2fc7a31e907809045bd6e2211bc64647807844d36bfcd457c95e561bc
+0010_user_admin_review_flag.sql        baseline     e5e49cf3ab27518bf006e7f54e92c58f9f34de8260e5b839242aaaa5ad9e74e3
+0011_team_invitation_pending_email_uniqueness.sql baseline d326143880640f508e4d7598fe560966e57518b64b49649323bc1b1f5a60341c

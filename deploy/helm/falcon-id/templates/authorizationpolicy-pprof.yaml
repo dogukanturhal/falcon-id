@@ -1,0 +1,32 @@
+{{- /*
+  Linkerd AuthorizationPolicy — pprof
+  Binds the dedicated pprof Server (templates/server-pprof.yaml) to
+  the operator ServiceAccounts that may run goroutine/heap dumps.
+
+  The list lives in .Values.pprof.allowedServiceAccounts as
+  [{namespace, name}, ...] so platform overlays can extend it without
+  template surgery. Default is empty — the chart's accessPolicy: deny
+  Server then rejects all callers, which is the correct fail-closed
+  posture for a fresh internal surface.
+*/ -}}
+{{- if and .Values.pprof.enabled .Values.linkerd.policy.enabled }}
+{{- range $i, $sa := .Values.pprof.allowedServiceAccounts }}
+---
+apiVersion: policy.linkerd.io/v1alpha1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "falcon-id.fullname" $ }}-pprof-{{ $sa.namespace }}-{{ $sa.name }}
+  labels:
+    {{- include "falcon-id.labels" $ | nindent 4 }}
+    falcon-id.hexxlock.com/surface: pprof
+spec:
+  targetRef:
+    group: policy.linkerd.io
+    kind: Server
+    name: {{ include "falcon-id.fullname" $ }}-pprof
+  requiredAuthenticationRefs:
+    - kind: ServiceAccount
+      name: {{ $sa.name }}
+      namespace: {{ $sa.namespace }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,35 @@
+{{- /*
+  PodDisruptionBudget — guards against voluntary disruption (rolling
+  restart, node drain, Argo Rollouts canary step) reducing the number
+  of healthy falcon-id pods below `minAvailable`.
+
+  Required for tier-1 because every product (Talon, ArgoCD, Grafana,
+  Harbor, frontend RPs, etc.) is fronted by an OAuth flow that
+  resolves through this Deployment. Losing all replicas during a
+  voluntary action is a cluster-wide IAM outage.
+
+  Gated on `.Values.podDisruptionBudget.enabled` so dev / single-replica
+  installs (where minAvailable=2 against replicas=1 would block every
+  voluntary action) can opt out.
+
+  Doc: https://kubernetes.io/docs/tasks/run-application/configure-pdb/
+*/ -}}
+{{- if and .Values.podDisruptionBudget .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+{{- end }}

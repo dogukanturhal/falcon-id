@@ -1,0 +1,109 @@
+# BuildKit build-context exclusions.
+#
+# The CI pipeline runs lint + test BEFORE build and populates the Go module
+# + build caches INSIDE the repo directory (per .gitlab-ci.yml — GOMODCACHE
+# and GOCACHE are pinned to ${CI_PROJECT_DIR}/.go/{mod,build}). By the time
+# the build stage hands the context to BuildKit, `.go/` typically holds
+# 3 GiB+ of cached modules and compiled object files — none of which the
+# Dockerfile needs (the builder stage runs its own `go mod download` from
+# Athens). Sending it anyway pushes 8+ minutes onto every pipeline.
+#
+# Likewise, security/test artifacts that earlier stages emit and pass via
+# `needs: artifacts: true` end up in CI_PROJECT_DIR before build runs and
+# don't belong in the image.
+#
+# Diagnosed 2026-06-04 when a routine falcon-id rebuild took 30+ minutes;
+# BuildKit log showed `#5 transferring context: 3.30GB 502.1s`. With this
+# .dockerignore the same context drops to <100 MB and BuildKit context
+# upload completes in <30 seconds.
+
+# ──────────────────────────────────────────────────────────────────
+# Secrets — keep dev .env files out of the image
+# ──────────────────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.secret
+
+# ──────────────────────────────────────────────────────────────────
+# Git — the COPY happens against a tar of the working tree, so .git
+# adds 40+ MB of pack history that the builder never reads.
+# ──────────────────────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ──────────────────────────────────────────────────────────────────
+# Go caches — THIS is the 3 GiB the CI used to upload every build.
+# Pinned to ${CI_PROJECT_DIR}/.go/{mod,build} by .gitlab-ci.yml so the
+# lint/test stages can reuse modules without re-downloading; the build
+# stage's BuildKit context doesn't need any of it because the Dockerfile
+# does its own `go mod download`.
+# ──────────────────────────────────────────────────────────────────
+.go/
+**/.go/
+
+# Local-developer caches in case anyone runs `go build` outside CI
+# and ends up with a bin/ checked in.
+bin/
+dist/
+build/
+*.test
+*.exe
+*.out
+coverage.out
+coverage.html
+cover.out
+
+# ──────────────────────────────────────────────────────────────────
+# Test fixtures + test files — the Dockerfile builds only main packages,
+# but BuildKit transfers everything in the context tar anyway. Excluding
+# *_test.go files alone saves a few MB; excluding testdata/ saves more.
+# ──────────────────────────────────────────────────────────────────
+**/*_test.go
+**/testdata
+**/testdata/
+
+# ──────────────────────────────────────────────────────────────────
+# CI artifacts from earlier stages that arrive via `needs: artifacts: true`
+# and otherwise hitch a ride into the build context.
+# ──────────────────────────────────────────────────────────────────
+gosec-report.json
+sbom.json
+sbom*.json
+sbom*.xml
+harbor-trivy-*.json
+trivy-*.json
+
+# ──────────────────────────────────────────────────────────────────
+# IDE / editor + local tool detritus
+# ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# ──────────────────────────────────────────────────────────────────
+# K6 load-test scripts + non-Go docs.
+#
+# IMPORTANT: do NOT exclude `docs/` wholesale — `docs/docs.go` is the
+# swag-generated Swagger spec that `cmd/routes.go` imports as
+# `github.com/dogukanturhal/falcon-id/docs`. Excluding it breaks the
+# build with "no required module provides package".
+# Exclude markdown / non-Go subdirs explicitly instead.
+# ──────────────────────────────────────────────────────────────────
+k6/
+docs/*.md
+docs/audits/
+docs/compliance/
+docs/integrations/
+docs/operator-runbooks/
+hack/
+
+# ──────────────────────────────────────────────────────────────────
+# Helm chart values + deployment manifests — written by CI's
+# bump-manifest stage AFTER build; never inputs to the image.
+# ──────────────────────────────────────────────────────────────────
+deploy/

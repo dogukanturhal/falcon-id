@@ -1,0 +1,728 @@
+# Default values for falcon-id.
+# Production overrides live in the GitOps repository/releases/falcon-id/values.yaml.
+
+global:
+  environment: prod
+  region: eu-tr-1
+  imagePullSecret: harbor-falcon-id-creds
+
+# Single-field full image path — tier-1 chart pattern used by Bitnami,
+# Istio, ArgoCD's own charts. `repository` holds the complete image
+# coordinate (registry + project + name). The deployment template simply
+# concatenates `{{ repository }}:{{ tag }}`.
+#
+# Why this shape (and not {registry}/{imagePath}/{repository}):
+#   argocd-image-updater's `helm.image-name` write-back would corrupt a
+#   multi-field split by writing the FULL Harbor path into `repository`,
+#   producing doubled URLs like registry.example.com/falcon-id/harbor.
+#   hexxlock.com/falcon-id/falcon-id. Collapsing to a single field makes
+#   image-updater's writes correct by construction. See the commit
+#   message for the full bug history.
+#
+# Chart default points at the in-cluster Harbor (dev/test clusters where
+# a lightweight Harbor is deployed alongside). Production overrides this
+# with the public Harbor hostname in the GitOps repository values.yaml.
+image:
+  repository: harbor.monitoring.svc.cluster.local/falcon-id/falcon-id
+  tag: "latest"          # image-updater writes the latest Harbor SHA
+  pullPolicy: IfNotPresent
+
+# Tier-1 HA default: three replicas with a soft topology-spread across
+# nodes and a PodDisruptionBudget that keeps at least two pods alive
+# during voluntary disruption (rolling restart, node drain, Argo
+# Rollouts canary). The 2026-05-01 OAuth outage affected every IdP
+# consumer because the single replica had a poisoned pgxpool — three
+# pods on a single node still survives that class because the
+# image-updater rollout creates the new pods at staggered times.
+#
+# When the cluster gains a second / third node (sr2 / sr3 plan), the
+# soft topology-spread automatically begins enforcing the rule
+# "max one falcon-id pod per node" without further chart changes.
+#
+# Override to 1 for non-prod / dev installs where HA is not required.
+replicaCount: 3
+
+# topologySpreadConstraints distribute the falcon-id pods across nodes
+# so a single node failure cannot take all replicas down. `whenUnsatisfiable:
+# ScheduleAnyway` is deliberate — the cluster runs single-node today
+# (memory: internal engineering notes) so a strict
+# DoNotSchedule would block all but one replica from scheduling. As
+# additional nodes land the soft preference pulls pods apart without
+# requiring a chart change.
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: falcon-id
+
+# PodDisruptionBudget guards against voluntary disruption (rolling
+# updates, node drains, Argo Rollouts canary steps) leaving too few
+# pods serving traffic. minAvailable: 2 with replicaCount: 3 means
+# at most one pod can be voluntarily down at a time.
+#
+# Disabled when replicaCount: 1 because PDB(minAvailable=1, replicas=1)
+# blocks every voluntary action — set podDisruptionBudget.enabled=false
+# in environment overlays that intentionally run a single replica.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# extraEnvFrom — additional secretRef entries injected into the container's
+# envFrom block after the chart-managed vault Secret. Use this to mount
+# operator-managed Secrets (e.g. Strimzi KafkaUser credentials, external
+# SaaS API keys) without modifying the chart's ExternalSecret template.
+#
+# Each entry must have the shape:
+#   - secretRef:
+#       name: <secret-name>
+#       optional: <bool>   # default false
+#
+# Example — Kafka SASL credentials projected from Vault via a standalone
+# ExternalSecret in the falcon-id namespace (see ADR 0029 Phase 1a):
+#   extraEnvFrom:
+#     - secretRef:
+#         name: falcon-id-kafka-sasl
+#         optional: false
+extraEnvFrom: []
+
+service:
+  type: ClusterIP
+  port: 80
+  containerPort: 8010   # per falcon-id/.env.production.example SERVICE_PORT
+
+# pprof — Go runtime profiling endpoint on a separate listener.
+#
+# Tier-1 layered defenses:
+#
+#  1. Off by default. The chart only sets FALCON_PPROF_ENABLED on the
+#     pod when this block is enabled.
+#  2. Bound to its own port (default 6060) so a public-listener
+#     misconfiguration cannot expose pprof.
+#  3. The chart ships templates/server-pprof.yaml + templates/
+#     authorizationpolicy-pprof.yaml. The Server is accessPolicy: deny
+#     by default, so even with the listener up no caller is allowed
+#     until an SA is added to allowedServiceAccounts here.
+#  4. The Service template does NOT publish 6060 — kubectl port-forward
+#     is the supported access path so reaching pprof requires kubectl
+#     credentials AND an AuthzPolicy SA bind.
+#
+# Operator runbook (when this is enabled):
+#
+#   kubectl -n falcon-id port-forward deploy/falcon-id-falcon-id 6060:pprof
+#   go tool pprof http://127.0.0.1:6060/debug/pprof/goroutine
+#
+# Runs from a cluster-internal pod whose SA matches one in
+# allowedServiceAccounts; the Linkerd proxy enforces the SA bind.
+
+pprof:
+  enabled: false
+  containerPort: 6060
+  # ServiceAccounts allowed to reach pprof. Empty by default — operator
+  # workflows extend this in their environment overlay (e.g. an SRE
+  # `pprof-debugger` SA in a dedicated namespace, or the platform-admin
+  # SA used by the in-cluster argocd CLI workflow).
+  allowedServiceAccounts: []
+  # Example shape:
+  # allowedServiceAccounts:
+  #   - namespace: ops
+  #     name: pprof-debugger
+
+# Argo Rollouts canary delivery.
+#
+# When enabled, the chart emits a Rollout (templates/rollout.yaml) +
+# AnalysisTemplate (templates/analysistemplate.yaml) instead of the
+# default Deployment. The two are mutually exclusive — see the gate
+# at the top of templates/deployment.yaml.
+#
+# DEFAULT IS FALSE for falcon-id specifically: this is THE auth tier;
+# we don't break it in by being the first user of the canary
+# mechanism in the cluster. Operators flip rollouts.enabled=true in
+# their environment overlay AFTER:
+#   1. argo-rollouts controller verified running
+#   2. A less critical workload has been on Rollout for ≥7 days
+#   3. The Prometheus successCondition has been validated against
+#      production traffic patterns
+#
+# Doc: https://argoproj.github.io/argo-rollouts/features/canary/
+rollouts:
+  enabled: false
+  canary:
+    # Canary step ladder. The 10/50/100 split with paused analysis
+    # between steps is the tier-1 default — the 2026-05-01 outage
+    # shape (100% failure rate at first request) trips the analysis
+    # gate within a single 30s scrape interval at the 10% step.
+    steps:
+      - setWeight: 10
+      - pause: { duration: 5m }
+      - analysis:
+          templates:
+            - templateName: falcon-id-canary-success-rate
+      - setWeight: 50
+      - pause: { duration: 3m }
+      - analysis:
+          templates:
+            - templateName: falcon-id-canary-success-rate
+      - setWeight: 100
+    analysis:
+      interval: 30s
+      # The AT measures 5xx-rate (server errors only) per Google SRE
+      # canary canonical pattern + Keycloak SLI doc — 4xx are
+      # legitimate client errors and were tripping the prior 0.99
+      # success-rate threshold on baseline noise (verified 2026-05-16:
+      # MR-182 canary aborted at 0.9876 with zero new image-side
+      # defects; same context-canceled 400s appeared in the stable
+      # pods). See chart's templates/analysistemplate.yaml file
+      # header for the full rationale + primary sources.
+      #
+      # successCondition: sample passes when data is present AND
+      # 5xx-rate <= 0.001 (0.1% server errors — Keycloak/IdP industry
+      # norm).
+      # failureCondition: fires on absent/NaN data OR when 5xx-rate
+      # > 0.005 (0.5%) — hard abort on catastrophic regression shapes
+      # without conflating with single-scrape flakes, AND without
+      # letting a broken metrics pipeline masquerade as a pass.
+      # consecutiveErrorLimit: 4 — tolerate Prom-side hiccups (scrape
+      # failure, query timeout) per Akuity recommendation.
+      #
+      # FIXED 2026-09-06 (row t-486) — (a) FAIL-OPEN:
+      # `len(result) == 0` used to live in successCondition (added
+      # after 2026-05-07's false-abort incident — see the git history
+      # of this file for HH:32/09:18/13:42 — where an empty vector
+      # made `result[0] <= 0.001` panic with "reflect: slice index out
+      # of range", phase=Error, consecutiveErrors=5 > limit=4, Rollout
+      # aborted with no traffic in the window). The fix at the time
+      # over-corrected: it made ANY empty result an automatic
+      # Successful, and an empty result is indistinguishable from a
+      # BROKEN metric (renamed metric, relabeled ServiceMonitor,
+      # scrape target down) — both return zero Prometheus series, and
+      # clamp_min() cannot rescue an empty vector (only a non-empty
+      # one). That is fail-open: a broken observability pipeline
+      # during a canary would pass every sample as Successful with
+      # zero real observations, on the auth tier. `len(result) == 0`
+      # moved from successCondition to failureCondition (mirrors
+      # https://github.com/argoproj/argo-rollouts/issues/1466's
+      # documented "invert the guard so empty means failure" fix,
+      # rather than inventing a new threshold) so an absent/errored
+      # metric now FAILS the analysis. Near-zero-sample behavior: a
+      # step that gets truly zero canary requests for its whole window
+      # now resolves Failed (counts against failureLimit=3, aborts on
+      # the 4th such sample) instead of a blind Successful — the right
+      # default for THE auth tier, where "we didn't observe anything"
+      # must never read as "it's healthy".
+      successCondition: "len(result) > 0 && result[0] <= 0.001"
+      failureCondition: "len(result) == 0 || result[0] != result[0] || result[0] > 0.005"
+      failureLimit: 3
+      consecutiveErrorLimit: 4
+      # FIXED 2026-09-06 (row t-486) — (b) WINDOW COULD NOT OBSERVE:
+      # this rate() range used to be hardcoded to 5m directly in the
+      # PromQL in templates/analysistemplate.yaml (not wired to any
+      # values.yaml field), while the step ladder above has TWO
+      # different pauses: 5m at step 1, only 3m at step 2. interval/
+      # count control the analysis-run's own sampling cadence — they
+      # do NOT change what each sample's rate() window covers, so
+      # shrinking/lengthening a pause never revisited this window.
+      #
+      # Arithmetic (step 2, weight goes 10%->50% at t=0 of this step):
+      #   pause: 3m (180s) < the old range: 5m (300s) — a 120s deficit.
+      #   1st sample fires right as the pause ends, t=180s: its rate()
+      #     window is [t-300, t] = [-120s, 180s] -> 120/300 = 40% of
+      #     that window predates setWeight:50 (it's step 1's 10%-weight
+      #     traffic, or earlier).
+      #   2nd sample (t=210s): window [-90s, 210s]  -> 30% predates.
+      #   3rd sample (t=240s): window [-60s, 240s]  -> 20% predates.
+      #   4th sample (t=270s): window [-30s, 270s]  -> 10% predates.
+      #   5th sample (t=300s): window [0s, 300s]    -> 0% predates
+      #     (only the LAST of 5 samples was ever clean).
+      #   4 of 5 (80%) of step 2's gate was built on a mix that
+      #   includes the PRIOR, lower canary weight — diluting exactly
+      #   the escalation (10%->50%) the gate exists to catch.
+      # range is now 3m: at step 2, window == pause, 0% predates on
+      # every sample. At step 1 (5m pause > 3m range), a 3m window is
+      # still always fully inside the 5m canary period (just uses less
+      # of the available good data) — safe in both directions. Keep
+      # `range` <= the shortest `pause:` above if the step ladder ever
+      # changes.
+      range: 3m
+      # FQDN form (.svc.cluster.local) is mandatory. The argo-rollouts
+      # controller pod runs in argo-rollouts namespace and resolves
+      # the AnalysisTemplate's address as a literal hostname — bare
+      # `monitoring.svc` doesn't expand through the search list, so
+      # the very first canary AnalysisRun aborted with NXDOMAIN
+      # (observed 2026-05-01 on the first organic canary cycle:
+      # consecutiveErrors=5 > limit=4 → Rollout aborted, stable
+      # cohort kept serving, exact tier-1 behaviour). Same DNS class
+      # as the MinIO bug fixed in falcon-id !107.
+      prometheusAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+
+# Prometheus scrape config. Disabled by default so non-k8s / dev installs
+# aren't forced to have the kube-prometheus-stack CRDs installed.
+# Enable in environments where kube-prometheus-stack is running.
+serviceMonitor:
+  enabled: false
+  # Must match the Prometheus CR's serviceMonitorSelector.release label.
+  # kube-prometheus-stack defaults this to the Helm release name.
+  prometheusRelease: kube-prometheus-stack
+  interval: 30s
+  scrapeTimeout: 10s
+  # Optional: drop high-cardinality Go runtime metrics to keep Prometheus
+  # storage bounded. Override here if you want them.
+  # metricRelabelings: []
+  # relabelings: []
+
+# podAnnotations are rendered onto the pod template — useful for
+# Linkerd injection, Prometheus scrape config, etc. NOT the place
+# for Stakater Reloader: the Reloader operator reads only the
+# DEPLOYMENT-level metadata.annotations, not the pod template's
+# annotations. Pre-2026-04-30 this file carried
+# `reloader.stakater.com/auto: "true"` here, which silently failed
+# to trigger any rotation rolls. Moved to the chart-default
+# Deployment.metadata.annotations in templates/deployment.yaml so
+# every install gets it; deploymentAnnotations below is for per-env
+# additions that don't displace it.
+podAnnotations: {}
+
+deploymentAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1
+    memory: 1Gi
+
+# Environment variables that are NOT secrets — come from values, not Vault.
+env:
+  ENVIRONMENT: production
+  SERVICE_NAME: falcon-id
+  SERVICE_PORT: "8010"
+  LOG_LEVEL: info
+  JWT_ISSUER: https://id.hexxlock.com
+  OAUTH_ISSUER: https://id.hexxlock.com
+  FRONTEND_URL: https://app.hexxlock.com
+  # IAM_SERVICE_URL — in-cluster base URL of falcon-id for the
+  # tenantprojection bootstrap's OAuth2 client_credentials token mint.
+  # Falcon-id calls its own /oauth/token; the cluster-internal DNS
+  # name resolves to itself (Linkerd handles the loopback). ADR 0029
+  # follow-up handoff (G).
+  IAM_SERVICE_URL: http://falcon-id-falcon-id.falcon-id.svc.cluster.local
+  MFA_ISSUER: "Falcon ID"
+  SMTP_HOST: mail.hexxlock.com
+  SMTP_PORT: "587"
+  SMTP_FROM: noreply@falcon.hexxlock.com
+  SMTP_USE_TLS: "true"
+  TRUSTED_PROXIES: "10.0.0.0/8"
+  OPA_DECISION_PATH: falcon/authz/allow
+  OPA_URL: http://opa.opa.svc.cluster.local:8181
+  SPICEDB_ENDPOINT: spicedb.spicedb.svc.cluster.local:50051
+  # Falcon-id's viper config sets SPICEDB_INSECURE default to TRUE
+  # (dev-friendly). In production/staging this MUST be explicitly
+  # overridden to false or the config validator rejects startup with:
+  #   "SPICEDB_INSECURE must be false in production environment
+  #    when SpiceDB is enabled"
+  # With SPICEDB_INSECURE=false the client uses TLS; trust of SpiceDB's
+  # self-signed-via-exampletenant-CA cert is provided by the
+  # SSL_CERT_FILE env var pointing at the trust-manager bundle (see
+  # internalTlsTrust section below).
+  SPICEDB_INSECURE: "false"
+  REDIS_HOST: falcon-id-redis.falcon-id.svc.cluster.local
+  REDIS_PORT: "6379"
+  # MinIO endpoint + bucket for avatar storage. Credentials come from
+  # the externalSecrets.minioSA block below (Vault-projected, never
+  # in values). Endpoint default is the in-cluster MinIO tenant Service;
+  # bucket name matches the constant in
+  # internal/handlers/avatar_upload_handler.go (avatarBucket).
+  MINIO_ENDPOINT: minio.minio-tenant.svc.cluster.local:80
+  MINIO_BUCKET: hexxlock-avatars
+  # Databases are constructed from DSN secrets (see externalSecrets below),
+  # not from values.
+  #
+  # Admin bootstrap — creates the initial platform admin on first start.
+  # Follows the Keycloak/ArgoCD pattern: idempotent, env-var-triggered.
+  # Set these in the environment overlay (the GitOps repository values.yaml)
+  # for the first deployment, then remove them once the account exists.
+  # Both variables must be present for bootstrap to activate; if either
+  # is absent the startup check is skipped silently.
+  # FALCON_ADMIN_EMAIL: ""
+  # FALCON_ADMIN_PASSWORD: ""
+
+livenessProbe:
+  httpGet:
+    # /health/live-deep runs `SELECT count(*) FROM iam_oauth_clients` so a
+    # pod whose pgxpool reports "Ping OK" but cannot actually run statements
+    # (the failure mode behind the 2026-05-01 outage, where every OAuth
+    # call short-circuited in ~200µs without ever touching the table) is
+    # detected by the kubelet and restarted. /health (process-only) was
+    # the previous target and let the pod ride out the outage.
+    path: /health/live-deep
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 10
+  # 5 × 30s = 150s of sustained DB-unreachable before the kubelet
+  # restarts. Higher than the readiness threshold (3 × 10s = 30s)
+  # on purpose: readiness should drain traffic on transient blips,
+  # liveness should only kill the pod when the failure is durable
+  # enough that recovery via reconnect is unlikely.
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet:
+    # The service registers /health/ready (see cmd/routes.go:registerHealthRoutes) —
+    # the Kubernetes-style single-word /ready was never implemented. Point
+    # the readiness probe at the actual path so the pod can reach Ready
+    # once migrations finish. As of 2026-05-01 /health/ready treats
+    # control_plane_database and redis as load-bearing too — a half-broken
+    # pod (e.g. Redis-down, DBs-up) now drains traffic instead of silently
+    # serving with rate-limit / CSRF / session-cache fail-open.
+    path: /health/ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# ExternalSecrets — pull secrets from Vault KV into a k8s Secret consumed
+# via envFrom.
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+
+  # Main DB DSN — from example/data/platform/prod/falcon-id/database-main
+  mainDatabase:
+    remoteKey: platform/prod/falcon-id/database-main
+  # Control DB DSN — from example/data/platform/prod/falcon-id/database-control
+  controlDatabase:
+    remoteKey: platform/prod/falcon-id/database-control
+  # App-level secrets — from example/data/platform/falcon-id/app.
+  #
+  # Vault layout (KV v2, mount "example"):
+  #   example/data/<remoteKey>:
+  #     jwt_secret      — HS256 signing key for legacy JWTs (rotating)
+  #     encryption_key  — AES-256 key for PII at-rest encryption
+  #     token_hash_salt — salt for stored token / state-token hashes
+  #     internal_api_key — legacy S2S key (deprecated; do not consume
+  #                        in new code per the standing rules)
+  #     email_hash_key  — HMAC key for user-email-hash column. REQUIRED
+  #                       since 2026-05-22 — startup fails-fast via
+  #                       repositories.RequireEmailHashKey when missing.
+  #                       Generate with `openssl rand -hex 32` (32 bytes
+  #                       / 64-hex-char minimum). Treat as effectively
+  #                       immutable: rotating the key invalidates every
+  #                       email_hash in iam_users and requires a
+  #                       back-fill migration. See
+  #                       internal/repositories/user_repository.go
+  #                       header for the rationale.
+  app:
+    remoteKey: platform/falcon-id/app
+  # SpiceDB PSK — from example/data/platform/spicedb/psk
+  spicedb:
+    remoteKey: platform/spicedb/psk
+  # Bootstrap admin — drives cmd/admin_bootstrap.go via FALCON_ADMIN_EMAIL
+  # + FALCON_ADMIN_PASSWORD env vars. Set remoteKey to a Vault path
+  # holding `email` + `password` fields to auto-seed the platform admin
+  # on cluster init. Idempotent: bootstrap exits early when the user
+  # already exists. Leave empty to disable (default).
+  #
+  # Vault layout (KV v2, mount "example"):
+  #   example/data/<remoteKey>:
+  #     email     — admin login email
+  #     password  — admin password (will be argon2id-hashed by the app)
+  #
+  # When set, the chart's <fullname>-vault Secret picks up two extra
+  # keys (FALCON_ADMIN_EMAIL, FALCON_ADMIN_PASSWORD), already exposed
+  # to the falcon-id container via envFrom. cmd/admin_bootstrap.go runs
+  # at every boot; it creates the user under tenant exampletenant
+  # and assigns platform_admin + iam_admin roles (both must exist in
+  # the tenant; tenant + roles must be seeded separately, e.g. via
+  # Keystone SeedData or a one-shot SQL Job).
+  adminBootstrap:
+    remoteKey: ""
+  # Bootstrap OAuth provisioner client — drives
+  # cmd/oauth_provisioner_bootstrap.go via FALCON_PROVISIONER_CLIENT_ID
+  # + FALCON_PROVISIONER_CLIENT_SECRET env vars. Set remoteKey to a
+  # Vault path holding `client_id` + `client_secret` fields to
+  # idempotently INSERT the iam_oauth_clients row on every falcon-id
+  # boot. Required for the Crossplane ServiceClientClaim provisioning
+  # chain — per-service Jobs auth as this client.
+  #
+  # Vault layout (KV v2, mount "example"):
+  #   example/data/<remoteKey>:
+  #     client_id     — provisioner OAuth client ID (string)
+  #     client_secret — provisioner OAuth client secret (high-entropy
+  #                     random; will be SHA-256 hashed for storage)
+  #
+  # In production, this path is the same one written by the legacy
+  # bash bootstrap-job.yaml at cluster init:
+  #   platform/serviceclient-provisioner/falcon-id-admin
+  #
+  # When set, the chart's <fullname>-vault Secret picks up two extra
+  # keys (FALCON_PROVISIONER_CLIENT_ID, FALCON_PROVISIONER_CLIENT_SECRET)
+  # already exposed to the falcon-id container via envFrom.
+  # cmd/oauth_provisioner_bootstrap.go runs at every boot; it idempotently
+  # creates the iam_oauth_clients row if missing, skips on match.
+  #
+  # The legacy bash Job's create flow (POST /api/v1/admin/oauth-clients
+  # via admin login) hits architectural hazards under post-disaster
+  # recovery (risk-MFA enrollment interrupt + FI!137 fail-closed realm
+  # gate). This boot hook bypasses both via direct DB access. Survives
+  # any future falcon-id-pg fresh-initdb without operator intervention.
+  #
+  # Leave empty to disable (default — keeps non-prod / dev installs
+  # decoupled from the cluster-init Vault seed). Production overlays
+  # set remoteKey to the canonical path.
+  provisionerBootstrap:
+    remoteKey: ""
+
+  # MinIO scoped-user creds for avatar bucket. Vault path holds
+  # {access_key, secret_key}. When set, the chart's <fullname>-vault
+  # Secret picks up MINIO_ACCESS_KEY + MINIO_SECRET_KEY (envFrom-injected).
+  # Provisioned by the <gitops-bootstrap-repo> minio-scoped-users reconciler
+  # (`falcon-id-avatars` user, policy scoped to s3:* on hexxlock-avatars).
+  # Default empty so dev installs without Vault still hydrate the rest of
+  # the secret cleanly; production overlay sets
+  # `platform/falcon-id/minio-sa` (Vault mount: example).
+  minioSA:
+    remoteKey: ""
+
+  # OAuth client_credentials creds for falcon-id-as-CLIENT to other
+  # platform services (currently: tenant-management /api/v1/internal/tenants
+  # for tenantprojection bootstrap). Vault path holds {client_id, client_secret}
+  # populated by the platform XServiceClient Crossplane composition driven
+  # from `serviceclientclaim-falcon-id.yaml` (the GitOps repository).
+  #
+  # When set, the chart's <fullname>-vault Secret picks up
+  # SERVICE_CLIENT_ID + SERVICE_CLIENT_SECRET (envFrom-injected); the
+  # tenantprojection bootstrap wires these into shared/service-auth.NewIAMHTTPClient.
+  # ADR 0029 follow-up handoff (G).
+  serviceClient:
+    remoteKey: ""
+
+# Mount the trust-manager-distributed internal CA bundle and set
+# SSL_CERT_FILE so Go's crypto/x509 trusts both public roots AND
+# HexxLock internal CA (spicedb TLS, etc.). Requires the namespace to
+# be labeled hexxlock.com/internal-tls-trust=enabled so trust-manager
+# auto-creates the ConfigMap.
+internalTlsTrust:
+  enabled: false            # opt-in per release values
+  configMapName: exampletenant-ca
+  mountPath: /etc/ssl/hexxlock
+  sslCertFileKey: ca-bundle.pem
+
+# ---------------------------------------------------------------------------
+# Keystone migration deploy-ordering gate (Argo CD PreSync hook)
+# ---------------------------------------------------------------------------
+# Fail-closed gate for the 2026-07-21 OAuth migration-gap outage. Runs the
+# keystone-migration-gate binary baked into this release's image and refuses to
+# let the Rollout sync until the image's HEAD Keystone bundle (from the embedded
+# internal/migrations/bundled.lock) is recorded in the database's
+# keystone_schema_migrations table — i.e. schema-before-code. See
+# templates/keystone-migration-gate-hook.yaml and
+# docs/adr/0001-keystone-migration-bundle-deploy-ordering.md.
+#
+# Opt-in: leave disabled until the schema / tracking-table / DATABASE_URL have
+# been confirmed against a canary sync, then flip enabled=true in the
+# environment's the GitOps repository values overlay to ARM the gate.
+keystoneMigrationGate:
+  enabled: false
+  # PostgreSQL schema + tracking table Keystone records applied bundles in.
+  schema: public
+  trackingTable: keystone_schema_migrations
+  timeout: "15s"
+  activeDeadlineSeconds: 120
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+
+# ---------------------------------------------------------------------------
+# APISIX route management — tier-1 pattern: services own their own routes
+# ---------------------------------------------------------------------------
+apisix:
+  adminUrl: "http://apisix-admin.apisix.svc.cluster.local:9180"
+  adminKeySecret: apisix-admin-keys
+  routeSync:
+    enabled: true
+  routes:
+    internal:
+      enabled: true
+      host: auth.hexxlock.com
+      tenantId: "00000000-0000-0000-0000-000000000003"
+    customer:
+      enabled: true
+      host: id.hexxlock.com
+
+# podDisruptionBudget block is defined earlier in this file (HA section
+# at line 67). Removed the trailing override `enabled: false` because
+# that silently disabled the PDB for every consumer of the chart and
+# was the artefact of single-replica bootstrap. New default is enabled
+# with minAvailable: 2 — environment overlays running replicaCount: 1
+# can opt out by setting podDisruptionBudget.enabled: false there.
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy — L3/L4 default-deny INGRESS + allow-list (ASVS V13)
+# ---------------------------------------------------------------------------
+# Renders templates/networkpolicy.yaml. Default-deny ingress on the falcon-id
+# pods with an explicit namespace + probe-CIDR allow-list. Escape hatch: set
+# enabled=false to remove the policy. Egress is intentionally left open (a
+# default-deny egress posture is a separate, higher-risk hardening — see the
+# template header).
+networkPolicy:
+  enabled: true   # default-deny ingress + allow-list; set false to disable
+  # Namespaces whose pods may reach the falcon-id HTTP port (mirrors
+  # linkerd.policy.allowedNamespaces at L3/L4). Matched by the
+  # kubernetes.io/metadata.name label auto-applied to every namespace.
+  allowedNamespaces:
+    - apisix            # id.hexxlock.com ingress gateway
+    - example-frontend  # ExampleSuite SPA BFFs
+    - example-platform  # platform namespace (when populated)
+    - example-business  # business namespace (when populated)
+    - falcon-id         # in-namespace sidecar jobs (spicedb hook, route sync)
+    - monitoring        # Prometheus /metrics scrape + blackbox probe
+  # Kubelet liveness/readiness probes hit the pod directly from the node and
+  # carry no namespace identity — admit the pod+node CIDRs at L3. Mirrors
+  # linkerd.policy.probeCIDRs; tighten per-env to the exact CIDRs.
+  allowProbeCIDRs: true
+  probeCIDRs:
+    - "10.42.0.0/16"   # cluster pod network
+    - "10.0.20.0/24"  # DMZ nodes (node-app-01, node-cp-01)
+    - "10.0.60.0/24"  # DevOps nodes (node-ops-01)
+
+# ---------------------------------------------------------------------------
+# Linkerd AuthorizationPolicy — identity-based authz on top of mTLS
+# ---------------------------------------------------------------------------
+# Ships a Server + AuthorizationPolicy + MeshTLSAuthentication +
+# NetworkAuthentication (for kubelet probes) for the falcon-id HTTP
+# surface.
+#
+# Rollout is staged via accessPolicy:
+#   - audit  (default): violations are LOGGED as authz.name=audit on the
+#     linkerd-proxy sidecar; requests still flow. Use for 1-2 weeks to
+#     harvest the full caller set from production logs before flipping.
+#   - deny             : violations return HTTP 403. Enforcement state.
+#
+# Allow-list is expressed via Linkerd MeshTLSAuthentication identityRefs.
+# Three complementary shapes, all OR-matched at the policy-controller:
+#
+#   allowedNamespaces:        emits identityRefs[].kind=Namespace —
+#                             every ServiceAccount in the listed ns is
+#                             authorized. Preferred for coarse allow-lists
+#                             (linkerd/linkerd2 RFC #8298, stable-2.12+).
+#
+#   allowedServiceAccounts:   emits identityRefs[].kind=ServiceAccount —
+#                             granular single-SA grants when a full ns is
+#                             too broad.
+#
+#   allowedIdentities:        emits spec.identities[] — raw SPIFFE strings
+#                             for cross-cluster or non-Kubernetes identities.
+#                             LITERAL match only; wildcards are parsed as
+#                             string constants and will never resolve
+#                             (see linkerd/linkerd2 PR #11882, edge-24.1.1).
+#
+# The default list grants every SA in the known in-cluster caller
+# namespaces. Override per-env if the allow-list needs to be tighter.
+linkerd:
+  policy:
+    enabled: true        # ship the Server + AuthzPolicy + MeshTLS/Network authns
+    # accessPolicy stays "audit" as the safe default: the Server + policies
+    # deploy and violations are LOGGED (authz.name=audit) but still flow, so
+    # enabling by default cannot break an unlisted caller. Flip per-env to
+    # "deny" (HTTP 403 enforcement) after the 1-2 week audit-log observation
+    # window confirms the allow-list below is complete. Escape hatch: set
+    # enabled=false to remove the mesh policy entirely.
+    accessPolicy: audit  # audit | deny — flip to deny after observation
+    # Namespace-wide allow-list (preferred). Every ServiceAccount in each
+    # listed namespace is authorized to call falcon-id over mTLS.
+    allowedNamespaces:
+      # APISIX gateway — forwards id.hexxlock.com external traffic
+      - apisix
+      # ExampleSuite frontend BFFs (11 SPAs sharing the namespace)
+      - example-frontend
+      # ExampleSuite platform/business namespaces (when populated)
+      - example-platform
+      - example-business
+      # In-cluster health probe from blackbox-exporter in monitoring ns
+      - monitoring
+      # falcon-id itself — internal calls from sidecar jobs (spicedb
+      # schema hook, apisix route sync hook)
+      - falcon-id
+    # Granular SA-level allow-list (additive to allowedNamespaces).
+    # Entries are {name, namespace} pairs.
+    allowedServiceAccounts: []
+    # Raw SPIFFE identity strings (additive). No wildcards — literal match.
+    # Populate only for non-Kubernetes or cross-cluster callers.
+    allowedIdentities: []
+    # Kubelet probes bypass the mesh identity check via a pod/node CIDR
+    # NetworkAuthentication. Tighten per-env to the exact pod+node CIDR.
+    allowKubeletProbes: true
+    probeCIDRs:
+      - "10.42.0.0/16"   # cluster pod network
+      - "10.0.20.0/24"  # DMZ nodes (node-app-01, node-cp-01)
+      - "10.0.60.0/24"  # DevOps nodes (node-ops-01)
+
+# ---------------------------------------------------------------------------
+# Autoscaling — HorizontalPodAutoscaler (autoscaling/v2)
+# ---------------------------------------------------------------------------
+# When enabled, the chart emits a single HPA targeting this Deployment and
+# omits the static `spec.replicas` from the Deployment template so HPA owns
+# replica count exclusively.
+#
+# Single-Proxmox-node constraint:
+#   The cluster currently runs on a single Proxmox host (sr1). Keep
+#   `maxReplicas` low (2-3) to avoid OOM-killing the only node. The
+#   per-environment override in
+#   the GitOps repository/environments/prod-eu-west-1-workload/falcon-id/values.yaml
+#   caps `maxReplicas` at 2.
+#
+# IMPORTANT — ArgoCD ignoreDifferences:
+#   For HPA-driven replicas to survive ArgoCD sync, the cluster-wide
+#   argocd-cm must declare an ignoreDifferences entry for apps_Deployment
+#   on /spec/replicas. Delivered by WS0 of the Phase 0/1/2 plan.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 75
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max

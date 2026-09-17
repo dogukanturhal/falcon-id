@@ -1,0 +1,76 @@
+{{/* templates/hpa.yaml */}}
+{{/*
+  HorizontalPodAutoscaler for falcon-id (autoscaling/v2).
+
+  Controlled by .Values.autoscaling.enabled. When enabled, the
+  Deployment template omits the static `replicas:` field so the HPA
+  is the sole authority on replica count, preventing the
+  Helm-managed Deployment from fighting back against HPA decisions.
+
+  Single-node guardrail: maxReplicas SHOULD remain ≤ 2-3 while running
+  on the single Proxmox host (sr1). The prod environment override
+  in the GitOps repository caps maxReplicas at 2.
+
+  CRITICAL — for HPA to take effect, the cluster-wide argocd-cm must
+  declare:
+    resource.customizations.ignoreDifferences.apps_Deployment: |
+      jsonPointers:
+        - /spec/replicas
+  Without this, ArgoCD reverts HPA-driven replica changes on every
+  sync. Delivered by WS0 of the Phase 0/1/2 plan.
+*/}}
+{{- if .Values.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+spec:
+  # scaleTargetRef must follow the actual workload kind. When
+  # rollouts.enabled=true the chart emits an argoproj.io/v1alpha1
+  # Rollout instead of an apps/v1 Deployment (templates/rollout.yaml
+  # vs templates/deployment.yaml). The HPA must point at whichever
+  # is rendered, otherwise it errors with `deployments.apps
+  # "<release>" not found` and never scales.
+  #
+  # argo-rollouts implements /scale on Rollout exactly the way the
+  # apps/v1 Deployment controller does, so HPA semantics carry over
+  # without further changes.
+  scaleTargetRef:
+    {{- if .Values.rollouts.enabled }}
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    {{- else }}
+    apiVersion: apps/v1
+    kind: Deployment
+    {{- end }}
+    name: {{ include "falcon-id.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ .Values.autoscaling.behavior.scaleUp.stabilizationWindowSeconds | default 60 }}
+      selectPolicy: {{ .Values.autoscaling.behavior.scaleUp.selectPolicy | default "Max" }}
+      policies:
+        {{- toYaml .Values.autoscaling.behavior.scaleUp.policies | nindent 8 }}
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.autoscaling.behavior.scaleDown.stabilizationWindowSeconds | default 600 }}
+      selectPolicy: {{ .Values.autoscaling.behavior.scaleDown.selectPolicy | default "Min" }}
+      policies:
+        {{- toYaml .Values.autoscaling.behavior.scaleDown.policies | nindent 8 }}
+{{- end }}

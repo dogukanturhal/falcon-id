@@ -1,0 +1,47 @@
+module: iam
+permissions:
+  - resource: users
+    actions: [create, read, update, delete, unlock, reset_password, impersonate, manage_mfa, send_email, bulk_operations]
+    description: User identity management
+  - resource: roles
+    actions: [create, read, update, delete, assign]
+    description: Role-based access control
+  - resource: permissions
+    actions: [read, manage, register]
+    description: Permission definitions
+  - resource: groups
+    actions: [create, read, update, delete, manage_members, manage_roles]
+    description: User group management
+  - resource: sessions
+    actions: [read, manage]
+    description: Active session management
+  - resource: tenants
+    actions: [create, read, update, delete, configure, manage_members]
+    description: Tenant lifecycle management
+  - resource: realms
+    actions: [create, read, update, delete, configure]
+    description: Realm configuration
+  - resource: oauth-clients
+    actions: [create, read, update, delete, rotate_secret]
+    description: OIDC/OAuth client registration
+  - resource: api-keys
+    actions: [create, read, update, delete, rotate]
+    description: API key management
+  - resource: audit-logs
+    actions: [read, export]
+    description: Security audit trail
+  - resource: mfa
+    actions: [configure, enforce, reset]
+    description: Multi-factor authentication policies
+  - resource: saml
+    actions: [create, read, update, delete, configure]
+    description: SAML identity provider federation
+  - resource: ldap
+    actions: [create, read, update, delete, configure, sync]
+    description: LDAP/Active Directory integration
+  - resource: scim
+    actions: [configure, read]
+    description: SCIM provisioning
+  - resource: password-policies
+    actions: [read, configure]
+    description: Password strength and rotation policies

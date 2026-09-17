@@ -1,0 +1,424 @@
+# HexxLock Platform Service Registry
+#
+# This file is the single source of truth for all services monitored by the
+# platform health endpoint. It is embedded into the Falcon-ID binary via go:embed.
+#
+# To add a new service:
+#   1. Add an entry below with the correct docker-compose service name as hostname
+#   2. Rebuild Falcon-ID
+#
+# For K8s deployments, override with SERVICE_REGISTRY_PATH env var pointing to
+# a ConfigMap-mounted YAML with environment-specific hostnames.
+#
+# check_type: "http" (default) or "tcp" for non-HTTP services
+# category: platform | business | infrastructure | frontend | monitoring
+
+services:
+  # ── Platform Services (Go microservices) ───────────────────────────────
+  - name: "Subscription Management"
+    hostname: "subscription-management"
+    port: 8040
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Tenant Management"
+    hostname: "tenant-management"
+    port: 8056
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Billing"
+    hostname: "billing"
+    port: 8042
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Payment Gateway"
+    hostname: "payment-gateway"
+    port: 8041
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Quota Service"
+    hostname: "quota-service"
+    port: 8013
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Email Service"
+    hostname: "email"
+    port: 8004
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Workflow Engine"
+    hostname: "workflow-engine"
+    port: 8006
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "CMS"
+    hostname: "cms"
+    port: 8016
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Helpdesk"
+    hostname: "helpdesk"
+    port: 8030
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Realtime"
+    hostname: "realtime"
+    port: 8051
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Report Builder"
+    hostname: "report-builder"
+    port: 8104
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Report Scheduling"
+    hostname: "report-scheduling"
+    port: 8098
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Document Processor"
+    hostname: "document-processor"
+    port: 8100
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Document Numbering"
+    hostname: "document-numbering"
+    port: 8009
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "E-Signature"
+    hostname: "esignature"
+    port: 8096
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Comments"
+    hostname: "comments"
+    port: 8103
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Custom Fields"
+    hostname: "custom-fields"
+    port: 8095
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Custom Objects"
+    hostname: "custom-objects"
+    port: 8105
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Marketing Automation"
+    hostname: "marketing-automation"
+    port: 8011
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Domain Management"
+    hostname: "domain-management"
+    port: 8090
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Integration Bus"
+    hostname: "integration-bus"
+    port: 8008
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Integration Hub"
+    hostname: "integration-hub"
+    port: 8012
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Master Data"
+    hostname: "master-data"
+    port: 8007
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Connectors"
+    hostname: "connectors"
+    port: 8101
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "AI Search"
+    hostname: "ai-search"
+    port: 8106
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "API Marketplace"
+    hostname: "api-marketplace"
+    port: 8107
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "App Marketplace"
+    hostname: "app-marketplace"
+    port: 8108
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Developer Portal"
+    hostname: "developer-portal"
+    port: 8102
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Predictive Analytics"
+    hostname: "predictive-analytics"
+    port: 8105
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Messaging Integration"
+    hostname: "messaging-integration"
+    port: 8010
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Compute API"
+    hostname: "compute-api"
+    port: 8017
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  - name: "Network API"
+    hostname: "network-api"
+    port: 8016
+    health_path: "/health"
+    check_type: "http"
+    category: "platform"
+
+  # ── Business Modules ───────────────────────────────────────────────────
+  - name: "Accounting"
+    hostname: "accounting"
+    port: 8020
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "CRM"
+    hostname: "crm"
+    port: 8021
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "HR"
+    hostname: "hr"
+    port: 8022
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "FICO"
+    hostname: "fico"
+    port: 8023
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "MM (Materials)"
+    hostname: "mm"
+    port: 8024
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "Inventory"
+    hostname: "inventory"
+    port: 8025
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "Invoicing"
+    hostname: "invoicing"
+    port: 8026
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "PPSCM"
+    hostname: "ppscm"
+    port: 8027
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "Finance"
+    hostname: "finance-service"
+    port: 8028
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "PM (Project Mgmt)"
+    hostname: "pm"
+    port: 8029
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "SD (Sales)"
+    hostname: "sd"
+    port: 8110
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "Marketing"
+    hostname: "marketing"
+    port: 8080
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "PLM"
+    hostname: "plm"
+    port: 8032
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "CMMS"
+    hostname: "cmms"
+    port: 8033
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "QMS"
+    hostname: "qms"
+    port: 8034
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  - name: "E-Commerce"
+    hostname: "ecommerce"
+    port: 8035
+    health_path: "/health"
+    check_type: "http"
+    category: "business"
+
+  # ── Infrastructure (TCP checks) ────────────────────────────────────────
+  - name: "Redis"
+    hostname: "redis"
+    port: 6379
+    check_type: "tcp"
+    category: "infrastructure"
+
+  - name: "Kafka"
+    hostname: "kafka"
+    port: 9092
+    check_type: "tcp"
+    category: "infrastructure"
+
+  - name: "Control Plane DB"
+    hostname: "postgres-control-plane"
+    port: 5432
+    check_type: "tcp"
+    category: "infrastructure"
+
+  - name: "SpiceDB"
+    hostname: "spicedb"
+    port: 50051
+    check_type: "tcp"
+    category: "infrastructure"
+
+  - name: "Vault"
+    hostname: "vault"
+    port: 8200
+    check_type: "tcp"
+    category: "infrastructure"
+
+  - name: "Zookeeper"
+    hostname: "zookeeper"
+    port: 2181
+    check_type: "tcp"
+    category: "infrastructure"
+
+  # ── Infrastructure (HTTP checks) ───────────────────────────────────────
+  - name: "MinIO"
+    hostname: "minio"
+    port: 9000
+    health_path: "/minio/health/live"
+    check_type: "http"
+    category: "infrastructure"
+
+  - name: "APISIX Gateway"
+    hostname: "apisix"
+    port: 9080
+    health_path: "/apisix/status"
+    check_type: "http"
+    category: "infrastructure"
+
+  # ── Frontend Apps ──────────────────────────────────────────────────────
+  - name: "Dashboard"
+    hostname: "dashboard"
+    port: 3000
+    check_type: "tcp"
+    category: "frontend"
+
+  - name: "Platform Admin"
+    hostname: "platform-admin"
+    port: 3001
+    check_type: "tcp"
+    category: "frontend"
+
+  - name: "Accounts"
+    hostname: "accounts"
+    port: 3002
+    check_type: "tcp"
+    category: "frontend"

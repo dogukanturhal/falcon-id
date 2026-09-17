@@ -1,0 +1,51 @@
+{{- /*
+  When `rollouts.enabled: true`, falcon-id is delivered as an Argo
+  Rollouts canary (see templates/rollout.yaml) instead of a plain
+  Deployment. The two are mutually exclusive — running both at once
+  would create duplicate pod sets and confuse Argo CD's health
+  reporting. Default is Deployment for safety; production overlays
+  flip rollouts.enabled=true once a non-falcon-id workload has
+  exercised the canary mechanism in the cluster.
+
+  The pod template body lives in `define "falcon-id.podTemplate"` in
+  templates/_helpers.tpl and is shared with templates/rollout.yaml so
+  the two delivery shapes can never drift in pod spec.
+*/ -}}
+{{- if not .Values.rollouts.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "falcon-id.fullname" . }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+  annotations:
+    {{- /*
+      Stakater Reloader — auto-roll the Deployment when any Secret /
+      ConfigMap referenced in the pod template changes. Falcon-ID
+      consumes a long list of rotated credentials (DB password, OAuth
+      signing keys, Vault token, SAML signing key, etc.); without this
+      annotation each rotation needs a manual `kubectl rollout
+      restart` to take effect, which is the operational footgun that
+      caused the 2026-04-30 IAP login outage on the sibling Talon
+      Deployment.
+
+      Reloader watches per-deployment Secret/CM hashes and triggers a
+      rollout when any change. Operator runs cluster-wide already
+      (namespace `reloader`); this annotation is the opt-in side.
+
+      Doc: https://github.com/stakater/Reloader#how-to-use-reloader
+    */}}
+    reloader.stakater.com/auto: "true"
+    {{- with .Values.deploymentAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "falcon-id.selectorLabels" . | nindent 6 }}
+  {{- include "falcon-id.podTemplate" . | nindent 2 }}
+{{- end }}{{/* if not .Values.rollouts.enabled */}}

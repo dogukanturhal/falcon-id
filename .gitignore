@@ -1,0 +1,34 @@
+# Compiled binaries. The `falcon` binary was committed at the first commit
+# and has been carried in every clone since, because this file did not exist.
+falcon
+/falcon-id
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go build and coverage artefacts
+coverage.txt
+coverage.html
+*.prof
+
+# Local environment. Only the .example templates are tracked; a populated
+# .env holds real credentials and must never be committed.
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Secrets and keys — belt and braces alongside the CI secret scan.
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+kubeconfig
+*.kubeconfig
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store

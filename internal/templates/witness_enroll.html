@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device enrollment witness — Falcon ID</title>
+    <style>
+        /*
+         * Visual primitives lifted verbatim from internal/templates/login.html
+         * so the witness page matches the canonical Falcon-ID brand at
+         * /oauth/login (#159 follow-up). Any change to login.html's base
+         * card / logo / subtitle / error / button primitives MUST be mirrored
+         * here, and vice versa — operators see both pages back-to-back in
+         * the ZTNA enrollment flow and the brand presentation must be
+         * indistinguishable.
+         */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: linear-gradient(to bottom right, #f8fafc, #ffffff, #eef2ff);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            color: #020817;
+        }
+        .card {
+            background: #fff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            box-shadow: 0 20px 25px -5px rgba(2,8,23,0.06), 0 8px 10px -6px rgba(2,8,23,0.05);
+            padding: 40px;
+            width: 100%;
+            max-width: 400px;
+        }
+        .logo {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .logo-mark {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 56px;
+            height: 56px;
+            border-radius: 16px;
+            background: #2563eb;
+            color: #ffffff;
+            box-shadow: 0 10px 15px -3px rgba(37,99,235,0.25);
+        }
+        .logo-word {
+            font-size: 24px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: #020817;
+        }
+        .subtitle {
+            text-align: center;
+            margin-bottom: 28px;
+            color: #64748b;
+            font-size: 15px;
+        }
+        /* Error banner — IDENTICAL ruleset to login.html .error so an
+         * operator who just saw a wrong-password banner on /oauth/login
+         * sees the same shape/colour for any witness-page error here. */
+        .error {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            color: #b91c1c;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+        .error strong {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+        /* Info + success banners use the same shell (padding, border,
+         * radius, font-size) as .error so the visual rhythm matches. */
+        .info {
+            background: #eef4ff;
+            border: 1px solid #b6cffb;
+            color: #1d4ed8;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+        .success {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            color: #166534;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+        .success strong {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+        .state { display: none; }
+        .state.visible { display: block; }
+        .operator {
+            background: #f1f5f9;
+            border-radius: 8px;
+            padding: 10px 14px;
+            text-align: center;
+            font-size: 13px;
+            color: #020817;
+            margin-bottom: 20px;
+        }
+        .operator strong { color: #2563eb; }
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: #020817;
+        }
+        /* Fact rows are the witness-page analogue of the login form's
+         * <label>/<input> pairs: same vertical rhythm + same border /
+         * radius / focus-tint as the login text inputs so the page reads
+         * like a sign-in form even though the fields are read-only. */
+        .fact {
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            line-height: 1.5;
+            background: #fff;
+        }
+        .fact .label {
+            color: #64748b;
+            font-weight: 500;
+            display: block;
+            margin-bottom: 4px;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+        }
+        .fact .value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 13px;
+            word-break: break-all;
+            color: #020817;
+        }
+        /* Primary button — IDENTICAL ruleset to login.html button so the
+         * "Sign with your security key" CTA has exactly the same shape,
+         * colour, padding, and hover/active tints as login's "Sign in". */
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        button:hover:not(:disabled) { background: #1d4ed8; }
+        button:active:not(:disabled) { background: #1e40af; }
+        button:disabled { background: #94a3b8; cursor: not-allowed; }
+        button.secondary {
+            background: #e2e8f0;
+            color: #020817;
+            font-size: 14px;
+            padding: 10px;
+            font-weight: 500;
+        }
+        button.secondary:hover { background: #d1d1d6; }
+        .actions {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .fallback {
+            margin-top: 12px;
+            display: none;
+        }
+        .fallback.visible { display: block; }
+        .fallback textarea {
+            width: 100%;
+            min-height: 110px;
+            padding: 10px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 11px;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            background: #f8fafc;
+            color: #020817;
+            resize: vertical;
+        }
+        .fallback p { font-size: 13px; color: #64748b; margin-bottom: 8px; }
+        .footer {
+            margin-top: 24px;
+            padding-top: 16px;
+            border-top: 1px solid #e2e8f0;
+            font-size: 11px;
+            color: #64748b;
+            text-align: center;
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="card" id="card">
+        <div class="logo"><span class="logo-mark"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="logo-word">Falcon ID</span></div>
+        <div class="subtitle">Witness device enrollment with your security key.</div>
+
+        <div class="operator">
+            Signing as <strong id="operator-email">{{.OperatorEmail}}</strong>
+            <span id="operator-sub" style="display:none">{{.OperatorSub}}</span>
+        </div>
+
+        <div class="state info" id="state-info">
+            <span id="state-info-msg">Working&hellip;</span>
+        </div>
+
+        <div class="state success" id="state-success">
+            <strong>Device enrollment witness submitted</strong>
+            <span id="success-detail">You can close this window.</span>
+        </div>
+
+        <div class="state error" id="state-error">
+            <strong id="error-title">Something went wrong</strong>
+            <span id="error-detail"></span>
+            <div class="actions" style="margin-top:12px">
+                <button type="button" id="retry-btn" style="display:none">Try again</button>
+                <button type="button" class="secondary" id="copy-debug-btn">Copy debug info</button>
+            </div>
+            <div class="fallback" id="fallback">
+                <p>The desktop enrollment app could not be reached. Copy the witness payload below and paste it into the enrollment wizard.</p>
+                <textarea id="fallback-payload" readonly></textarea>
+                <div class="actions" style="margin-top:8px">
+                    <button type="button" class="secondary" id="copy-payload-btn">Copy payload</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="fact">
+            <span class="label">Device UUID</span>
+            <span class="value" title="{{.DeviceUUID}}">{{.DeviceUUID}}</span>
+        </div>
+        <div class="fact">
+            <span class="label">EK public-key hash (SHA-256)</span>
+            <span class="value" title="{{.EKPubkeyHash}}">{{.EKPubkeyHash}}</span>
+        </div>
+        <div class="fact">
+            <span class="label">Callback target</span>
+            <span class="value" title="{{.CallbackURL}}">{{.CallbackURL}}</span>
+        </div>
+
+        <div class="actions">
+            <button type="button" id="sign-btn">Sign with your security key</button>
+        </div>
+
+        <div class="footer">
+            Witness JWS expires 10 minutes after signing. <br>
+            Audience: internal.example.com / device-attest
+        </div>
+    </div>
+
+    <script>
+    // SECURITY: state is in-memory only. No cookies are set, no localStorage
+    // is touched. The bootstrap payload below is server-rendered through
+    // html/template so every field is HTML-escaped at template-execution
+    // time. We read the values back out via JSON.parse on a server-emitted
+    // <script type="application/json"> island below to keep the JS source
+    // free of string concatenation.
+    </script>
+    <script type="application/json" id="bootstrap-data">{{.BootstrapJSON}}</script>
+    <script>
+    (function () {
+        var data;
+        try {
+            data = JSON.parse(document.getElementById('bootstrap-data').textContent || '{}');
+        } catch (e) {
+            data = {};
+        }
+
+        var signBtn = document.getElementById('sign-btn');
+        var retryBtn = document.getElementById('retry-btn');
+        var copyDebugBtn = document.getElementById('copy-debug-btn');
+        var copyPayloadBtn = document.getElementById('copy-payload-btn');
+        var stateInfo = document.getElementById('state-info');
+        var stateInfoMsg = document.getElementById('state-info-msg');
+        var stateSuccess = document.getElementById('state-success');
+        var stateError = document.getElementById('state-error');
+        var errorTitle = document.getElementById('error-title');
+        var errorDetail = document.getElementById('error-detail');
+        var fallback = document.getElementById('fallback');
+        var fallbackPayload = document.getElementById('fallback-payload');
+        var successDetail = document.getElementById('success-detail');
+
+        function setVisible(el, visible) {
+            if (visible) { el.classList.add('visible'); } else { el.classList.remove('visible'); }
+        }
+
+        function hideAllStates() {
+            setVisible(stateInfo, false);
+            setVisible(stateSuccess, false);
+            setVisible(stateError, false);
+            setVisible(fallback, false);
+            retryBtn.style.display = 'none';
+        }
+
+        function showInfo(msg) {
+            hideAllStates();
+            stateInfoMsg.textContent = msg;
+            setVisible(stateInfo, true);
+        }
+
+        function showError(title, detail, opts) {
+            hideAllStates();
+            errorTitle.textContent = title;
+            errorDetail.textContent = detail || '';
+            setVisible(stateError, true);
+            if (opts && opts.retryable) { retryBtn.style.display = 'block'; }
+            if (opts && opts.fallback && opts.fallbackPayload) {
+                fallbackPayload.value = opts.fallbackPayload;
+                setVisible(fallback, true);
+            }
+            signBtn.disabled = false;
+        }
+
+        function showSuccess(closeMsg) {
+            hideAllStates();
+            successDetail.textContent = closeMsg;
+            setVisible(stateSuccess, true);
+        }
+
+        // base64url <-> ArrayBuffer helpers (WebAuthn wire format).
+        function b64uToBuf(b64u) {
+            var b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
+            var pad = b64.length % 4;
+            if (pad) { b64 += '===='.slice(pad); }
+            var bin = atob(b64);
+            var buf = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) { buf[i] = bin.charCodeAt(i); }
+            return buf.buffer;
+        }
+        function bufToB64u(buf) {
+            var bytes = new Uint8Array(buf);
+            var bin = '';
+            for (var i = 0; i < bytes.byteLength; i++) { bin += String.fromCharCode(bytes[i]); }
+            return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        }
+
+        // Build the PublicKeyCredentialRequestOptions the browser's WebAuthn
+        // ceremony expects. Matches the shape WebAuthnService.BeginAuthentication
+        // returns; only the byte-encoded fields need decoding.
+        function toCredentialRequestOptions(challenge) {
+            // The begin response is AuthenticationChallenge:
+            //   { publicKey: CredentialAssertion, wa_session_id: "..." }
+            // and CredentialAssertion itself serialises as
+            //   { publicKey: { challenge, allowCredentials, rpId, ... } }
+            // so the real PublicKeyCredentialRequestOptions are up to TWO
+            // "publicKey" levels deep. A single-level unwrap left opts.challenge
+            // undefined and threw "b64u is undefined" (live repro 2026-06-16).
+            var opts = challenge;
+            if (opts && opts.publicKey) { opts = opts.publicKey; }
+            if (opts && opts.publicKey) { opts = opts.publicKey; }
+            var out = Object.assign({}, opts);
+            out.challenge = b64uToBuf(opts.challenge);
+            if (Array.isArray(opts.allowCredentials)) {
+                out.allowCredentials = opts.allowCredentials.map(function (c) {
+                    return { type: c.type, id: b64uToBuf(c.id), transports: c.transports };
+                });
+            }
+            out.userVerification = 'required';
+            return out;
+        }
+
+        function assertionToBody(assertion) {
+            return {
+                id: assertion.id,
+                rawId: bufToB64u(assertion.rawId),
+                type: assertion.type,
+                response: {
+                    authenticatorData: bufToB64u(assertion.response.authenticatorData),
+                    clientDataJSON: bufToB64u(assertion.response.clientDataJSON),
+                    signature: bufToB64u(assertion.response.signature),
+                    userHandle: assertion.response.userHandle ? bufToB64u(assertion.response.userHandle) : null
+                },
+                clientExtensionResults: assertion.getClientExtensionResults ? assertion.getClientExtensionResults() : {}
+            };
+        }
+
+        async function postJSON(path, body) {
+            var resp = await fetch(path, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'X-CSRF-Token': data.csrfToken || ''
+                },
+                body: body ? JSON.stringify(body) : null
+            });
+            var text = await resp.text();
+            var parsed = null;
+            try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = null; }
+            return { status: resp.status, ok: resp.ok, body: parsed, raw: text };
+        }
+
+        function classifyBeginError(resp) {
+            if (resp.status === 401) { return { title: 'Sign-in required', detail: 'Your session expired. Sign in again to continue.', retryable: false }; }
+            if (resp.status === 403) { return { title: 'Not a platform admin', detail: 'Only HexxLock platform admins can witness device enrollment.', retryable: false }; }
+            if (resp.status === 400) { return { title: 'Bad request', detail: (resp.body && resp.body.error) || 'device_uuid invalid', retryable: false }; }
+            return { title: 'Could not start signing', detail: (resp.body && resp.body.error) || ('HTTP ' + resp.status), retryable: true };
+        }
+
+        function classifyFinishError(resp) {
+            if (resp.status === 401) { return { title: 'Security key not accepted', detail: (resp.body && resp.body.error) || 'WebAuthn assertion failed verification.', retryable: true }; }
+            if (resp.status === 503) { return { title: 'Witness signing unavailable', detail: (resp.body && resp.body.error) || 'Signing key is not configured on this Falcon-ID instance.', retryable: false }; }
+            if (resp.status >= 500) { return { title: 'JWS minting failed', detail: (resp.body && resp.body.error) || ('HTTP ' + resp.status), retryable: true }; }
+            return { title: 'Could not finish signing', detail: (resp.body && resp.body.error) || ('HTTP ' + resp.status), retryable: true };
+        }
+
+        async function postCallback(payload) {
+            // Strict same-origin omit: the callback target is a 127.0.0.1
+            // localhost port, never the Falcon-ID origin. Omit credentials
+            // to keep the operator's id.hexxlock.com cookies off the wire.
+            var resp = await fetch(data.callbackUrl, {
+                method: 'POST',
+                credentials: 'omit',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!resp.ok) {
+                throw new Error('callback returned HTTP ' + resp.status);
+            }
+        }
+
+        var lastDebug = null;
+
+        async function run() {
+            signBtn.disabled = true;
+            showInfo('Starting ceremony…');
+            try {
+                var begin = await postJSON('/api/v1/auth/webauthn/witness/begin', {
+                    device_uuid: data.deviceUUID,
+                    ek_pubkey_hash: data.ekPubkeyHash
+                });
+                if (!begin.ok) {
+                    var e = classifyBeginError(begin);
+                    lastDebug = { stage: 'begin', status: begin.status, body: begin.raw };
+                    showError(e.title, e.detail, { retryable: e.retryable });
+                    return;
+                }
+                var challenge = begin.body;
+                // Server (AuthenticationChallenge) sends the session id as
+                // `wa_session_id`; keep the camel/snake fallbacks for safety.
+                var sessionID = (challenge && (challenge.wa_session_id || challenge.sessionId || challenge.session_id)) || '';
+
+                showInfo('Touch your security key…');
+                var assertion;
+                try {
+                    assertion = await navigator.credentials.get({ publicKey: toCredentialRequestOptions(challenge) });
+                } catch (err) {
+                    lastDebug = { stage: 'webauthn-get', error: String(err && err.message || err), name: err && err.name };
+                    if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+                        showError('Ceremony cancelled', 'The security-key prompt was dismissed. Press try again when you are ready.', { retryable: true });
+                    } else if (err && err.name === 'InvalidStateError') {
+                        showError('Credential not enrolled', 'This security key is not registered to your Falcon-ID account.', { retryable: false });
+                    } else {
+                        showError('Security-key error', String(err && err.message || err), { retryable: true });
+                    }
+                    return;
+                }
+
+                showInfo('Verifying assertion…');
+                var finishPath = '/api/v1/auth/webauthn/witness/finish?wa_session_id=' + encodeURIComponent(sessionID);
+                var finishBody = assertionToBody(assertion);
+                finishBody.device_uuid = data.deviceUUID;
+                var finish = await postJSON(finishPath, finishBody);
+                if (!finish.ok) {
+                    var f = classifyFinishError(finish);
+                    lastDebug = { stage: 'finish', status: finish.status, body: finish.raw };
+                    showError(f.title, f.detail, { retryable: f.retryable });
+                    return;
+                }
+                var jws = finish.body;
+                var callbackPayload = {
+                    signed_jws: jws.signed_jws,
+                    admin_sub: jws.admin_sub,
+                    issued_at: jws.issued_at,
+                    expires_at: jws.expires_at,
+                    device_uuid: data.deviceUUID,
+                    state: data.state || ''
+                };
+                showInfo('Returning the witness to the enrollment app…');
+                try {
+                    await postCallback(callbackPayload);
+                } catch (cbErr) {
+                    lastDebug = { stage: 'callback', error: String(cbErr && cbErr.message || cbErr) };
+                    showError(
+                        'Could not reach the enrollment app',
+                        'Copy the witness payload below and paste it into the enrollment wizard.',
+                        { retryable: true, fallback: true, fallbackPayload: JSON.stringify(callbackPayload, null, 2) }
+                    );
+                    return;
+                }
+                showSuccess('You can close this window. Auto-closing in 3 seconds…');
+                setTimeout(function () {
+                    try { window.close(); } catch (e) { /* ignore */ }
+                    successDetail.textContent = 'You can close this window.';
+                }, 3000);
+            } catch (err) {
+                lastDebug = { stage: 'unknown', error: String(err && err.message || err) };
+                showError('Unexpected error', String(err && err.message || err), { retryable: true });
+            }
+        }
+
+        signBtn.addEventListener('click', run);
+        retryBtn.addEventListener('click', run);
+        copyDebugBtn.addEventListener('click', function () {
+            var blob = JSON.stringify({
+                debug: lastDebug,
+                deviceUUID: data.deviceUUID,
+                ekPubkeyHash: data.ekPubkeyHash,
+                callbackUrl: data.callbackUrl,
+                operatorSub: data.operatorSub,
+                state: data.state,
+                at: new Date().toISOString()
+            }, null, 2);
+            navigator.clipboard.writeText(blob).then(function () {
+                copyDebugBtn.textContent = 'Copied';
+                setTimeout(function () { copyDebugBtn.textContent = 'Copy debug info'; }, 1500);
+            });
+        });
+        copyPayloadBtn.addEventListener('click', function () {
+            navigator.clipboard.writeText(fallbackPayload.value).then(function () {
+                copyPayloadBtn.textContent = 'Copied';
+                setTimeout(function () { copyPayloadBtn.textContent = 'Copy payload'; }, 1500);
+            });
+        });
+    })();
+    </script>
+</body>
+</html>

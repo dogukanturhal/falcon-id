@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - bodyclose
+
+linters-settings:
+  errcheck:
+    exclude-functions:
+      - (*database/sql.DB).Close
+      - (*database/sql.Rows).Close
+      - (*database/sql.Stmt).Close
+      - (*database/sql.Tx).Rollback
+      - (*net/http.Response).Body.Close
+      - (io.Closer).Close
+      - (*os.File).Close
+      - (*github.com/jackc/pgx/v5/pgxpool.Pool).Close
+      - (*github.com/redis/go-redis/v9.Client).Close
+      - (*github.com/redis/go-redis/v9.PubSub).Close
+      - (*go.uber.org/zap.Logger).Sync
+      - (*text/tabwriter.Writer).Flush
+      - (*encoding/csv.Writer).Write
+      - fmt.Fprintf
+      - fmt.Fprintln
+      - fmt.Fprint
+      - fmt.Sscanf
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
