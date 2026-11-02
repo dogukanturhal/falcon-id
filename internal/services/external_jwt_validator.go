@@ -24,7 +24,7 @@ import (
 // ExternalJWTValidator verifies JWTs signed by EXTERNAL issuers
 // registered as iam_oauth_trusted_external_issuers rows — most
 // importantly the Talon Identity-Aware Proxy at
-// internal.example.com. Distinct from
+// auth.internal.example.com. Distinct from
 // OAuthProviderService.ValidateAccessToken (which only validates
 // JWTs Falcon-ID issued itself, by checking against its own RSA
 // public key + iam_oauth_tokens row).

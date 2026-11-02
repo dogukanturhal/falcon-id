@@ -146,17 +146,39 @@ type RegisterModuleRequest struct {
 	// for this Module but absent from Permissions are soft-deprecated.
 	// Defaults to false (additive, backward-compat).
 	Prune bool `json:"prune,omitempty"`
+
+	// Dependencies declares other module names this module's role templates
+	// are allowed to reference permissions from, in addition to Module
+	// itself and the permissions already present in this same Permissions
+	// payload. Optional and additive — omitting it (the pre-existing
+	// behaviour for every caller that doesn't use RoleTemplates) means role
+	// templates may only reference permissions belonging to Module or to
+	// this same request's Permissions.
+	Dependencies []string `json:"dependencies,omitempty"`
+
+	// RoleTemplates publishes this module's versioned starter-role catalog
+	// (the product roadmap §4.1 "Role templates"). Optional and additive: a
+	// caller that omits it (every existing RegisterModule caller today)
+	// behaves exactly as before. See RoleTemplateDefinition for the
+	// per-template validation rules (key ownership, permission scope,
+	// monotonic version).
+	RoleTemplates []RoleTemplateDefinition `json:"role_templates,omitempty"`
 }
 
 // RegisterModuleResponse is the response for permission registration
 type RegisterModuleResponse struct {
-	Module      string               `json:"module"`
-	Registered  int                  `json:"registered"`
-	Updated     int                  `json:"updated"`
+	Module     string `json:"module"`
+	Registered int    `json:"registered"`
+	Updated    int    `json:"updated"`
 	// Deprecated is the count of catalog rows transitioned to the
 	// deprecated state during this call. Always 0 when Prune=false.
 	Deprecated  int                  `json:"deprecated"`
 	Permissions []PermissionResponse `json:"permissions"`
+
+	// RoleTemplates lists the templates that were registered (newly
+	// inserted or matched an existing identical version) during this call.
+	// Empty when the request omitted RoleTemplates.
+	RoleTemplates []RoleTemplateResponse `json:"role_templates,omitempty"`
 }
 
 // CreatePermissionRequest is the request body for creating a single permission
@@ -205,9 +227,74 @@ type BatchAuthorizeRequest struct {
 	TenantID    uuid.UUID `json:"tenantId"`
 }
 
-// BatchAuthorizeResponse is the response for batch authorization check
+// DecisionReason is the machine-readable reason a permission was not granted
+// (23-authorization-rbac-abac-rebac.md §5.6/§7.2). It shares one vocabulary
+// with the audit reason_code and the frontend's disabled-with-reason / 403
+// copy. Every value other than "" is a deny; anything the service cannot
+// classify is DecisionReasonUnknown (fail closed).
+type DecisionReason string
+
+const (
+	// DecisionReasonEntitlementMissing: the tenant's plan does not include the
+	// permission's module (module_not_entitled).
+	DecisionReasonEntitlementMissing DecisionReason = "entitlement_missing_for_module"
+	// DecisionReasonPermissionDenied: the user holds no role granting it.
+	DecisionReasonPermissionDenied DecisionReason = "permission_denied"
+	// DecisionReasonCaveatFailed: a role/relation grants it but a caveat
+	// (approval limit, time window, elevation...) did not pass or could not be
+	// decided. PermissionDecision.Caveat / MissingContext say which.
+	DecisionReasonCaveatFailed DecisionReason = "caveat_failed"
+	// DecisionReasonSoDConflict: a block-mode separation-of-duties rule
+	// forbids this permission for the user.
+	DecisionReasonSoDConflict DecisionReason = "sod_conflict"
+	// DecisionReasonTenantSuspended: the tenant is suspended.
+	DecisionReasonTenantSuspended DecisionReason = "tenant_suspended"
+	// DecisionReasonPermissionSunset: the permission was retired.
+	DecisionReasonPermissionSunset DecisionReason = "permission_sunset"
+	// DecisionReasonUnavailable: a dependency needed to decide (SpiceDB,
+	// entitlement lookup) failed; the decision fails closed.
+	DecisionReasonUnavailable DecisionReason = "authz_unavailable"
+	// DecisionReasonUnknown: denied for a reason the service cannot classify.
+	DecisionReasonUnknown DecisionReason = "unknown"
+)
+
+// PermissionDecision is the per-key answer of authorize/batch.
+type PermissionDecision struct {
+	Allowed bool           `json:"allowed"`
+	Reason  DecisionReason `json:"reason,omitempty"`
+	// Caveat names the failed caveat when Reason is caveat_failed and it is
+	// known; MissingContext lists caveat parameters that were not supplied.
+	Caveat         string   `json:"caveat,omitempty"`
+	MissingContext []string `json:"missingContext,omitempty"`
+	// Module is the module the denial concerns (entitlement_missing_for_module).
+	Module string `json:"module,omitempty"`
+}
+
+// BatchAuthorizeResponse is the response for batch authorization check.
+// Results is the legacy key->bool map (kept so existing callers keep working);
+// Decisions carries the same verdict per key plus the reason for a denial.
 type BatchAuthorizeResponse struct {
-	Results map[string]bool `json:"results"`
+	Results   map[string]bool               `json:"results"`
+	Decisions map[string]PermissionDecision `json:"decisions"`
+}
+
+// SimulateRequest is the body of POST /api/v1/authorize/simulate: "can user X
+// do Y, and why". The user must belong to the caller's own tenant.
+type SimulateRequest struct {
+	UserID     uuid.UUID `json:"userId" binding:"required"`
+	Permission string    `json:"permission" binding:"required"`
+}
+
+// SimulateResponse is the policy-simulator answer: the same decision
+// authorize/batch would give, plus the SpiceDB resolution trace and any open
+// SoD warnings that touch the permission.
+type SimulateResponse struct {
+	UserID      uuid.UUID          `json:"userId"`
+	Permission  string             `json:"permission"`
+	Decision    PermissionDecision `json:"decision"`
+	Trace       interface{}        `json:"trace,omitempty"`
+	Caveats     interface{}        `json:"caveats,omitempty"`
+	SoDWarnings []SoDViolation     `json:"sodWarnings,omitempty"`
 }
 
 // EffectivePermissionsResponse is the response for getting user's effective permissions

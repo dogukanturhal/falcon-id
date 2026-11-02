@@ -45,9 +45,18 @@ type groupServiceRoleRepo interface {
 
 // GroupService handles group business logic
 type GroupService struct {
-	groupRepo groupServiceGroupRepo
-	userRepo  groupServiceUserRepo
-	roleRepo  groupServiceRoleRepo
+	groupRepo  groupServiceGroupRepo
+	userRepo   groupServiceUserRepo
+	roleRepo   groupServiceRoleRepo
+	sodService userServiceSoDEvaluator // Optional: ADR-A10 SoD warn-mode evaluation on group role-set writes
+}
+
+// SetSoDService wires ADR-A10 SoD evaluation into GroupService. Safe to
+// call with nil (evaluation is then simply skipped). A group's role set
+// change affects every member's effective permissions, so SetRoles
+// evaluates SoD per member — see SetRoles.
+func (s *GroupService) SetSoDService(svc userServiceSoDEvaluator) {
+	s.sodService = svc
 }
 
 // NewGroupService creates a new GroupService
@@ -480,7 +489,35 @@ func (s *GroupService) SetRoles(ctx context.Context, groupID uuid.UUID, roleIDs 
 		}
 	}
 
+	// ADR-A10 SoD (23-authorization-rbac-abac-rebac.md §5.2): a group's
+	// role set is itself a "role-assignment write" affecting every
+	// member's effective permissions — evaluate each member. Best-effort:
+	// paginated, warn-mode only, never fails this write.
+	if s.sodService != nil {
+		s.evaluateSoDForMembers(ctx, group.TenantID, groupID, roleIDs)
+	}
+
 	return nil
+}
+
+// evaluateSoDForMembers walks every member of groupID and triggers an
+// async, non-blocking ADR-A10 SoD evaluation for each — see SetRoles.
+func (s *GroupService) evaluateSoDForMembers(ctx context.Context, tenantID, groupID uuid.UUID, roleIDs []uuid.UUID) {
+	const pageSize = 200
+	page := 1
+	for {
+		members, total, err := s.groupRepo.GetMembers(ctx, groupID, page, pageSize)
+		if err != nil || len(members) == 0 {
+			return
+		}
+		for _, m := range members {
+			s.sodService.EvaluateUserAsync(ctx, tenantID, m.UserID, roleIDs)
+		}
+		if page*pageSize >= total {
+			return
+		}
+		page++
+	}
 }
 
 // ==================== Effective Permissions ====================

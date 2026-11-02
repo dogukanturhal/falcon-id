@@ -81,6 +81,9 @@ func (h *MagicLinkHandler) VerifyMagicLink(c *gin.Context) {
 
 	response, err := h.magicLinkService.VerifyMagicLink(c.Request.Context(), req.Token, ipAddress, userAgent)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
@@ -110,6 +113,9 @@ func (h *MagicLinkHandler) VerifyMagicLinkFromQuery(c *gin.Context) {
 
 	response, err := h.magicLinkService.VerifyMagicLink(c.Request.Context(), token, ipAddress, userAgent)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}

@@ -57,6 +57,22 @@ type ProductLookup interface {
 	LookupProductForTenant(ctx context.Context, tenantID uuid.UUID) (uuid.UUID, error)
 }
 
+// productSlugResolver resolves a product's Slug — falcon-id's module-namespace
+// equivalent for a provisioned product (see TemplateRoleProvisioner /
+// PermissionService.RegisterModule's Module field) — from its ID. Satisfied
+// by *repositories.ProductRepository.GetByID.
+type productSlugResolver interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*models.Product, error)
+}
+
+// moduleGrantProvisioner materializes a module's role templates for a tenant
+// once that module/product has been granted/entitled. Satisfied by
+// *TemplateRoleProvisioner. See ProvisionForModuleGrant's doc comment for
+// why "module" is mapped 1:1 to models.Product.Slug here.
+type moduleGrantProvisioner interface {
+	ProvisionForModuleGrant(ctx context.Context, tenantID uuid.UUID, module string) (int, error)
+}
+
 // ── Options ─────────────────────────────────────────────────────────────────
 
 // ConsumerOption configures a ProvisioningConsumer.
@@ -69,15 +85,33 @@ func WithProductLookup(lookup ProductLookup) ConsumerOption {
 	}
 }
 
+// WithTemplateRoleProvisioner wires TemplateRoleProvisioner into the
+// subscription-activated path (the product roadmap §4.1 "Role templates"):
+// example.tenant.subscription.activated is falcon-id's existing closest
+// analog to a "module granted" event, so this is the trigger
+// ProvisionForModuleGrant runs off, rather than a bespoke new event. It is
+// optional (nil by default) and best-effort — a failure here must never
+// fail the product-instance provisioning it rides along with. productSlugs
+// resolves the granted product's Slug (the module namespace); when omitted,
+// the hook is skipped entirely (there is no way to resolve a module name).
+func WithTemplateRoleProvisioner(provisioner moduleGrantProvisioner, productSlugs productSlugResolver) ConsumerOption {
+	return func(c *ProvisioningConsumer) {
+		c.templateProvisioner = provisioner
+		c.productSlugs = productSlugs
+	}
+}
+
 // ── Consumer ────────────────────────────────────────────────────────────────
 
 // ProvisioningConsumer handles subscription lifecycle events and triggers
 // product instance provisioning. It decouples the Kafka transport from the
 // business logic, making it testable without Kafka dependencies.
 type ProvisioningConsumer struct {
-	instanceSvc   provisioningInstanceService
-	orchestrator  provisioningReconciler
-	productLookup ProductLookup
+	instanceSvc         provisioningInstanceService
+	orchestrator        provisioningReconciler
+	productLookup       ProductLookup
+	templateProvisioner moduleGrantProvisioner
+	productSlugs        productSlugResolver
 }
 
 // NewProvisioningConsumer creates a new provisioning consumer.
@@ -94,6 +128,28 @@ func NewProvisioningConsumer(
 		opt(c)
 	}
 	return c
+}
+
+// provisionRoleTemplatesForGrant is the best-effort module-grant hook shared
+// by HandleSubscriptionActivated and HandleSubscriptionActivatedSync. It
+// never returns an error: role-template provisioning is additive convenience
+// (tenants can still self-serve via POST /role-templates/{key}/instantiate),
+// so it must not fail — or block — the product instance provisioning it
+// rides along with.
+func (c *ProvisioningConsumer) provisionRoleTemplatesForGrant(ctx context.Context, tenantID, productID uuid.UUID) {
+	if c.templateProvisioner == nil || c.productSlugs == nil {
+		return
+	}
+	product, err := c.productSlugs.GetByID(ctx, productID)
+	if err != nil || product == nil || product.Slug == "" {
+		if err != nil {
+			log.Printf("[ProvisioningConsumer] resolve product slug for role templates failed (tenant=%s product=%s): %v", tenantID, productID, err)
+		}
+		return
+	}
+	if _, err := c.templateProvisioner.ProvisionForModuleGrant(ctx, tenantID, product.Slug); err != nil {
+		log.Printf("[ProvisioningConsumer] role template provisioning failed (tenant=%s module=%s): %v", tenantID, product.Slug, err)
+	}
 }
 
 // HandleSubscriptionActivated processes a subscription.activated event by
@@ -120,6 +176,9 @@ func (c *ProvisioningConsumer) HandleSubscriptionActivated(ctx context.Context, 
 			log.Printf("[ProvisioningConsumer] reconcile failed for instance %s: %v", pi.ID, err)
 		}
 	}()
+
+	// Best-effort role-template materialization; see provisionRoleTemplatesForGrant.
+	go c.provisionRoleTemplatesForGrant(context.Background(), event.TenantID, productID) //nolint:gosec // goroutine must outlive request context
 
 	return nil
 }
@@ -172,6 +231,9 @@ func (c *ProvisioningConsumer) HandleSubscriptionActivatedSync(ctx context.Conte
 		return fmt.Errorf("reconcile product instance to terminal state: %w", err)
 	}
 
+	// Best-effort role-template materialization; see provisionRoleTemplatesForGrant.
+	c.provisionRoleTemplatesForGrant(ctx, event.TenantID, productID)
+
 	return nil
 }
 
@@ -190,5 +252,5 @@ func (c *ProvisioningConsumer) resolveProductID(ctx context.Context, event Subsc
 		return pid, nil
 	}
 
-	return models.WellKnownProductHexxLockERP, nil
+	return models.WellKnownProductExampleSuite, nil
 }

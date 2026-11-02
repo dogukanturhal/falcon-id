@@ -47,7 +47,7 @@ func handleCallback(c *gin.Context) {
 import "github.com/dogukanturhal/platform-shared/security"
 
 // Only allow specific domains
-allowedDomains := []string{"hexxlock.com", "example.com"}
+allowedDomains := []string{"example.com", "example.com"}
 
 if err := security.ValidateURLWithAllowlist(redirectURL, allowedDomains); err != nil {
     return fmt.Errorf("invalid redirect URL: %w", err)
@@ -63,7 +63,7 @@ import "github.com/dogukanturhal/platform-shared/security"
 config := security.URLValidatorConfig{
     RequireHTTPS:    true,
     BlockPrivateIPs: true,
-    AllowedDomains:  []string{"hexxlock.com", "partner.com"},
+    AllowedDomains:  []string{"example.com", "partner.com"},
 }
 
 validator := security.NewURLValidator(config)

@@ -4,11 +4,17 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"os"
+	"strings"
+	"syscall"
 	"time"
 
 	sharedDB "github.com/dogukanturhal/falcon-id/internal/shared/database"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -17,32 +23,106 @@ type PostgresDB struct {
 	Pool *pgxpool.Pool
 }
 
-// NewPostgresDB is an exported function.
+// NewPostgresDB connects using the pool configuration from the DB_* environment.
 func NewPostgresDB(databaseURL string) (*PostgresDB, error) {
+	return NewPostgresDBWithPool(databaseURL, sharedDB.LoadPoolConfig())
+}
+
+// NewPostgresDBWithPool connects with an explicit pool configuration. Transient
+// failures (server out of connection slots, starting up, network errors) are
+// retried with exponential backoff within DB_CONNECT_RETRY_MAX (default 90s).
+func NewPostgresDBWithPool(databaseURL string, poolConfig sharedDB.PoolConfig) (*PostgresDB, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse database URL: %w", err)
 	}
 
-	// Configure connection pool from environment (defaults: 50 open, 10 idle, 5m lifetime, 1m idle time)
-	poolConfig := sharedDB.LoadPoolConfig()
 	poolConfig.ApplyToPgxPool(config)
 	log.Printf("Database pool configured: %s", poolConfig)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	var pool *pgxpool.Pool
+	err = retryTransient(connectRetryMax(), time.Now, time.Sleep, func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
-	pool, err := pgxpool.NewWithConfig(ctx, config)
+		p, cerr := pgxpool.NewWithConfig(ctx, config)
+		if cerr != nil {
+			return fmt.Errorf("failed to create connection pool: %w", cerr)
+		}
+		if perr := p.Ping(ctx); perr != nil {
+			p.Close()
+			return fmt.Errorf("failed to ping database: %w", perr)
+		}
+		pool = p
+		return nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create connection pool: %w", err)
-	}
-
-	// Test connection
-	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+		return nil, err
 	}
 
 	return &PostgresDB{Pool: pool}, nil
+}
+
+const (
+	defaultConnectRetryMax = 90 * time.Second
+	retryInitialBackoff    = 1 * time.Second
+	retryMaxBackoff        = 8 * time.Second
+)
+
+// connectRetryMax reads DB_CONNECT_RETRY_MAX (duration, default 90s).
+func connectRetryMax() time.Duration {
+	val := os.Getenv("DB_CONNECT_RETRY_MAX")
+	if val == "" {
+		return defaultConnectRetryMax
+	}
+	d, err := time.ParseDuration(val)
+	if err != nil || d < 0 {
+		log.Printf("WARNING: invalid duration for DB_CONNECT_RETRY_MAX=%q, using default %s", val, defaultConnectRetryMax)
+		return defaultConnectRetryMax
+	}
+	return d
+}
+
+// isTransientConnectError reports whether a connect failure is worth retrying:
+// SQLSTATE 53300 (too many clients), 57P03 (cannot connect now), class 08
+// (connection exception), and dial/network errors.
+func isTransientConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "53300" || pgErr.Code == "57P03" || strings.HasPrefix(pgErr.Code, "08")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// retryTransient runs attempt until it succeeds, fails non-transiently, or the
+// next backoff would exceed budget. now and sleep are injectable for tests.
+func retryTransient(budget time.Duration, now func() time.Time, sleep func(time.Duration), attempt func() error) error {
+	start := now()
+	backoff := retryInitialBackoff
+	for n := 1; ; n++ {
+		err := attempt()
+		if err == nil {
+			return nil
+		}
+		if !isTransientConnectError(err) {
+			return err
+		}
+		if now().Sub(start)+backoff > budget {
+			return fmt.Errorf("database not reachable after %d attempts: %w", n, err)
+		}
+		log.Printf("WARNING: database connect attempt %d failed (transient), retrying in %s: %v", n, backoff, err)
+		sleep(backoff)
+		if backoff *= 2; backoff > retryMaxBackoff {
+			backoff = retryMaxBackoff
+		}
+	}
 }
 
 // Close is an exported function.

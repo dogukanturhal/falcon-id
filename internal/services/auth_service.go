@@ -24,21 +24,25 @@ import (
 
 // AuthService is an exported type.
 type AuthService struct {
-	config            *config.Config
-	userRepo          *repositories.UserRepository
-	roleRepo          *repositories.RoleRepository
-	sessionRepo       *repositories.SessionRepository
-	tokenRepo         *repositories.TokenRepository
-	tenantRepo        *repositories.TenantRepository
-	tokenService      *TokenService
-	auditService      *AuditService
-	ldapService       *LDAPService
-	mfaService        *MFAService
-	mfaEnrollmentSvc  *MFAEnrollmentService
-	riskService       *RiskService
-	deviceService     *DeviceService
-	groupService      *GroupService
-	sessionCache      *redis.SessionCache
+	config           *config.Config
+	userRepo         *repositories.UserRepository
+	roleRepo         *repositories.RoleRepository
+	sessionRepo      *repositories.SessionRepository
+	tokenRepo        *repositories.TokenRepository
+	tenantRepo       *repositories.TenantRepository
+	tokenService     *TokenService
+	auditService     *AuditService
+	ldapService      *LDAPService
+	mfaService       *MFAService
+	mfaEnrollmentSvc *MFAEnrollmentService
+	riskService      *RiskService
+	deviceService    *DeviceService
+	groupService     *GroupService
+	sessionCache     *redis.SessionCache
+	mfaUserLookup    interface {
+		GetByID(context.Context, uuid.UUID) (*models.User, error)
+		HasActiveWebAuthnCredential(context.Context, uuid.UUID) (bool, error)
+	}
 	appAccessService  *AppAccessService
 	loginDiscoverer   loginDiscoverer
 	backchannelLogout *BackchannelLogoutService
@@ -67,6 +71,8 @@ type AuthService struct {
 	// cmd/services.go alongside the other CAE publish-sites; nil-safe.
 	caeService *CAEService
 
+	accessTerminator accessTerminator
+
 	// realmRepo is optional. When set, the MFA enrollment interrupt
 	// path honors RealmSecurityPolicy.MFAGracePeriodDays + MFAEnrollmentMaxSkips
 	// — stamping per-user deadline/skip state on first prompt and gating
@@ -91,6 +97,21 @@ type AuthService struct {
 	// removed). Phase C, 2026-05-26. Nil-safe — DB writes + CAE
 	// emission remain authoritative when unset.
 	securityNotifier *SecurityNotificationService
+
+	// tenantSuspension blocks login / session creation for suspended tenants
+	// (R1-GAPS row 27). Optional; nil disables enforcement.
+	tenantSuspension TenantSuspensionChecker
+}
+
+// SetTenantSuspensionChecker wires the tenant-suspension gate.
+func (s *AuthService) SetTenantSuspensionChecker(c TenantSuspensionChecker) {
+	s.tenantSuspension = c
+}
+
+// SetAccessTerminator wires the single access-termination path used after a
+// password change (replaces the inline token/session sweep).
+func (s *AuthService) SetAccessTerminator(t accessTerminator) {
+	s.accessTerminator = t
 }
 
 // SetCAEService wires the CAEP publisher into AuthService. Safe to
@@ -339,7 +360,7 @@ func validateTenantSlug(slug string) error {
 		"test", "demo", "staging", "prod", "production",
 		"system", "root", "user", "public", "private",
 		"internal", "external", "default",
-		// track.<apex> is the click-tracking host (see apps/mearax's
+		// track.<apex> is the click-tracking host (see apps/acmeweb's
 		// apex-domains config) — a tenant slug must never collide with it.
 		"track",
 	}
@@ -380,6 +401,14 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest, ipAdd
 		return nil, fmt.Errorf("check user status: %w", err)
 	}
 
+	// 3a. Tenant suspension gate (R1-GAPS row 27). After the credential check
+	// on purpose: an unauthenticated caller must not be able to probe which
+	// tenants are suspended. Checked before MFA so no challenge is issued.
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, tenantCtx.TenantID); err != nil {
+		s.auditService.LogLogin(ctx, tenantCtx.TenantID, &user.ID, ipAddress, userAgent, false, "tenant_suspended")
+		return nil, err
+	}
+
 	// 3b. SSO-only tenant gate (t-431, d-169): local_auth_disabled rejects
 	// this login even though the password just verified correct. Placed
 	// AFTER authenticateCredentials/checkUserStatus specifically so it
@@ -409,6 +438,22 @@ func (s *AuthService) Login(ctx context.Context, req *models.LoginRequest, ipAdd
 	hasFactor, factorErr := s.userRepo.HasAnyMFAFactor(ctx, user.ID)
 	if factorErr != nil {
 		return nil, fmt.Errorf("check user MFA factor inventory: %w", factorErr)
+	}
+	// Invited owner/admin members must enrol a second factor before their first
+	// session (team invitations, D-12). Routed through the same registration-
+	// interrupt path as risk-driven MFA so enrolment, backup codes and session
+	// issuance are the single existing flow.
+	if !hasFactor && (riskAssessment == nil || !riskAssessment.RequiresMFA) {
+		invitedAdmin, adminErr := s.userRepo.RequiresInvitedAdminMFA(ctx, user.ID, tenantCtx.TenantID)
+		if adminErr != nil {
+			return nil, fmt.Errorf("check invited admin MFA requirement: %w", adminErr)
+		}
+		if invitedAdmin {
+			if riskAssessment == nil {
+				riskAssessment = &models.RiskAssessment{}
+			}
+			riskAssessment.RequiresMFA = true
+		}
 	}
 	mfaRequired := hasFactor || (riskAssessment != nil && riskAssessment.RequiresMFA)
 	if mfaRequired && req.MFACode == "" {
@@ -629,6 +674,37 @@ func (s *AuthService) checkUserStatus(ctx context.Context, tenantID uuid.UUID, u
 			zap.Time("timestamp", time.Now().UTC()),
 		)
 		return fmt.Errorf("account is disabled")
+	}
+
+	// Blocks login for both the self-service pending_deletion state
+	// (ScheduleAccountDeletion) and the admin-triggered soft-delete state
+	// (AdminSoftDeleteUser, see admin_user_lifecycle.go) — both flip
+	// ActivationStatus, neither flips IsActive, so this check is required
+	// in addition to the IsActive gate above. Distinct reason strings so
+	// the audit log tells the two paths apart.
+	switch user.ActivationStatus {
+	case "pending_deletion":
+		s.auditService.LogLogin(ctx, tenantID, &user.ID, ipAddress, userAgent, false, "account pending deletion")
+		logger.SecurityAudit.Warn("Security audit: login denied - account pending deletion",
+			zap.String("event", "auth.login.failed"),
+			zap.String("username", username),
+			zap.String("user_id", user.ID.String()),
+			zap.String("ip", ipAddress),
+			zap.String("reason", "pending_deletion"),
+			zap.Time("timestamp", time.Now().UTC()),
+		)
+		return fmt.Errorf("account is scheduled for deletion")
+	case "admin_deleted":
+		s.auditService.LogLogin(ctx, tenantID, &user.ID, ipAddress, userAgent, false, "account deleted by administrator")
+		logger.SecurityAudit.Warn("Security audit: login denied - account admin-deleted",
+			zap.String("event", "auth.login.failed"),
+			zap.String("username", username),
+			zap.String("user_id", user.ID.String()),
+			zap.String("ip", ipAddress),
+			zap.String("reason", "admin_deleted"),
+			zap.Time("timestamp", time.Now().UTC()),
+		)
+		return fmt.Errorf("account has been deleted")
 	}
 
 	if user.IsLocked {
@@ -885,18 +961,34 @@ func (s *AuthService) createMFAChallenge(ctx context.Context, tenantCtx *tenantC
 	}
 
 	mfaMethod, availableMethods := s.determineMFAMethod(user, req.PreferredMFAMethod, riskMFARequired, hasFactor, hasPasskey)
+	tempSessionID, err := s.storeMFASession(ctx, tenantCtx, user, ipAddress, userAgent, req.ClientID, mfaMethod)
+	if err != nil {
+		return nil, err
+	}
 
-	if mfaMethod == authMethodEmail && s.mfaService != nil {
+	if mfaMethod == authMethodEmail {
+		if s.mfaService == nil {
+			return nil, fmt.Errorf("%w: email verification not configured", ErrMFAUnavailable)
+		}
 		if err := s.mfaService.SendEmailMFACode(ctx, user.ID); err != nil {
 			logger.Error("Failed to send MFA email code", zap.Error(err))
+			_ = s.consumeMFASession(ctx, tempSessionID)
+			return nil, fmt.Errorf("%w: email delivery failed", ErrMFAUnavailable)
+		}
+		if err := s.sessionCache.Client().Set(ctx, "mfa:session:"+tempSessionID+":resend", "1", time.Minute); err != nil {
+			return nil, fmt.Errorf("%w: email resend tracking failed", ErrMFAUnavailable)
 		}
 	}
 
-	tempSessionID := s.storeMFASession(ctx, tenantCtx, user, ipAddress, userAgent, req.ClientID)
-
 	s.logMFAChallenge(user.ID, mfaMethod, availableMethods, false)
 
-	return s.buildMFAChallengeResponse(mfaMethod, availableMethods, tempSessionID, isNewDevice, riskAssessment), nil
+	response := s.buildMFAChallengeResponse(mfaMethod, availableMethods, tempSessionID, isNewDevice, riskAssessment)
+	response.MaskedEmail = maskMFAEmail(user.Email)
+	response.MFAExpiresIn = 300
+	if mfaMethod == authMethodEmail {
+		response.ResendAfterSeconds = 60
+	}
+	return response, nil
 }
 
 // createMFAEnrollmentInterrupt mints an enrollment_token, audit-logs the
@@ -1173,8 +1265,11 @@ func (s *AuthService) getAvailableMFAMethods(user *models.User, hasPasskey bool)
 }
 
 // storeMFASession stores MFA session in Redis
-func (s *AuthService) storeMFASession(ctx context.Context, tenantCtx *tenantContext, user *models.User, ipAddress, userAgent, clientID string) string {
+func (s *AuthService) storeMFASession(ctx context.Context, tenantCtx *tenantContext, user *models.User, ipAddress, userAgent, clientID, mfaMethod string) (string, error) {
 	tempSessionID := uuid.New().String()
+	if s.sessionCache == nil {
+		return "", fmt.Errorf("%w: cache not configured", ErrMFAUnavailable)
+	}
 
 	if s.sessionCache != nil {
 		mfaSessionData := &models.MFASessionData{
@@ -1185,17 +1280,19 @@ func (s *AuthService) storeMFASession(ctx context.Context, tenantCtx *tenantCont
 			UserAgent:  userAgent,
 			ClientID:   clientID,
 			CreatedAt:  time.Now().Unix(),
+			MFAMethod:  mfaMethod,
 		}
 		sessionJSON, err := json.Marshal(mfaSessionData)
 		if err == nil {
 			redisKey := "mfa:session:" + tempSessionID
 			if setErr := s.sessionCache.Client().Set(ctx, redisKey, string(sessionJSON), 5*time.Minute); setErr != nil {
 				logger.Warn("Failed to store MFA session in Redis", zap.Error(setErr))
+				return "", fmt.Errorf("%w: challenge persistence failed", ErrMFAUnavailable)
 			}
 		}
 	}
 
-	return tempSessionID
+	return tempSessionID, nil
 }
 
 // logMFAChallenge logs MFA challenge creation
@@ -1331,8 +1428,8 @@ func (s *AuthService) getDirectRoles(ctx context.Context, userID uuid.UUID) ([]s
 
 // createSessionWithInvalidation creates session with security invalidation.
 // SECURITY: Implements session ID regeneration on authentication to prevent
-// session fixation attacks (Auth0-style CVE pattern). If an existing session
-// exists from the same IP, the old session is invalidated and a new session
+// session fixation attacks (Auth0-style CVE pattern). If this browser presented
+// an existing session (falcon_idp_session cookie), the old session is invalidated and a new session
 // is created with PreviousSessionID set, creating an audit trail.
 //
 // authMethods is forwarded to createSession so the new row records the
@@ -1344,22 +1441,14 @@ func (s *AuthService) getDirectRoles(ctx context.Context, userID uuid.UUID) ([]s
 // behaviour, SessionTTLDefault → SessionExpiry), true = extended
 // (SessionTTLRememberMe, default 30d).
 func (s *AuthService) createSessionWithInvalidation(ctx context.Context, userID uuid.UUID, ipAddress, userAgent string, authMethods []string, rememberMe bool) (*models.Session, error) {
-	// Find existing sessions from the same IP for regeneration tracking
+	// The session THIS browser presented (cookie), never an IP match: many
+	// devices share one IP behind WireGuard/NAT.
 	var previousSessionID *uuid.UUID
-	activeSessions, err := s.sessionRepo.GetActiveSessions(ctx, userID)
-	if err != nil {
-		logger.Warn("Failed to get active sessions for regeneration check", zap.Error(err))
-	} else {
-		for _, existingSession := range activeSessions {
-			if existingSession.IPAddress != nil && *existingSession.IPAddress == ipAddress {
-				previousSessionID = &existingSession.ID
-				break
-			}
-		}
+	if oldID, _ := s.presentedSessionID(ctx, userID); oldID != uuid.Nil {
+		previousSessionID = &oldID
 	}
 
-	// Invalidate existing sessions from the same IP
-	if err := s.invalidateExistingSessionsBeforeLogin(ctx, userID, ipAddress); err != nil {
+	if err := s.invalidateExistingSessionsBeforeLogin(ctx, userID); err != nil {
 		logger.Warn("Failed to invalidate existing sessions before login", zap.Error(err))
 	}
 
@@ -1485,14 +1574,28 @@ func (s *AuthService) generateAccessToken(ctx context.Context, user *models.User
 	}
 }
 
-// updateUserLoginInfo updates last login timestamp and resets failed attempts
+// updateUserLoginInfo updates last login timestamp and resets failed attempts.
+//
+// Deliberately uses the targeted UserRepository.UpdateLoginInfo (three
+// columns) instead of the write-all-columns UserRepository.Update. Some
+// callers of this method (AuthService.IssueSessionForNewUser, used by
+// self-service signup completion) pass a *models.User assembled from a
+// *models.UserResponse, which never carries PasswordHash — routing that
+// through Update() silently nulled out the password every signup had
+// just set, because Update()'s partial-struct guard keys off an empty
+// Email, and this partial struct's Email is populated (needed for the
+// JWT) even though PasswordHash and other columns are not. See
+// UserRepository.UpdateLoginInfo's doc comment for the full incident.
+// The in-memory fields are still set below so callers building the
+// response (buildLoginResponse reads user.LastLoginIP) see the new
+// values without a re-fetch.
 func (s *AuthService) updateUserLoginInfo(ctx context.Context, user *models.User, ipAddress string) error {
 	now := time.Now()
 	user.LastLoginAt = &now
 	user.LastLoginIP = &ipAddress
 	user.FailedLoginAttempts = 0
 
-	if err := s.userRepo.Update(ctx, user); err != nil {
+	if err := s.userRepo.UpdateLoginInfo(ctx, user.ID, now, ipAddress); err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1602,11 +1705,10 @@ func (s *AuthService) Logout(ctx context.Context, userID uuid.UUID, sessionID uu
 	// sessions immediately rather than waiting for the cookie TTL.
 	// This closes the "stolen cookie until TTL" gap identified in the
 	// 2026-06-02 tier-1 IAP gap analysis.
-	if s.caepEmitter != nil && tenantID != uuid.Nil {
-		reason := "logout"
-		if allDevices {
-			reason = "logout_all_devices"
-		}
+	// User-wide event: only for sign-out everywhere, otherwise receivers would
+	// tear down the user's other devices too.
+	if s.caepEmitter != nil && tenantID != uuid.Nil && allDevices {
+		reason := "logout_all_devices"
 		go func() { //nolint:gosec // goroutine must outlive request context
 			_ = s.caepEmitter.EmitSessionRevoked(
 				context.Background(),
@@ -1622,11 +1724,11 @@ func (s *AuthService) Logout(ctx context.Context, userID uuid.UUID, sessionID uu
 
 // terminateLogoutSessions ends sessions and revokes tokens for a logout operation.
 //
-// Token revocation sweeps the user's iam_oauth_tokens rows (post-Phase-3
-// the only token store). allDevices=false also fires the user-broad
-// sweep — auth-service refresh tokens don't exist any more so per-token
-// revoke has no target, and the IdP session blacklist (tokenBlacklist
-// via auth_handler.Logout) was already user-broad anyway.
+// Token revocation is per-device by default: allDevices=false revokes only
+// the tokens bound to sessionID, so another device's refresh token is not
+// marked revoked and keeps working. allDevices=true ends every session and
+// sweeps all of the user's iam_oauth_tokens rows (revoke_reason="logout",
+// which RefreshTokens reports as "session has ended", never as theft).
 func (s *AuthService) terminateLogoutSessions(ctx context.Context, userID, sessionID uuid.UUID, allDevices bool) error {
 	if allDevices {
 		if err := s.sessionRepo.EndAllUserSessions(ctx, userID, "logout"); err != nil {
@@ -1637,11 +1739,16 @@ func (s *AuthService) terminateLogoutSessions(ctx context.Context, userID, sessi
 		}
 		return nil
 	}
+	if sessionID == uuid.Nil {
+		// Unresolvable session: never widen to the whole user. The handler
+		// has already cleared this browser's cookies.
+		return nil
+	}
+	if err := s.tokenService.RevokeOAuthTokensBySession(ctx, sessionID, userID); err != nil {
+		logger.Error("Failed to revoke OAuth tokens for session", zap.Error(err))
+	}
 	if err := s.sessionRepo.EndSession(ctx, sessionID, "logout"); err != nil {
 		return fmt.Errorf("failed to end session: %w", err)
-	}
-	if err := s.tokenService.RevokeAllUserOAuthTokens(ctx, userID, "logout"); err != nil {
-		logger.Error("Failed to revoke OAuth tokens", zap.Error(err))
 	}
 	return nil
 }

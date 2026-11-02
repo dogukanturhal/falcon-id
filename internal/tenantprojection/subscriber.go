@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	sharedconfig "github.com/dogukanturhal/platform-shared/config"
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/scram"
-	sharedconfig "github.com/dogukanturhal/platform-shared/config"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
@@ -64,11 +64,21 @@ type Envelope struct {
 // Partial decode — unknown fields are ignored so producer schema additions
 // do not break the consumer.
 type tenantPayload struct {
-	ID       uuid.UUID `json:"id"`
-	Plan     string    `json:"plan"`
-	Type     string    `json:"type"` // tenant tier / TenantType
-	Status   string    `json:"subscription_status"`
-	Metadata []byte    `json:"metadata,omitempty"`
+	ID             uuid.UUID       `json:"id"`
+	Plan           string          `json:"plan"`
+	Type           string          `json:"type"` // tenant tier / TenantType
+	Status         string          `json:"subscription_status"`
+	PlatformStatus string          `json:"status"`
+	Metadata       json.RawMessage `json:"metadata,omitempty"`
+}
+
+func tenantProjectionStatus(payload tenantPayload) string {
+	if payload.Status != "" {
+		return payload.Status
+	}
+	// PlatformService's paid recovery uses the canonical iam_status DTO.
+	// Do not replace a real status with an empty legacy subscription field.
+	return payload.PlatformStatus
 }
 
 // tenantDeletePayload decodes the `data` field for delete events.
@@ -92,15 +102,20 @@ type SubscriberConfig struct {
 // consumer group. Kafka tracks per-partition offsets; each goroutine commits
 // only after the repository call succeeds.
 type TenantSubscriber struct {
-	cfg     SubscriberConfig
-	repo    *Repository
-	metrics *Metrics
-	log     *zap.SugaredLogger
+	trialReadyHook func(context.Context, uuid.UUID) error
+	cfg            SubscriberConfig
+	repo           *Repository
+	metrics        *Metrics
+	log            *zap.SugaredLogger
 
 	readers   []*kafka.Reader
 	dlqWriter *kafka.Writer
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
+}
+
+func (s *TenantSubscriber) SetTrialReadyHook(hook func(context.Context, uuid.UUID) error) {
+	s.trialReadyHook = hook
 }
 
 // NewTenantSubscriber wires a subscriber. If cfg.GroupID is empty,
@@ -320,13 +335,19 @@ func (s *TenantSubscriber) dispatch(ctx context.Context, subject string, env Env
 		if p.ID == uuid.Nil {
 			return fmt.Errorf("envelope missing tenant id (offset=%d)", offset)
 		}
+		if tenantProjectionStatus(p) == "" {
+			return fmt.Errorf("tenant payload missing lifecycle status")
+		}
+		if string(p.Metadata) == "null" {
+			p.Metadata = nil
+		}
 		// Phase 3.2 (ADR 0029): wire payload still carries plan + type for
 		// producer-side backward compatibility, but the consumer no longer
 		// copies them into TenantEvent — iam_tenants.plan / iam_tenants.type
 		// were physically dropped by the GitOps repository !699.
 		evt := TenantEvent{
 			ID:        p.ID,
-			Status:    p.Status,
+			Status:    tenantProjectionStatus(p),
 			Metadata:  p.Metadata,
 			EventTime: env.Timestamp,
 		}
@@ -342,6 +363,18 @@ func (s *TenantSubscriber) dispatch(ctx context.Context, subject string, env Env
 			return fmt.Errorf("ApplyTenantUpsert: %w", err)
 		}
 		s.handleResult(result, subject, evt.EventTime, p.ID)
+		var metadata map[string]any
+		if len(p.Metadata) > 0 {
+			_ = json.Unmarshal(p.Metadata, &metadata)
+		}
+		if result != UpsertResultOrphan && tenantProjectionStatus(p) == "trial" && metadata["signup_trial_started"] == true && s.trialReadyHook != nil {
+			// Runs on replay too: projection may have committed before the
+			// product callback failed. The callback verifies current source
+			// eligibility and is idempotent, including for stale events.
+			if err := s.trialReadyHook(ctx, p.ID); err != nil {
+				return fmt.Errorf("confirmed trial product: %w", err)
+			}
+		}
 
 	case SubjectTenantDeleted:
 		var d tenantDeletePayload

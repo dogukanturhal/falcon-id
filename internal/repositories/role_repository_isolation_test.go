@@ -354,3 +354,49 @@ func TestRoleGetByName_CrossTenantTableDriven(t *testing.T) {
 		})
 	}
 }
+
+// TestRoleGrantModulePermissionsToRole_InsertsCatalogRowsIdempotently verifies
+// the grant is scoped to the given modules, never deletes, and reports only
+// newly inserted rows.
+func TestRoleGrantModulePermissionsToRole_InsertsCatalogRowsIdempotently(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	require.NoError(t, err)
+	defer mock.Close()
+
+	roleID := uuid.New()
+	mods := []string{"qms", "cmms"}
+	mock.ExpectExec(`INSERT INTO iam_role_permissions \(role_id, permission_id\)\s+SELECT \$1, p.id\s+FROM iam_permissions p\s+WHERE p.module = ANY\(\$2::text\[\]\)\s+ON CONFLICT \(role_id, permission_id\) DO NOTHING`).
+		WithArgs(roleID, mods).
+		WillReturnResult(pgxmock.NewResult("INSERT", 7))
+
+	repo := newRoleRepoWithMock(mock)
+	n, err := repo.GrantModulePermissionsToRole(context.Background(), roleID, mods)
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), n)
+
+	n, err = repo.GrantModulePermissionsToRole(context.Background(), roleID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestRoleListActiveHolderIDs_FiltersActiveAndUnexpired verifies the query
+// joins users, requires is_active and ignores expired assignments.
+func TestRoleListActiveHolderIDs_FiltersActiveAndUnexpired(t *testing.T) {
+	mock, err := pgxmock.NewPool()
+	require.NoError(t, err)
+	defer mock.Close()
+
+	roleID := uuid.New()
+	u1, u2 := uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`FROM iam_user_roles ur\s+JOIN iam_users u ON u.id = ur.user_id\s+WHERE ur.role_id = \$1\s+AND u.is_active = true\s+AND u.deletion_scheduled_at IS NULL\s+AND \(u.activation_status IS NULL OR u.activation_status NOT IN \('pending_deletion', 'admin_deleted'\)\)\s+AND \(ur.expires_at IS NULL OR ur.expires_at > NOW\(\)\)`).
+		WithArgs(roleID).
+		WillReturnRows(pgxmock.NewRows([]string{"user_id"}).AddRow(u1).AddRow(u2))
+
+	repo := newRoleRepoWithMock(mock)
+	ids, err := repo.ListActiveHolderIDs(context.Background(), roleID)
+	require.NoError(t, err)
+	assert.Equal(t, []uuid.UUID{u1, u2}, ids)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}

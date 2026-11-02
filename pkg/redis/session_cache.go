@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -39,6 +41,15 @@ type SessionCache struct {
 	client *Client
 	prefix string
 	ttl    time.Duration
+
+	// idpAbsoluteCap bounds IdP SSO session lifetime from AuthTime (see
+	// SetIdpAbsoluteCap). Zero → defaultIdpAbsoluteCap.
+	idpAbsoluteCap time.Duration
+
+	// realmCapResolver, when set, resolves the per-realm absolute cap for a
+	// tenant at SSO session creation (see SetRealmCapResolver).
+	realmCapResolver RealmCapResolver
+	realmCapCache    sync.Map // uuid.UUID -> realmCapEntry
 
 	// roleVersionHook, when set, is invoked with the new version after every
 	// successful IncrementRoleVersion. It lets the DDIL offline-authz layer
@@ -490,6 +501,10 @@ type IdpSessionData struct {
 	// rows, and the OAuth step-up gate looped forever because AMR
 	// never gained "mfa". Live repro 2026-05-12 (this commit).
 	SessionID uuid.UUID `json:"session_id,omitempty"`
+	// AbsoluteCapSeconds is the realm-specific absolute lifetime (from
+	// AuthTime) recorded at session creation. 0 = no realm override (legacy
+	// records and realms without a policy) → the global cap applies.
+	AbsoluteCapSeconds int64 `json:"abs_cap,omitempty"`
 }
 
 func (s *SessionCache) idpSessionKey(sessionID uuid.UUID) string {
@@ -498,13 +513,123 @@ func (s *SessionCache) idpSessionKey(sessionID uuid.UUID) string {
 
 const idpSessionTTL = 7 * 24 * time.Hour
 
-// SetIdpSession stores an IdP-level SSO session entry with a 7-day TTL.
+// defaultIdpAbsoluteCap bounds an SSO session's total lifetime (measured from
+// AuthTime) when no explicit cap is wired via SetIdpAbsoluteCap.
+const defaultIdpAbsoluteCap = 7 * 24 * time.Hour
+
+type presentedIdpSessionKey struct{}
+
+// WithPresentedIdpSession records the falcon_idp_session cookie UUID the
+// current request's browser presented, so session-minting services can retire
+// exactly that browser's previous session (never other devices' sessions).
+func WithPresentedIdpSession(ctx context.Context, id uuid.UUID) context.Context {
+	return context.WithValue(ctx, presentedIdpSessionKey{}, id)
+}
+
+// PresentedIdpSessionFromContext returns the cookie UUID stored by
+// WithPresentedIdpSession, or uuid.Nil.
+func PresentedIdpSessionFromContext(ctx context.Context) uuid.UUID {
+	id, _ := ctx.Value(presentedIdpSessionKey{}).(uuid.UUID)
+	return id
+}
+
+// SetIdpAbsoluteCap sets the maximum total lifetime of an SSO session,
+// counted from its AuthTime. d <= 0 keeps the 7-day default.
+func (s *SessionCache) SetIdpAbsoluteCap(d time.Duration) {
+	s.idpAbsoluteCap = d
+}
+
+// IdpAbsoluteDeadline returns the instant after which data's SSO session must
+// be treated as expired regardless of activity. ok is false when the record
+// carries no AuthTime (legacy records), in which case no cap applies.
+func (s *SessionCache) IdpAbsoluteDeadline(data *IdpSessionData) (time.Time, bool) {
+	if data == nil || data.AuthTime <= 0 {
+		return time.Time{}, false
+	}
+	capD := s.idpAbsoluteCap
+	if capD <= 0 {
+		capD = defaultIdpAbsoluteCap
+	}
+	if data.AbsoluteCapSeconds > 0 {
+		capD = time.Duration(data.AbsoluteCapSeconds) * time.Second
+	}
+	return time.Unix(data.AuthTime, 0).Add(capD), true
+}
+
+// RealmCapResolver returns the realm-specific SSO absolute lifetime for the
+// tenant's realm. ok=false means the realm has no policy (use the global cap).
+type RealmCapResolver func(ctx context.Context, tenantID uuid.UUID) (d time.Duration, ok bool, err error)
+
+// realmCapCacheTTL bounds how stale a cached realm cap may be; admin changes
+// apply to new sessions within this window.
+const realmCapCacheTTL = time.Minute
+
+type realmCapEntry struct {
+	d       time.Duration
+	expires time.Time
+}
+
+// SetRealmCapResolver wires the per-realm cap lookup used by SetIdpSession.
+// Set once during wiring.
+func (s *SessionCache) SetRealmCapResolver(r RealmCapResolver) {
+	s.realmCapResolver = r
+}
+
+// realmCap returns the cached realm cap for tenantID (0 = none). Lookup errors
+// degrade to "no realm cap" (global default) and are not cached.
+func (s *SessionCache) realmCap(ctx context.Context, tenantID uuid.UUID) time.Duration {
+	if s.realmCapResolver == nil || tenantID == uuid.Nil {
+		return 0
+	}
+	if v, ok := s.realmCapCache.Load(tenantID); ok {
+		if e := v.(realmCapEntry); time.Now().Before(e.expires) {
+			return e.d
+		}
+	}
+	d, ok, err := s.realmCapResolver(ctx, tenantID)
+	if err != nil {
+		return 0
+	}
+	if !ok || d < 0 {
+		d = 0
+	}
+	s.realmCapCache.Store(tenantID, realmCapEntry{d: d, expires: time.Now().Add(realmCapCacheTTL)})
+	return d
+}
+
+// SetIdpSession stores an IdP-level SSO session entry with a 7-day TTL. When a
+// realm cap resolver is wired and data carries none, the tenant's realm cap is
+// recorded on the record so the deadline is fixed at creation.
 func (s *SessionCache) SetIdpSession(ctx context.Context, sessionID uuid.UUID, data *IdpSessionData) error {
+	if data != nil && data.AbsoluteCapSeconds == 0 {
+		if d := s.realmCap(ctx, data.TenantID); d > 0 {
+			data.AbsoluteCapSeconds = int64(d / time.Second)
+		}
+	}
 	payload, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("SetIdpSession: marshal: %w", err)
 	}
-	return s.client.Redis().Set(ctx, s.idpSessionKey(sessionID), payload, idpSessionTTL).Err()
+	if err := s.client.Redis().Set(ctx, s.idpSessionKey(sessionID), payload, idpSessionTTL).Err(); err != nil {
+		return err
+	}
+	// Per-user index so a terminate-everything path is O(user sessions)
+	// instead of a keyspace SCAN. Best-effort: the SCAN fallback in
+	// DeleteAllIdpSessionsByUser still covers entries that predate the index.
+	if data != nil && data.UserID != uuid.Nil {
+		ukey := s.idpUserSetKey(data.UserID)
+		pipe := s.client.Redis().Pipeline()
+		pipe.SAdd(ctx, ukey, sessionID.String())
+		// Set TTL is the full session TTL plus slack so it outlives any member.
+		pipe.Expire(ctx, ukey, idpSessionTTL+time.Hour)
+		_, _ = pipe.Exec(ctx)
+	}
+	return nil
+}
+
+// idpUserSetKey is the per-user set of live falcon_idp_session ids.
+func (s *SessionCache) idpUserSetKey(userID uuid.UUID) string {
+	return fmt.Sprintf("%s:idp_user_sessions:%s", s.prefix, userID.String())
 }
 
 // GetIdpSession retrieves an IdP-level SSO session.
@@ -522,14 +647,58 @@ func (s *SessionCache) GetIdpSession(ctx context.Context, sessionID uuid.UUID) (
 	if err := json.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("GetIdpSession: unmarshal: %w", err)
 	}
-	// Sliding TTL — extends on every read so active SSO sessions don't expire mid-use.
-	_ = s.client.Redis().Expire(ctx, s.idpSessionKey(sessionID), idpSessionTTL)
+	if out.UserID != uuid.Nil {
+		// Keep the per-user index alive as long as its newest member slides.
+		_ = s.client.Redis().Expire(ctx, s.idpUserSetKey(out.UserID), idpSessionTTL+time.Hour).Err()
+	}
+	// Sliding TTL — extends on every read so active SSO sessions don't expire
+	// mid-use, but never beyond the absolute cap from AuthTime. Past the cap
+	// the record is removed and reported as missing (→ login).
+	ttl := idpSessionTTL
+	if deadline, ok := s.IdpAbsoluteDeadline(&out); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			_ = s.client.Redis().Del(ctx, s.idpSessionKey(sessionID)).Err()
+			return nil, nil
+		}
+		if remaining < ttl {
+			ttl = remaining
+		}
+	}
+	_ = s.client.Redis().Expire(ctx, s.idpSessionKey(sessionID), ttl)
 	return &out, nil
+}
+
+// idpBackingOKKey caches "the iam_sessions row behind this SSO session is live
+// and its user is eligible" so the cookie auth path does not hit the DB on
+// every request.
+func (s *SessionCache) idpBackingOKKey(rowID uuid.UUID) string {
+	return fmt.Sprintf("%s:idp_backing_ok:%s", s.prefix, rowID.String())
+}
+
+// IdpBackingKnownGood reports whether a recent check found the backing session
+// row live and its user eligible. Errors read as a miss.
+func (s *SessionCache) IdpBackingKnownGood(ctx context.Context, rowID uuid.UUID) bool {
+	n, err := s.client.Redis().Exists(ctx, s.idpBackingOKKey(rowID)).Result()
+	return err == nil && n > 0
+}
+
+// MarkIdpBackingGood records a successful backing-row/user check for ttl.
+func (s *SessionCache) MarkIdpBackingGood(ctx context.Context, rowID uuid.UUID, ttl time.Duration) {
+	_ = s.client.Redis().Set(ctx, s.idpBackingOKKey(rowID), "1", ttl).Err()
 }
 
 // DeleteIdpSession removes an IdP-level SSO session (called on logout).
 func (s *SessionCache) DeleteIdpSession(ctx context.Context, sessionID uuid.UUID) error {
-	return s.client.Redis().Del(ctx, s.idpSessionKey(sessionID)).Err()
+	key := s.idpSessionKey(sessionID)
+	// Read the owner first so the per-user index entry can be removed too.
+	if raw, err := s.client.Redis().Get(ctx, key).Bytes(); err == nil {
+		var entry IdpSessionData
+		if json.Unmarshal(raw, &entry) == nil && entry.UserID != uuid.Nil {
+			_ = s.client.Redis().SRem(ctx, s.idpUserSetKey(entry.UserID), sessionID.String()).Err()
+		}
+	}
+	return s.client.Redis().Del(ctx, key).Err()
 }
 
 // GetIdpSessionAuthTime is the narrow lookup the OAuth provider
@@ -558,11 +727,36 @@ func (s *SessionCache) GetIdpSessionAuthTime(ctx context.Context, sessionID uuid
 	return out.AuthTime, true, nil
 }
 
+// GetIdpSessionRowID returns the iam_sessions row id (IdpSessionData.SessionID)
+// and the owning user id behind an opaque falcon_idp_session id: the stable
+// login-session identity that explicit session ends (logout, admin revoke,
+// password change) key on, whereas the idp session id itself is a per-browser
+// cookie value. The owner is returned so callers bind a token only to a
+// session of the same user. Returns (uuid.Nil, uuid.Nil, false, nil) when the
+// entry is gone or carries no row id.
+func (s *SessionCache) GetIdpSessionRowID(ctx context.Context, idpSessionID uuid.UUID) (rowID, userID uuid.UUID, found bool, err error) {
+	data, err := s.client.Redis().Get(ctx, s.idpSessionKey(idpSessionID)).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return uuid.Nil, uuid.Nil, false, nil
+		}
+		return uuid.Nil, uuid.Nil, false, &UnavailableError{Operation: "idp session row id retrieval", Err: err}
+	}
+	var out IdpSessionData
+	if err := json.Unmarshal(data, &out); err != nil {
+		return uuid.Nil, uuid.Nil, false, fmt.Errorf("GetIdpSessionRowID: unmarshal: %w", err)
+	}
+	if out.SessionID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, false, nil
+	}
+	return out.SessionID, out.UserID, true, nil
+}
+
 // DeleteAllIdpSessionsByUser removes every IdP SSO session entry whose
 // IdpSessionData.UserID matches userID. Used by /api/v1/auth/logout
 // when the caller authenticated via a Bearer access token that does
 // not carry a session_id / sid claim (the OAuth access tokens issued
-// to RPs like accounts.hexxlock.com only carry sub/aud/scope, not the
+// to RPs like accounts.example.com only carry sub/aud/scope, not the
 // IdP session ID — that's intentional per OIDC, but it means the
 // RP-initiated logout has no per-session identifier to scope the
 // cleanup to). Falls back to "log out everywhere" semantics for that
@@ -578,33 +772,115 @@ func (s *SessionCache) GetIdpSessionAuthTime(ctx context.Context, sessionID uuid
 // Returns the count of sessions deleted (zero is success — user had
 // no live IdP sessions, e.g. already logged out elsewhere).
 func (s *SessionCache) DeleteAllIdpSessionsByUser(ctx context.Context, userID uuid.UUID) (int, error) {
+	ids, err := s.deleteIdpSessionsByUser(ctx, userID, func(*IdpSessionData) bool { return true })
+	return len(ids), err
+}
+
+// DeleteAllIdpSessionsByUserExcept is DeleteAllIdpSessionsByUser but keeps the
+// SSO sessions backed by the iam_user_sessions row exceptRowID (the caller's
+// own session, e.g. after a self-service password change). uuid.Nil keeps none.
+// Returns the deleted falcon_idp_session ids (the `sid` app tokens carry).
+func (s *SessionCache) DeleteAllIdpSessionsByUserExcept(ctx context.Context, userID, exceptRowID uuid.UUID) ([]uuid.UUID, error) {
+	return s.deleteIdpSessionsByUser(ctx, userID, func(e *IdpSessionData) bool {
+		return exceptRowID == uuid.Nil || e.SessionID != exceptRowID
+	})
+}
+
+// DeleteIdpSessionsByRowID removes the SSO sessions of userID that are backed
+// by the single iam_user_sessions row rowID (single-session revoke). It returns
+// the deleted falcon_idp_session ids so callers can end tokens bound to them.
+func (s *SessionCache) DeleteIdpSessionsByRowID(ctx context.Context, userID, rowID uuid.UUID) ([]uuid.UUID, error) {
+	if rowID == uuid.Nil {
+		return nil, nil
+	}
+	return s.deleteIdpSessionsByUser(ctx, userID, func(e *IdpSessionData) bool { return e.SessionID == rowID })
+}
+
+// deleteIdpSessionsByUser deletes the user's SSO sessions for which match
+// returns true. It reads the per-user set first, then SCANs the keyspace as a
+// fallback for entries written before the index existed.
+func (s *SessionCache) deleteIdpSessionsByUser(ctx context.Context, userID uuid.UUID, match func(*IdpSessionData) bool) ([]uuid.UUID, error) {
+	rdb := s.client.Redis()
+	ukey := s.idpUserSetKey(userID)
+	var deleted []uuid.UUID
+	seen := map[string]bool{}
+
+	// handle processes one key. raw is a prefetched value (MGET) or nil to GET.
+	handle := func(key, idStr string, raw *string) {
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		var data []byte
+		if raw != nil {
+			data = []byte(*raw)
+		} else {
+			b, err := rdb.Get(ctx, key).Bytes()
+			if err != nil {
+				if errors.Is(err, redis.Nil) && idStr != "" {
+					_ = rdb.SRem(ctx, ukey, idStr).Err() // stale index member
+				}
+				return
+			}
+			data = b
+		}
+		var entry IdpSessionData
+		if err := json.Unmarshal(data, &entry); err != nil || entry.UserID != userID || !match(&entry) {
+			return
+		}
+		if rdb.Del(ctx, key).Err() == nil {
+			if id, perr := uuid.Parse(strings.TrimPrefix(key, s.prefix+":idp_session:")); perr == nil {
+				deleted = append(deleted, id)
+			}
+			if idStr != "" {
+				_ = rdb.SRem(ctx, ukey, idStr).Err()
+			}
+		}
+	}
+
+	members, err := rdb.SMembers(ctx, ukey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return deleted, &UnavailableError{Operation: "idp session index read", Err: err}
+	}
+	var memberKeys, memberIDs []string
+	for _, m := range members {
+		id, perr := uuid.Parse(m)
+		if perr != nil {
+			_ = rdb.SRem(ctx, ukey, m).Err()
+			continue
+		}
+		memberKeys = append(memberKeys, s.idpSessionKey(id))
+		memberIDs = append(memberIDs, m)
+	}
+	if len(memberKeys) > 0 {
+		vals, mgErr := rdb.MGet(ctx, memberKeys...).Result()
+		for i, k := range memberKeys {
+			var raw *string
+			if mgErr == nil {
+				if v, ok := vals[i].(string); ok {
+					raw = &v
+				} else {
+					// Expired between SMEMBERS and MGET: drop the stale member.
+					seen[k] = true
+					_ = rdb.SRem(ctx, ukey, memberIDs[i]).Err()
+					continue
+				}
+			}
+			handle(k, memberIDs[i], raw)
+		}
+	}
+
+	// Fallback SCAN (legacy entries without an index record).
 	pattern := fmt.Sprintf("%s:idp_session:*", s.prefix)
+	prefix := fmt.Sprintf("%s:idp_session:", s.prefix)
 	var cursor uint64
-	deleted := 0
 	for {
-		keys, next, err := s.client.Redis().Scan(ctx, cursor, pattern, 256).Result()
+		keys, next, err := rdb.Scan(ctx, cursor, pattern, 256).Result()
 		if err != nil {
 			return deleted, &UnavailableError{Operation: "idp session scan", Err: err}
 		}
 		for _, k := range keys {
-			data, err := s.client.Redis().Get(ctx, k).Bytes()
-			if err != nil {
-				if errors.Is(err, redis.Nil) {
-					continue // expired between SCAN and GET — fine
-				}
-				// Don't fail the whole logout on a single stale key.
-				continue
-			}
-			var entry IdpSessionData
-			if err := json.Unmarshal(data, &entry); err != nil {
-				continue // unreadable entry — leave it, TTL will harvest
-			}
-			if entry.UserID != userID {
-				continue
-			}
-			if delErr := s.client.Redis().Del(ctx, k).Err(); delErr == nil {
-				deleted++
-			}
+			handle(k, strings.TrimPrefix(k, prefix), nil)
 		}
 		cursor = next
 		if cursor == 0 {

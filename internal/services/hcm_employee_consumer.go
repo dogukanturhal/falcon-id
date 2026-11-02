@@ -154,7 +154,7 @@ type HCMEmployeeConsumer struct {
 // Caller owns the timeout; pass `&http.Client{Timeout:
 // hcmHTTPTimeout, Transport: tokenClient.RoundTripper(nil)}`.
 //
-// Memory: internal engineering notes.
+// operational notes.
 //
 // Note: this constructor was not wired into any cmd/ codepath at the
 // time of this MR (the consumer is reachable code but never started).

@@ -144,7 +144,7 @@ type OAuthClient struct {
 	//     refresh_token is NOT revoked; the same refresh_token string
 	//     is returned alongside a freshly-minted access_token. Closes
 	//     the cross-pod parallel-refresh revoke-the-old race observed
-	//     on internal.example.com (2026-05-14). Safe ONLY for
+	//     on falcon.internal.example.com (2026-05-14). Safe ONLY for
 	//     clients whose refresh_token cannot be exfiltrated by the
 	//     browser (server-side __Host- prefixed cookies behind the
 	//     BFF cookie domain) — explicit per-client opt-in required.
@@ -243,6 +243,24 @@ type OAuthToken struct {
 	// for pre-migration rows before the backfill runs; generateTokens always
 	// stamps it on new rows.
 	TokenFamilyID *uuid.UUID `json:"token_family_id,omitempty" db:"token_family_id"`
+	// SessionID is the iam_sessions row id of the login session the token was
+	// issued under (migration 0028), stable across rotations unless session
+	// drift cuts a new row. Distinct from IdpSessionID, which is the opaque
+	// falcon_idp_session / `sid` value. Explicit session end revokes by it;
+	// NULL = legacy token, not bound to a session.
+	SessionID *uuid.UUID `json:"session_id,omitempty" db:"session_id"`
+
+	// ReplacedBy is the id of the successor row minted when this refresh token
+	// was rotated or recovered (migration 0031). NULL = never rotated / legacy
+	// row. Drives lost-response recovery in RefreshTokens.
+	ReplacedBy *uuid.UUID `json:"replaced_by,omitempty" db:"replaced_by"`
+	// RevokeReason (migration 0031): "rotated" | "recovery_superseded" for rows
+	// revoked by the rotation path; nil otherwise. A recovery_superseded token
+	// presented again is always theft.
+	RevokeReason *string `json:"revoke_reason,omitempty" db:"revoke_reason"`
+	// RecoveryCount (migration 0031): lost-response recoveries served for this
+	// consumed token (capped at 1).
+	RecoveryCount int16 `json:"recovery_count" db:"recovery_count"`
 }
 
 // OAuthState represents OAuth 2.0 state parameter for CSRF protection
@@ -513,7 +531,11 @@ type OAuthClientListResponse struct {
 type OAuthAuthorizeRequest struct {
 	ResponseType string `form:"response_type" binding:"required,oneof=code token id_token"`
 	ClientID     string `form:"client_id" binding:"required"`
-	RedirectURI  string `form:"redirect_uri" binding:"required,url"`
+	// Not `url`: the validator requires "scheme://", which rejects RFC 8252
+	// private-use scheme redirects (com.example.app:/oauth/callback). The
+	// value is matched exactly against the client's registered redirect
+	// URIs before anything is issued, which is the real check.
+	RedirectURI  string `form:"redirect_uri" binding:"required"`
 	Scope        string `form:"scope"`
 	State        string `form:"state"`
 	Nonce        string `form:"nonce"`
@@ -666,6 +688,12 @@ type OAuthTokenRequest struct {
 	// resource path.
 	Audience string `form:"audience"`
 
+	// TargetTenantID (RFC 8693 §2.1 extension parameter) asks the
+	// token-exchange grant for a token for another tenant the subject
+	// token's user holds an active membership in (tenant token exchange,
+	// services.TenantTokenExchange).
+	TargetTenantID string `form:"target_tenant_id"`
+
 	// For authorization_code grant
 	Code         string `form:"code"`
 	RedirectURI  string `form:"redirect_uri"`
@@ -717,6 +745,14 @@ type OAuthTokenResponse struct {
 	// Omitted from non-exchange responses via omitempty for backward
 	// compatibility with existing consumers.
 	IssuedTokenType string `json:"issued_token_type,omitempty"`
+
+	// TenantID/TenantSlug/MembershipKind are set only on a tenant token
+	// exchange (target_tenant_id) so the client can route to the tenant's
+	// host without decoding the token or trusting its own input
+	// (RFC 6749 §5.1 allows additional response parameters).
+	TenantID       string `json:"tenant_id,omitempty"`
+	TenantSlug     string `json:"tenant_slug,omitempty"`
+	MembershipKind string `json:"membership_kind,omitempty"`
 
 	// AuthorizationDetails is included in the token response when the
 	// request contained a valid authorization_details parameter (RFC 9396 §4).

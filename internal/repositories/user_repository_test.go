@@ -381,7 +381,7 @@ func TestUserRepository_Update(t *testing.T) {
 }
 
 // TestUserRepository_Update_PartialStructPreservationGuard asserts the
-// repository-layer defense (SQL CASE-WHEN on $2::text = '') introduced by
+// repository-layer defense (SQL CASE-WHEN on $2::text = ”) introduced by
 // MR !234 after two production data-corruption incidents:
 //
 //   - 2026-05-12: partial *models.User (only ID/TenantID/Username) wiped
@@ -393,7 +393,7 @@ func TestUserRepository_Update(t *testing.T) {
 // The CASE-WHEN guard preserves email/email_hash/PII/auth-state when
 // caller passes empty Email. This test verifies the SQL text actually
 // contains the guard AND that calling Update with a partial struct
-// (Email='') passes empty parameters through to the SQL — relying on
+// (Email=”) passes empty parameters through to the SQL — relying on
 // PostgreSQL semantics to honour the CASE-WHEN. Combined with the live
 // CASE-WHEN it gives end-to-end correctness; in pure-pgxmock land the
 // test asserts the contract is present, not the live-PG outcome.
@@ -430,11 +430,11 @@ func TestUserRepository_Update_PartialStructPreservationGuard(t *testing.T) {
 	// If any of these CASE-WHEN guards is removed, this test fails —
 	// the SQL no longer matches the regex.
 	mock.ExpectQuery(
-		`(?s)UPDATE iam_users SET.*` +
-			`email\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN email.*` +
-			`email_hash\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN email_hash.*` +
-			`is_active\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN is_active.*` +
-			`is_email_verified\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN is_email_verified.*` +
+		`(?s)UPDATE iam_users SET.*`+
+			`email\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN email.*`+
+			`email_hash\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN email_hash.*`+
+			`is_active\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN is_active.*`+
+			`is_email_verified\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN is_email_verified.*`+
 			`password_hash\s*=\s*CASE WHEN \$2::text\s*=\s*''\s*THEN password_hash`,
 	).
 		WithArgs(
@@ -495,9 +495,12 @@ func TestUserRepository_Delete(t *testing.T) {
 	repo, mock := newUserRepo(t)
 	id := uuid.New()
 
+	mock.ExpectBegin()
+	expectMembershipRelease(mock, id)
 	mock.ExpectExec(`DELETE FROM iam_users WHERE id = \$1`).
 		WithArgs(id).
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
 
 	err := repo.Delete(ctx, id)
 	require.NoError(t, err)
@@ -601,8 +604,9 @@ func TestUserRepository_AssignRoles(t *testing.T) {
 
 	// Transaction lifecycle
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM iam_user_roles WHERE user_id = \$1`).
-		WithArgs(userID).
+	mock.ExpectExec(`SELECT id FROM iam_users`).WithArgs(userID).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`WITH removed AS .*`).
+		WithArgs(userID, []uuid.UUID{roleID1, roleID2}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(`INSERT INTO iam_user_roles`).
 		WithArgs(userID, roleID1, &assignedBy).
@@ -624,8 +628,9 @@ func TestUserRepository_AssignRoles_Empty(t *testing.T) {
 	userID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM iam_user_roles WHERE user_id = \$1`).
-		WithArgs(userID).
+	mock.ExpectExec(`SELECT id FROM iam_users`).WithArgs(userID).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	mock.ExpectExec(`WITH removed AS .*`).
+		WithArgs(userID, []uuid.UUID{}).
 		WillReturnResult(pgxmock.NewResult("DELETE", 2))
 	mock.ExpectCommit()
 
@@ -753,6 +758,40 @@ func TestUserRepository_ResetFailedAttempts(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestUserRepository_UpdateLoginInfo_DoesNotTouchPasswordHash guards the
+// 2026-09-18 incident: AuthService.IssueSessionForNewUser (self-service
+// signup completion) calls updateUserLoginInfo with a *models.User that
+// was assembled from a *models.UserResponse and therefore never carries
+// PasswordHash. Before this fix, updateUserLoginInfo routed that partial
+// struct through the write-all-columns UserRepository.Update, which
+// unconditionally overwrote password_hash from the zero value — nulling
+// out the credential CreatePreparedForSignup had just persisted, seconds
+// after signup. UpdateLoginInfo must be a targeted UPDATE that names only
+// last_login_at/last_login_ip/failed_login_attempts/updated_at, so it is
+// structurally incapable of writing password_hash regardless of what the
+// caller's struct carries — this test asserts that by matching the exact
+// SQL and column list, not merely that "some update happened".
+func TestUserRepository_UpdateLoginInfo_DoesNotTouchPasswordHash(t *testing.T) {
+	ctx := context.Background()
+	repo, mock := newUserRepo(t)
+	userID := uuid.New()
+	loginAt := time.Now().UTC().Truncate(time.Second)
+	ip := "203.0.113.7"
+
+	// The regexp requires the SET clause to name exactly these four
+	// columns — it does not match "password_hash" anywhere in the
+	// statement text. If a future change routes this through the
+	// column-generic Update() instead, this expectation goes unmet and
+	// the test fails (proving behavior, not just that a call was made).
+	mock.ExpectExec(`^UPDATE iam_users SET last_login_at = \$2, last_login_ip = \$3, failed_login_attempts = 0, updated_at = NOW\(\) WHERE id = \$1$`).
+		WithArgs(userID, loginAt, ip).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	err := repo.UpdateLoginInfo(ctx, userID, loginAt, ip)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // LockUser / UnlockUser
 // ──────────────────────────────────────────────────────────────────────────────
@@ -822,9 +861,12 @@ func TestUserRepository_CountActiveByTenant(t *testing.T) {
 	repo, mock := newUserRepo(t)
 	tenantID := uuid.New()
 
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users\s+WHERE tenant_id = \$1 AND is_active = true AND deletion_scheduled_at IS NULL`).
+	mock.ExpectBegin()
+	expectTenantScope(mock, tenantID)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users u\s+WHERE u.tenant_id = \$1 AND u.is_active = true AND u.deletion_scheduled_at IS NULL`).
 		WithArgs(tenantID).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(3))
+	mock.ExpectCommit()
 
 	count, err := repo.CountActiveByTenant(ctx, tenantID)
 	require.NoError(t, err)
@@ -838,9 +880,12 @@ func TestUserRepository_CountActiveByTenant_QueryError(t *testing.T) {
 	repo, mock := newUserRepo(t)
 	tenantID := uuid.New()
 
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users\s+WHERE tenant_id = \$1 AND is_active = true AND deletion_scheduled_at IS NULL`).
+	mock.ExpectBegin()
+	expectTenantScope(mock, tenantID)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users u\s+WHERE u.tenant_id = \$1 AND u.is_active = true AND u.deletion_scheduled_at IS NULL`).
 		WithArgs(tenantID).
 		WillReturnError(assert.AnError)
+	mock.ExpectRollback()
 
 	count, err := repo.CountActiveByTenant(ctx, tenantID)
 	require.Error(t, err)

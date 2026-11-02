@@ -280,7 +280,7 @@ spec:
     # drainer goroutine only spawns when the flag is true; the alerts
     # exercise the metrics emitted by that goroutine. Flipping the
     # flag without the alerts in place would be a tier-1 violation
-    # (memory: internal engineering notes).
+    # (operational notes).
     #
     # ---------------------------------------------------------------- #
     - name: falcon-id.caep

@@ -112,10 +112,10 @@ func TestSignupPasswordPolicy_RejectsBeforeAllSideEffects(t *testing.T) {
 				checker := &signupBreachStub{breached: tc.breached}
 				user.validator.breachChecker = checker
 				hook, session := &mockPostSignupHook{}, &signupSessionSpy{}
-				svc := NewSignupService(repo, email, tenant, registrar, user, &mockSignupUserLookup{}, "downstream.com", "starter")
+				svc := NewSignupService(repo, email, tenant, registrar, user, &mockSignupUserLookup{}, "downstream.com", "starter", testOTPKey)
 				svc.SetPostSignupHook(hook)
 				svc.SetSessionIssuer(session)
-				result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{SignupRequestID: req.ID, Password: tc.password}, "", "")
+				result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret, SignupRequestID: req.ID, Password: tc.password}, "", "")
 				require.Nil(t, result)
 				var violation *SignupPasswordError
 				require.ErrorAs(t, err, &violation)
@@ -148,15 +148,16 @@ func TestSignupPasswordPolicy_VerifiedRequestCanCorrectPassword(t *testing.T) {
 			tenant, registrar, email := &mockSignupTenantCreator{}, &mockTenantManagementRegistrar{}, &mockSignupEmailSender{}
 			user := &preflightUserCreator{validator: signupPolicyUserService()}
 			session := &signupSessionSpy{}
-			svc := NewSignupService(repo, email, tenant, registrar, user, &mockSignupUserLookup{}, "downstream.com", "starter")
+			svc := NewSignupService(repo, email, tenant, registrar, user, &mockSignupUserLookup{}, "downstream.com", "starter", testOTPKey)
 			svc.SetSessionIssuer(session)
-			input := &models.CompleteSignupInput{SignupRequestID: req.ID, Password: "Abcd123!", PlanCode: "starter"}
+			input := &models.CompleteSignupInput{CompletionSecret: testCompletionSecret, SignupRequestID: req.ID, Password: "Abcd123!", PlanCode: "starter"}
 			_, err := svc.CompleteSignup(context.Background(), input, "", "")
 			require.Error(t, err)
 			tenantID := models.WellKnownTenantConsumer
 			if accountType == "business" {
 				tenantID = uuid.New()
 				registrar.On("Register", mock.Anything, mock.Anything).Return(&TenantManagementRegisterResult{ID: tenantID}, nil).Once()
+				repo.On("SetProvisionedTenant", mock.Anything, req.ID, tenantID, mock.AnythingOfType("string")).Return(nil).Once()
 				tenant.On("CreateTenant", mock.Anything, mock.Anything).Return(&models.Tenant{ID: tenantID}, nil).Once()
 			} else {
 				tenant.On("GetByID", mock.Anything, tenantID).Return(&models.Tenant{ID: tenantID}, nil).Once()

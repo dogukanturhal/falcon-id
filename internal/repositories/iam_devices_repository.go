@@ -34,7 +34,7 @@ type IAMDeviceRow struct {
 
 	// DeviceUUID is the UUIDv4 bound to the attestation key (TPM AK, Apple
 	// SE key, Android StrongBox key). Used as the device-cert SAN per ADR
-	// 0040 D-005: spiffe://hexxlock.com/device/<device_uuid>.
+	// 0040 D-005: spiffe://example.com/device/<device_uuid>.
 	DeviceUUID uuid.UUID
 
 	// UserSub is the Falcon-ID sub of the owning user (RFC 9493 iss_sub).
@@ -78,13 +78,17 @@ type IAMDeviceRow struct {
 
 	// SerialNumber, Model, and Manufacturer are the human-facing hardware
 	// identity (OEM SMBIOS/DMI fields) captured at enrollment by the
-	// hexxlock-access agent and surfaced in the jess corporate-asset UI.
+	// device-agent agent and surfaced in the jess corporate-asset UI.
 	// Backed by NOT NULL DEFAULT '' columns (migration 0008) — empty string
 	// is the canonical "absent" value (no NULLs), so plain string types are
 	// used rather than pointers.
 	SerialNumber string
 	Model        string
 	Manufacturer string
+
+	// WitnessMethod records how the enrollment was witnessed: "passkey",
+	// "otp", or "" for legacy rows (migration 0039).
+	WitnessMethod string
 
 	// LastAttestationFingerprint is sha256 of the verifier input blob,
 	// used by the audit layer for replay detection.
@@ -237,7 +241,7 @@ const iamDeviceCols = `
     last_attestation_fingerprint,
     enrolled_at, last_seen_at,
     revoked_at, revoked_reason, revoked_by_sub,
-    serial_number, model, manufacturer`
+    serial_number, model, manufacturer, witness_method`
 
 // scanIAMDeviceRow scans one row from the result of a query that selects
 // iamDeviceCols in order.
@@ -269,6 +273,7 @@ func scanIAMDeviceRow(rows pgx.Rows) (IAMDeviceRow, error) {
 		&row.SerialNumber,
 		&row.Model,
 		&row.Manufacturer,
+		&row.WitnessMethod,
 	)
 	if err != nil {
 		return IAMDeviceRow{}, err
@@ -309,6 +314,7 @@ func scanIAMDeviceRowSingle(row pgx.Row) (IAMDeviceRow, error) {
 		&r.SerialNumber,
 		&r.Model,
 		&r.Manufacturer,
+		&r.WitnessMethod,
 	)
 	if err != nil {
 		return IAMDeviceRow{}, err
@@ -349,7 +355,7 @@ INSERT INTO iam_devices (
     hostname, platform_uuid, mac_addrs,
     last_attestation_fingerprint,
     enrolled_at, last_seen_at,
-    serial_number, model, manufacturer
+    serial_number, model, manufacturer, witness_method
 ) VALUES (
     $1,  $2,  $3,  $4,  $5,
     $6,  $7,  $8,
@@ -357,7 +363,7 @@ INSERT INTO iam_devices (
     $11, $12, $13,
     $14,
     $15, $16,
-    $17, $18, $19
+    $17, $18, $19, $20
 )`
 
 	now := time.Now().UTC()
@@ -375,7 +381,7 @@ INSERT INTO iam_devices (
 		row.Hostname, row.PlatformUUID, pq.Array(row.MACAddrs),
 		row.LastAttestationFingerprint,
 		row.EnrolledAt, row.LastSeenAt,
-		row.SerialNumber, row.Model, row.Manufacturer,
+		row.SerialNumber, row.Model, row.Manufacturer, row.WitnessMethod,
 	)
 	if err != nil {
 		if pgUniqueViolation(err) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,13 +79,20 @@ type configInvalidationMessage struct {
 // L1: Local LRU (30s TTL) -> L2: Redis HSET (5m TTL) -> L3: DB -> L4: Static default.
 type ConfigProvider struct {
 	staticConfig      *config.Config
-	repo              *repositories.TenantConfigRepository
+	repo              tenantConfigStore
 	redisClient       *redis.Client
 	logger            *zap.Logger
 	provCfg           *ConfigProviderConfig
 	localCache        *lru.Cache[string, *configCacheEntry]
 	keyRegistry       map[string]models.ConfigKeyDefinition
 	encryptionService atomic.Pointer[crypto.EncryptionService]
+
+	// appHostResolver, when set, backs FrontendURL's L3.5 source: a live
+	// lookup against tenant-management's app_host (see
+	// TenantAppHostResolver's doc comment). atomic.Pointer so
+	// SetAppHostResolver (called once at boot, cmd/services.go) never
+	// races FrontendURL's concurrent reads.
+	appHostResolver atomic.Pointer[TenantAppHostResolver]
 
 	// metrics uses atomic fields directly; no mutex needed.
 	metrics ConfigProviderMetrics
@@ -97,11 +105,21 @@ type ConfigProvider struct {
 	cancelSubscriber context.CancelFunc
 }
 
+// tenantConfigStore is the subset of *repositories.TenantConfigRepository
+// ConfigProvider needs. Extracted as an interface so unit tests can supply a
+// fake store instead of requiring a live Postgres pool (the concrete
+// repository type only takes a *pgxpool.Pool, with no seam for a fake).
+type tenantConfigStore interface {
+	Get(ctx context.Context, tenantID uuid.UUID, configKey string) (*models.TenantConfig, error)
+	GetByScope(ctx context.Context, tenantID uuid.UUID, realmID, appID *uuid.UUID, configKey string) (*models.TenantConfig, error)
+	UpsertByScope(ctx context.Context, p repositories.UpsertByScopeParams) error
+}
+
 // NewConfigProvider creates a new ConfigProvider.
 // redisClient can be nil if Redis is unavailable (L2 cache will be skipped).
 func NewConfigProvider(
 	staticConfig *config.Config,
-	repo *repositories.TenantConfigRepository,
+	repo tenantConfigStore,
 	redisClient *redis.Client,
 	logger *zap.Logger,
 	provCfg *ConfigProviderConfig,
@@ -134,6 +152,16 @@ func NewConfigProvider(
 // When set, sensitive config values are decrypted on read from DB and skipped in Redis cache.
 func (cp *ConfigProvider) SetEncryptionService(enc *crypto.EncryptionService) {
 	cp.encryptionService.Store(enc)
+}
+
+// SetAppHostResolver wires FrontendURL's live source for tenant-management's
+// app_host. When unset, FrontendURL behaves exactly as before this change:
+// local cache -> Redis -> DB -> static default, never hitting the network.
+func (cp *ConfigProvider) SetAppHostResolver(r TenantAppHostResolver) {
+	if r == nil {
+		return
+	}
+	cp.appHostResolver.Store(&r)
 }
 
 // registerKeys populates the key registry with all supported dynamic config keys.
@@ -588,8 +616,107 @@ func (cp *ConfigProvider) SMTPUseTLS(ctx context.Context, tenantID uuid.UUID) bo
 }
 
 // FrontendURL is an exported identifier.
+// frontendURLKey is the ConfigProvider key used for FrontendURL below.
+const frontendURLKey = "frontend_url"
+
+// FrontendURL resolves the per-tenant frontend URL: local cache -> Redis ->
+// DB (an admin-configured per-tenant override, if one exists) -> live
+// tenant-management app_host lookup (see SetAppHostResolver) -> static
+// default. The live lookup's result is fed back into the L1/L2 caches (see
+// populateFrontendURLCache) rather than bypassing them, so a resolver call
+// only happens once per cache TTL, not once per request.
+//
+// Deliberately does NOT read tenants.domain — see
+// TenantAppHostResolver's doc comment for why.
 func (cp *ConfigProvider) FrontendURL(ctx context.Context, tenantID uuid.UUID) string {
-	return cp.getString(ctx, tenantID, "frontend_url", cp.staticConfig.FrontendURL)
+	raw, err := cp.getRaw(ctx, tenantID, frontendURLKey)
+	if err == nil && raw != nil {
+		if s, ok := decodeWrappedString(raw); ok && s != "" {
+			return s
+		}
+	}
+
+	// L1/L2/L3 all missed — no admin-configured override for this tenant.
+	// Resolve from tenant-management's app_host instead of falling
+	// straight to the hardcoded static default.
+	if resolverPtr := cp.appHostResolver.Load(); resolverPtr != nil {
+		resolver := *resolverPtr
+		appHost, rErr := resolver.ResolveAppHost(ctx, tenantID)
+		if rErr == nil && appHost != "" {
+			resolvedURL := appHostToFrontendURL(appHost)
+			cp.populateFrontendURLCache(ctx, tenantID, resolvedURL)
+			return resolvedURL
+		}
+		if rErr != nil {
+			cp.logger.Warn("app-host resolution failed, falling back to static frontend URL",
+				zap.Error(rErr), zap.String("tenant_id", tenantID.String()))
+		}
+	}
+
+	// L4: static default — unchanged behaviour when no override exists
+	// and the resolver is unset, unavailable, or failed.
+	return cp.staticConfig.FrontendURL
+}
+
+// decodeWrappedString unwraps a {"v": "<string>"} config_value JSON message
+// the same way getString does, for callers (FrontendURL) that need to
+// short-circuit before falling further down the cache chain.
+func decodeWrappedString(raw json.RawMessage) (string, bool) {
+	var w wrappedValue
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(w.V, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// appHostToFrontendURL builds a full frontend URL from a bare host (e.g.
+// "acme.example.com") returned by tenant-management's app-host endpoint.
+// Tolerates a host value that already carries a scheme (defensive; the
+// contract describes app_host as a bare host).
+func appHostToFrontendURL(host string) string {
+	if strings.HasPrefix(host, "http://") || strings.HasPrefix(host, "https://") {
+		return host
+	}
+	return "https://" + host
+}
+
+// populateFrontendURLCache stores a tenant-management-sourced frontend URL
+// into the L1 local cache and L2 Redis cache using the exact same TTLs and
+// wrapper format as populateCachesFromDB, so it is indistinguishable to
+// future reads from a DB-sourced value. It deliberately does NOT write the
+// value back to the DB (iam_tenant_configs stays reserved for explicit
+// admin overrides — writing a derived value there would make a stale
+// tenant-management read permanent instead of expiring with the cache).
+func (cp *ConfigProvider) populateFrontendURLCache(ctx context.Context, tenantID uuid.UUID, url string) {
+	valueJSON, err := json.Marshal(url)
+	if err != nil {
+		cp.logger.Warn("Failed to marshal resolved frontend URL for caching", zap.Error(err))
+		return
+	}
+	wrapped, err := json.Marshal(wrappedValue{V: valueJSON})
+	if err != nil {
+		cp.logger.Warn("Failed to wrap resolved frontend URL for caching", zap.Error(err))
+		return
+	}
+
+	cacheKey := localCacheKey(tenantID, frontendURLKey)
+	cp.localCache.Add(cacheKey, &configCacheEntry{
+		Value:     wrapped,
+		ExpiresAt: time.Now().Add(cp.provCfg.LocalCacheTTL),
+	})
+
+	if cp.redisClient != nil {
+		pipe := cp.redisClient.Pipeline()
+		pipe.HSet(ctx, redisHashKey(tenantID), frontendURLKey, string(wrapped))
+		pipe.Expire(ctx, redisHashKey(tenantID), cp.provCfg.RedisCacheTTL)
+		if _, pipeErr := pipe.Exec(ctx); pipeErr != nil {
+			cp.logger.Warn("Failed to populate Redis cache with resolved frontend URL", zap.Error(pipeErr))
+		}
+	}
 }
 
 // RateLimitRequests is an exported identifier.

@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/productslug"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
 
@@ -74,7 +75,7 @@ func (c *DefaultModuleEntitlementChecker) IsTenantEntitled(ctx context.Context, 
 		}
 
 		// Direct slug match: product slug == module name
-		if strings.ToLower(product.Slug) == module {
+		if productslug.Equivalent(product.Slug, module) {
 			return true, nil
 		}
 

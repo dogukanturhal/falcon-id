@@ -4,6 +4,7 @@ package models
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -383,14 +384,26 @@ func TestVerifySignupEmailInput_Validation(t *testing.T) {
 	}{
 		{
 			name:      "valid token",
-			req:       VerifySignupEmailInput{Token: "abc123def456"}, // gitleaks:allow — test fixture, not a real credential
+			req:       VerifySignupEmailInput{Token: "abc123def456"},
 			wantValid: true,
 		},
 		{
-			name:      "missing token fails required",
+			name:      "valid code with signup id",
+			req:       VerifySignupEmailInput{SignupID: "6f1c2a7e", Code: "123456"},
+			wantValid: true,
+		},
+		{
+			// Code-or-token presence is enforced by SignupService.VerifyEmail
+			// (verification_code_invalid), not by binding tags.
+			name:      "empty input passes binding",
 			req:       VerifySignupEmailInput{},
+			wantValid: true,
+		},
+		{
+			name:      "oversized code fails max",
+			req:       VerifySignupEmailInput{Code: strings.Repeat("1", 33)},
 			wantValid: false,
-			wantField: "Token",
+			wantField: "Code",
 		},
 	}
 

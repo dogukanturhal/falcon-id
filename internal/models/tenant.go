@@ -3,6 +3,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,6 +50,19 @@ type Tenant struct {
 	// Phase 2 settings fields (migration 0001_tenant_settings_phase2.sql)
 	Timezone              string     `json:"timezone"`
 	DefaultSenderDomainID *uuid.UUID `json:"default_sender_domain_id,omitempty"`
+}
+
+// PlaceholderTenantName is the workspace name a self-service signup gets when
+// it did not supply a company name (the signup page collects only email +
+// password). It is a stand-in, never a real name: the first-run step asks for
+// the real one, and it is replaced from the first legal entity's title (see
+// services.TenantWorkspaceNameService). Compare through IsPlaceholderTenantName.
+const PlaceholderTenantName = "My Company"
+
+// IsPlaceholderTenantName reports whether name is still the signup placeholder
+// (case- and whitespace-insensitive, so a hand-typed copy counts too).
+func IsPlaceholderTenantName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), PlaceholderTenantName)
 }
 
 // IsInternalTenant returns true if this is the HexxLock internal tenant

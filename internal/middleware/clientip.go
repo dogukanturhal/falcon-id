@@ -214,7 +214,7 @@ func ClientCountryGin(c *gin.Context) string {
 }
 
 // IPGeo holds the per-request geo attribution stamped by the
-// `id-hexxlock-geo-stamp` Cloudflare Worker (infrastructure-iac MR-114).
+// `geo-stamp` Cloudflare Worker (the edge infrastructure repository).
 // All fields are best-effort — any single field is "" when Cloudflare's
 // `request.cf` object did not have that property at the edge.
 //
@@ -315,10 +315,10 @@ var vpnHintRegexp = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
 }, "|") + `)\b`)
 
 // ClientGeo returns the geo attribution stamped onto the request by the
-// `id-hexxlock-geo-stamp` Cloudflare Worker. Returns a zero-value IPGeo
+// `geo-stamp` Cloudflare Worker. Returns a zero-value IPGeo
 // (all fields "") when no headers are present — e.g. when the Worker
 // has not yet been deployed, when the route is not under the Worker's
-// route pattern (id.hexxlock.com/api/v1/auth/* + id.hexxlock.com/oauth/*),
+// route pattern (id.example.com/api/v1/auth/* + id.example.com/oauth/*),
 // or during local-dev / unit tests that build *http.Request directly
 // without a proxy chain.
 //

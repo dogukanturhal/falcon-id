@@ -80,7 +80,7 @@ func TestEnvStringSlice(t *testing.T) {
 	t.Run("regression: matches expected multi-element shape (not viper default)", func(t *testing.T) {
 		viper.Reset()
 		viper.AutomaticEnv()
-		t.Setenv("TEST_SLICE_REGRESSION", "https://id.hexxlock.com,https://accounts.hexxlock.com")
+		t.Setenv("TEST_SLICE_REGRESSION", "https://id.example.com,https://accounts.example.com")
 
 		// viper.GetStringSlice's native behaviour on env vars (broken for our use case)
 		broken := viper.GetStringSlice("TEST_SLICE_REGRESSION")
@@ -90,8 +90,8 @@ func TestEnvStringSlice(t *testing.T) {
 		// envStringSlice — correct multi-element shape
 		fixed := envStringSlice("TEST_SLICE_REGRESSION")
 		assert.Equal(t, []string{
-			"https://id.hexxlock.com",
-			"https://accounts.hexxlock.com",
+			"https://id.example.com",
+			"https://accounts.example.com",
 		}, fixed)
 	})
 }

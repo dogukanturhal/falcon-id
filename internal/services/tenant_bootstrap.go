@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -25,6 +26,60 @@ import (
 // reconciler will close any gaps on the next run.
 type TenantBootstrapService struct {
 	client *spicedb.Client
+	// catalog is the concrete permission set wildcard role grants are expanded
+	// against. Optional: without it wildcard grants are skipped (never written raw).
+	catalog PermissionCatalog
+}
+
+// SetPermissionCatalog wires the catalog used to expand wildcard grants.
+func (s *TenantBootstrapService) SetPermissionCatalog(c PermissionCatalog) {
+	s.catalog = c
+}
+
+// expandRolePermissions resolves wildcard entries to concrete permission names.
+// Wildcards that match nothing (or cannot be expanded) are skipped and reported
+// in one aggregated Warn per role.
+func (s *TenantBootstrapService) expandRolePermissions(
+	ctx context.Context,
+	result *BootstrapResult,
+	tenantID, roleID uuid.UUID,
+	permissions []string,
+) []string {
+	hasWildcard := false
+	for _, p := range permissions {
+		if isWildcardPermission(p) {
+			hasWildcard = true
+			break
+		}
+	}
+	if !hasWildcard {
+		return permissions
+	}
+
+	var catalog []string
+	if s.catalog != nil {
+		var err error
+		catalog, err = s.catalog.ListConcreteNames(ctx)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("load permission catalog for wildcard expansion: %w", err))
+			catalog = nil
+		}
+	}
+	concrete, unmatched, moduleLevel := expandPermissionPatterns(permissions, catalog)
+	if len(moduleLevel) > 0 {
+		logger.Log.Debug("Module-level wildcard role permissions have no concrete expansion; skipped",
+			zap.String("role_id", roleID.String()),
+			zap.Int("count", len(moduleLevel)),
+		)
+	}
+	if len(unmatched) > 0 {
+		logger.Log.Warn("Wildcard role permissions matched no catalog permission; skipped",
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("role_id", roleID.String()),
+			zap.Strings("patterns", unmatched),
+		)
+	}
+	return concrete
 }
 
 // BootstrapResult aggregates the outcome of a bootstrap operation.
@@ -184,7 +239,8 @@ func (s *TenantBootstrapService) BootstrapUserMembership(
 // BootstrapRolePermissions seeds SpiceDB "granted_to_role" relationships for
 // every permission name in the permissions slice. Each permission is modelled as
 // an access_grant object whose "granted_to_role" subject is the role, matching
-// the example_complete.zed schema: WriteRolePermission(ctx, tenantID, roleID,
+// the canonical schema (deploy/helm/spicedb-schema/files/spicedb.zed, D-68):
+// WriteRolePermission(ctx, tenantID, roleID,
 // "access_grant", permName, "granted_to_role").
 //
 // Failures are collected into BootstrapResult.Errors so that a single transient
@@ -202,6 +258,8 @@ func (s *TenantBootstrapService) BootstrapRolePermissions(
 
 	result := &BootstrapResult{TenantID: tenantID}
 
+	permissions = s.expandRolePermissions(ctx, result, tenantID, roleID, permissions)
+
 	logger.Log.Info("Bootstrapping role permissions in SpiceDB",
 		zap.String("tenant_id", tenantID.String()),
 		zap.String("role_id", roleID.String()),
@@ -209,7 +267,26 @@ func (s *TenantBootstrapService) BootstrapRolePermissions(
 	)
 
 	for _, permName := range permissions {
-		spicedbPermID := spicedb.PermissionToSpiceDBID(permName)
+		if relation := requesterPermissionRelation(permName); relation != "" {
+			module := strings.SplitN(permName, ":", 2)[0]
+			token, err := s.client.WriteRolePermission(ctx, tenantID, roleID, "module", module, relation)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("write requester permission %q: %w", permName, err))
+			} else {
+				result.RelationshipsWritten++
+				result.LastZedToken = token
+			}
+		}
+		spicedbPermID, err := spicedb.PermissionToSpiceDBIDChecked(permName)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("write permission %q: %w", permName, err))
+			logger.Log.Error("Invalid role permission object id; not written",
+				zap.String("role_id", roleID.String()),
+				zap.String("permission", permName),
+				zap.Error(err),
+			)
+			continue
+		}
 		token, err := s.client.WriteRolePermission(ctx, tenantID, roleID, "access_grant", spicedbPermID, "granted_to_role")
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("write permission %q: %w", permName, err))
@@ -240,6 +317,43 @@ func (s *TenantBootstrapService) BootstrapRolePermissions(
 		zap.Int("errors", len(result.Errors)),
 	)
 
+	return result, nil
+}
+
+// RevokeRolePermissions deletes the access_grant tuples for the given
+// permission names from a role (the inverse of BootstrapRolePermissions).
+// SpiceDB DELETE of an absent tuple is a no-op, so it is idempotent. Failures
+// are collected in BootstrapResult.Errors.
+//
+// A wildcard input is expanded and deletes every concrete tuple it covers, even
+// ones the role still holds through an explicit grant or another wildcard, so it
+// over-deletes. Callers must re-sync the role's remaining permissions with
+// BootstrapRolePermissions afterwards.
+func (s *TenantBootstrapService) RevokeRolePermissions(
+	ctx context.Context,
+	tenantID uuid.UUID,
+	roleID uuid.UUID,
+	permissions []string,
+) (*BootstrapResult, error) {
+	if s.client == nil {
+		return nil, fmt.Errorf("RevokeRolePermissions: SpiceDB client not initialized")
+	}
+	result := &BootstrapResult{TenantID: tenantID}
+	permissions = s.expandRolePermissions(ctx, result, tenantID, roleID, permissions)
+	for _, permName := range permissions {
+		spicedbPermID, err := spicedb.PermissionToSpiceDBIDChecked(permName)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("delete permission %q: %w", permName, err))
+			continue
+		}
+		token, err := s.client.DeleteRolePermission(ctx, tenantID, roleID, "access_grant", spicedbPermID, "granted_to_role")
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("delete permission %q: %w", permName, err))
+			continue
+		}
+		result.RelationshipsWritten++
+		result.LastZedToken = token
+	}
 	return result, nil
 }
 
@@ -355,6 +469,34 @@ func (s *TenantBootstrapService) SyncUserAccess(
 	}
 	if _, err := s.client.ReplaceUserTenant(ctx, tenantID, userID, relation); err != nil {
 		return fmt.Errorf("SyncUserAccess: tenant membership: %w", err)
+	}
+	return nil
+}
+
+// SyncExternalAccess converges an external (seat-free) member's access to a
+// client tenant: the exact tenant-scoped role memberships plus the
+// tenant#guest marker. It never touches tenant#member/admin, which belong to
+// the tenant's own seat-holding users. On revoke (active=false) roles are
+// removed before the guest edge so a partial failure cannot leave access
+// broader than PostgreSQL.
+func (s *TenantBootstrapService) SyncExternalAccess(
+	ctx context.Context,
+	tenantID uuid.UUID,
+	userID uuid.UUID,
+	active bool,
+	roleIDs []uuid.UUID,
+) error {
+	if s.client == nil {
+		return fmt.Errorf("SyncExternalAccess: SpiceDB client not initialized")
+	}
+	if !active {
+		roleIDs = nil
+	}
+	if err := s.SyncUserRoles(ctx, tenantID, userID, roleIDs); err != nil {
+		return fmt.Errorf("SyncExternalAccess: roles: %w", err)
+	}
+	if _, err := s.client.SetTenantGuest(ctx, tenantID, userID, active); err != nil {
+		return fmt.Errorf("SyncExternalAccess: tenant guest: %w", err)
 	}
 	return nil
 }

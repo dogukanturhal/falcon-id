@@ -48,6 +48,7 @@ func (s *AuthService) LoginViaWebAuthn(
 	ctx context.Context,
 	user *models.User,
 	ipAddress, userAgent, clientID string,
+	rememberMe bool,
 ) (*models.LoginResponse, error) {
 	if user == nil {
 		return nil, errors.New("LoginViaWebAuthn: user is nil")
@@ -102,13 +103,9 @@ func (s *AuthService) LoginViaWebAuthn(
 	//    code, and /oauth/token then emits `amr` + the derived `acr`
 	//    (urn:hexxlock:aal3) onto the id_token.
 	authMethods := []string{AMRValueHardwareKey, AMRValueUserVerification}
-	// Passkey primary-login does NOT expose a "Remember me" checkbox —
-	// the WebAuthn ceremony already produces a hardware-key-bound
-	// session whose assurance level is independent of cookie lifetime.
-	// rememberMe=false preserves the short TTL for this path (existing
-	// behaviour). Future: surface the checkbox on the discoverable-
-	// credential picker if product asks for it.
-	session, err := s.createSessionWithInvalidation(ctx, user.ID, ipAddress, userAgent, authMethods, false)
+	// rememberMe (opt-in checkbox on the login page) selects the long
+	// session TTL; the IdP cookie Max-Age follows IsRememberMeSession.
+	session, err := s.createSessionWithInvalidation(ctx, user.ID, ipAddress, userAgent, authMethods, rememberMe)
 	if err != nil {
 		return nil, fmt.Errorf("LoginViaWebAuthn: create session: %w", err)
 	}
@@ -159,7 +156,12 @@ func (s *AuthService) LoginViaWebAuthn(
 	//    isNewDevice=false / riskAssessment=nil because the passkey
 	//    flow doesn't run risk evaluation — possession + UV is its own
 	//    risk story.
-	return s.buildLoginResponse(ctx, tenantCtx, user, roles, permissions, accessToken, false, false, nil)
+	resp, err := s.buildLoginResponse(ctx, tenantCtx, user, roles, permissions, accessToken, false, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp.IsRememberMeSession = rememberMe
+	return resp, nil
 }
 
 // maybePasskeyEnrollmentInterrupt evaluates the admin-passkey-required gate

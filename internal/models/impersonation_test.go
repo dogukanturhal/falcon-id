@@ -274,7 +274,6 @@ func TestImpersonationResponse_Fields(t *testing.T) {
 		resp := ImpersonationResponse{ //nolint:gosec // test fixture value, not a real credential
 			ImpersonationSessionID: uuid.New().String(),
 			AccessToken:            "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.test",
-			RefreshToken:           "refresh-token-value",
 			ExpiresIn:              900,
 			TokenType:              "Bearer",
 			TargetUser:             targetUser,
@@ -283,7 +282,6 @@ func TestImpersonationResponse_Fields(t *testing.T) {
 
 		assert.NotEmpty(t, resp.ImpersonationSessionID)
 		assert.NotEmpty(t, resp.AccessToken)
-		assert.NotEmpty(t, resp.RefreshToken)
 		assert.Equal(t, 900, resp.ExpiresIn)
 		assert.Equal(t, "Bearer", resp.TokenType)
 		assert.Equal(t, targetUser, resp.TargetUser)
@@ -309,7 +307,7 @@ func TestImpersonationResponse_Fields(t *testing.T) {
 		assert.Equal(t, "access-token", out["access_token"])
 		assert.Equal(t, "Bearer", out["token_type"])
 		assert.Equal(t, float64(900), out["expires_in"])
-		// RefreshToken is omitempty, so it should be absent when empty.
+		// An impersonation response never carries a refresh token.
 		assert.NotContains(t, out, "refresh_token")
 	})
 }

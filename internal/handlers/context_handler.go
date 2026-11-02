@@ -5,12 +5,14 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -78,6 +80,15 @@ type AvailableContext struct {
 	RealmType  string    `json:"realm_type"` // enterprise, shared, sandbox
 	Roles      []string  `json:"roles"`      // User's roles in this context
 	IsCurrent  bool      `json:"is_current"` // True if this is active context
+	// MembershipKind is "home" for the user's own tenant, "member" for another
+	// company the person joined by invitation and "external" for
+	// a client tenant reached through a seat-free external membership. A
+	// client calls the tenant token exchange (POST /oauth/token,
+	// target_tenant_id) to obtain a token for an external context.
+	MembershipKind string `json:"membership_kind"`
+	// LastUsedAt is when the person last worked in this company (membership
+	// last_used_at); the client uses it to preselect the default company.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
 // AvailableContextsResponse contains all contexts accessible to the user
@@ -109,6 +120,14 @@ type UserContext struct {
 	RealmName  string
 	RealmType  string
 	Roles      []string
+	// MembershipKind: "home", "member" or "external" (see AvailableContext).
+	MembershipKind string
+	LastUsedAt     *time.Time
+	// TenantStatus / TenantSuspended are filled by verifyUserContextAccess
+	// only (never cached): iam_tenants.status and the iam_tenant_status
+	// suspension mirror (0018) of the target tenant.
+	TenantStatus    string `json:"-"`
+	TenantSuspended bool   `json:"-"`
 }
 
 // SessionContextUpdate for updating session context in Redis
@@ -175,6 +194,9 @@ func (h *ContextHandler) GetAvailableContexts(c *gin.Context) {
 			RealmType:  ctx.RealmType,
 			Roles:      ctx.Roles,
 			IsCurrent:  ctx.TenantID == currentUser.TenantID && ctx.RealmID == currentUser.RealmID,
+
+			MembershipKind: ctx.MembershipKind,
+			LastUsedAt:     ctx.LastUsedAt,
 		}
 		response.Contexts = append(response.Contexts, ac)
 		if ac.IsCurrent {
@@ -263,6 +285,27 @@ func (h *ContextHandler) SwitchContext(c *gin.Context) {
 			"reason":        "access_denied",
 		}, false)
 
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied to requested context"})
+		return
+	}
+
+	// A suspended or no longer active tenant is never a switch target: the
+	// token minted below would otherwise outlive the suspension that login,
+	// refresh and the tenant token exchange already enforce (LD-R3-TX-3).
+	if reason := switchTargetRefusal(contextInfo); reason != "" {
+		logger.Log.Warn("Context switch to inactive tenant denied",
+			zap.String("user_id", currentUser.ID.String()),
+			zap.String("tenant_id", req.TenantID.String()),
+			zap.String("reason", reason))
+		h.auditLog(c.Request.Context(), currentUser.ID, currentUser.TenantID, "context_switch_denied", map[string]interface{}{
+			"target_tenant": req.TenantID,
+			"target_realm":  req.RealmID,
+			"reason":        reason,
+		}, false)
+		if reason == "tenant_suspended" {
+			respondIfTenantSuspended(c, services.ErrTenantSuspended)
+			return
+		}
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied to requested context"})
 		return
 	}
@@ -400,9 +443,14 @@ func setAccessTokenCookie(c *gin.Context, token string, ttl time.Duration) {
 
 // getUserContextsFromDB fetches user's accessible contexts from database
 func (h *ContextHandler) getUserContextsFromDB(ctx context.Context, userID uuid.UUID) ([]UserContext, error) {
-	// Query to get all tenant/realm combinations the user has access to
+	// Query to get all tenant/realm combinations the user has access to:
+	// the home tenant (iam_users.tenant_id) plus every tenant holding an
+	// active seat_class='external' (an accountant invited from their partner
+	// tenant) or seat_class='member' (a person invited into another company
+	// with their one global account) membership for the user. Roles are scoped to each listed
+	// tenant so one tenant's role names never appear under another.
 	query := `
-		SELECT DISTINCT
+		SELECT
 			t.id as tenant_id,
 			t.slug as tenant_slug,
 			t.name as tenant_name,
@@ -410,18 +458,43 @@ func (h *ContextHandler) getUserContextsFromDB(ctx context.Context, userID uuid.
 			'' as realm_slug,
 			'' as realm_name,
 			'' as realm_type,
-			COALESCE(array_agg(DISTINCT ro.name) FILTER (WHERE ro.name IS NOT NULL), '{}') as roles
+			COALESCE(array_agg(DISTINCT ro.name) FILTER (WHERE ro.name IS NOT NULL), '{}') as roles,
+			CASE WHEN t.id = u.tenant_id THEN 'home'
+			     WHEN bool_or(mm.seat_class = 'external') THEN 'external'
+			     ELSE 'member' END as membership_kind,
+			max(mm.last_used_at) as last_used_at
 		FROM iam_users u
-		INNER JOIN iam_tenants t ON u.tenant_id = t.id
+		INNER JOIN iam_tenants t ON t.id = u.tenant_id OR t.id IN (
+			SELECT m.tenant_id FROM iam_user_memberships m
+			WHERE m.user_id = u.id AND m.seat_class IN ('external', 'member') AND m.status = 'active'
+		)
+		LEFT JOIN iam_user_memberships mm ON mm.tenant_id = t.id AND mm.user_id = u.id
 		LEFT JOIN iam_user_roles ur ON ur.user_id = u.id
-		LEFT JOIN iam_roles ro ON ro.id = ur.role_id
+			AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+		LEFT JOIN iam_roles ro ON ro.id = ur.role_id AND ro.tenant_id = t.id
 		WHERE u.id = $1
 			AND (u.is_active = true OR u.is_active IS NULL)
-		GROUP BY t.id, t.slug, t.name, u.realm_id
+		GROUP BY t.id, t.slug, t.name, u.realm_id, u.tenant_id
 		ORDER BY t.name
 	`
 
-	rows, err := h.db.Query(ctx, query, userID)
+	// The external memberships live in other tenants: read them under the
+	// user's own app.current_user_id so the iam_user_memberships RLS policy
+	// exposes them (see repositories.WithUserMembershipScope).
+	var contexts []UserContext
+	err := repositories.WithUserMembershipScope(ctx, h.db, userID, func(tx pgx.Tx) error {
+		var qErr error
+		contexts, qErr = scanUserContexts(ctx, tx, query, userID)
+		return qErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return contexts, nil
+}
+
+func scanUserContexts(ctx context.Context, tx pgx.Tx, query string, userID uuid.UUID) ([]UserContext, error) {
+	rows, err := tx.Query(ctx, query, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user contexts: %w", err)
 	}
@@ -442,6 +515,8 @@ func (h *ContextHandler) getUserContextsFromDB(ctx context.Context, userID uuid.
 			&realmName,
 			&realmType,
 			&uc.Roles,
+			&uc.MembershipKind,
+			&uc.LastUsedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan user context: %w", err)
@@ -473,7 +548,7 @@ func (h *ContextHandler) getUserContextsFromDB(ctx context.Context, userID uuid.
 
 // cacheUserContexts stores user's contexts in Redis with 1 hour TTL
 func (h *ContextHandler) cacheUserContexts(ctx context.Context, userID uuid.UUID, contexts []UserContext) error {
-	key := fmt.Sprintf("hexxlock:user:%s:contexts", userID.String())
+	key := userContextsCacheKey(userID)
 	data, err := json.Marshal(contexts)
 	if err != nil {
 		return fmt.Errorf("failed to marshal contexts: %w", err)
@@ -484,7 +559,7 @@ func (h *ContextHandler) cacheUserContexts(ctx context.Context, userID uuid.UUID
 
 // getCachedUserContexts retrieves cached user contexts from Redis
 func (h *ContextHandler) getCachedUserContexts(ctx context.Context, userID uuid.UUID) ([]UserContext, error) {
-	key := fmt.Sprintf("hexxlock:user:%s:contexts", userID.String())
+	key := userContextsCacheKey(userID)
 	data, err := h.redisClient.Redis().Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("getCachedUserContexts: %w", err)
@@ -496,6 +571,19 @@ func (h *ContextHandler) getCachedUserContexts(ctx context.Context, userID uuid.
 	}
 
 	return contexts, nil
+}
+
+// switchTargetRefusal returns why a reachable context's tenant may not be
+// switched into, or "" when it may. Mirrors the tenant token exchange
+// (services.tenantExchangeRefusal): active or trial only, never suspended.
+func switchTargetRefusal(info *UserContext) string {
+	switch {
+	case info.TenantSuspended:
+		return "tenant_suspended"
+	case info.TenantStatus != "active" && info.TenantStatus != "trial":
+		return "tenant_not_active"
+	}
+	return ""
 }
 
 // verifyUserContextAccess checks if user can access a specific tenant/realm
@@ -511,12 +599,19 @@ func (h *ContextHandler) verifyUserContextAccess(
 			u.realm_id as realm_id,
 			'' as realm_slug,
 			'' as realm_name,
-			'' as realm_type
+			'' as realm_type,
+			t.status,
+			COALESCE(ts.suspended, false)
 		FROM iam_users u
-		INNER JOIN iam_tenants t ON u.tenant_id = t.id
+		INNER JOIN iam_tenants t ON t.id = $2
+		LEFT JOIN iam_tenant_status ts ON ts.tenant_id = t.id
 		WHERE u.id = $1
-			AND t.id = $2
 			AND u.is_active = true
+			AND (u.tenant_id = $2 OR EXISTS (
+				SELECT 1 FROM iam_user_memberships m
+				WHERE m.tenant_id = $2 AND m.user_id = u.id
+					AND m.seat_class IN ('external', 'member') AND m.status = 'active'
+			))
 		LIMIT 1
 	`
 
@@ -524,15 +619,24 @@ func (h *ContextHandler) verifyUserContextAccess(
 	var realmIDResult *uuid.UUID
 	var realmSlug, realmName, realmType *string
 
-	err := h.db.QueryRow(ctx, query, userID, tenantID).Scan(
-		&contextInfo.TenantID,
-		&contextInfo.TenantSlug,
-		&contextInfo.TenantName,
-		&realmIDResult,
-		&realmSlug,
-		&realmName,
-		&realmType,
-	)
+	err := repositories.WithUserMembershipScope(ctx, h.db, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, userID, tenantID).Scan(
+			&contextInfo.TenantID,
+			&contextInfo.TenantSlug,
+			&contextInfo.TenantName,
+			&realmIDResult,
+			&realmSlug,
+			&realmName,
+			&realmType,
+			&contextInfo.TenantStatus,
+			&contextInfo.TenantSuspended,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Neither home tenant nor an active external membership: a plain
+		// denial (403), not a server error.
+		return false, nil, nil
+	}
 	if err != nil {
 		return false, nil, fmt.Errorf("verifyUserContextAccess: %w", err)
 	}
@@ -557,17 +661,22 @@ func (h *ContextHandler) verifyUserContextAccess(
 // getUserRolesInContext returns user's roles in a specific context
 func (h *ContextHandler) getUserRolesInContext(
 	ctx context.Context,
-	userID, _, _ uuid.UUID,
+	userID, tenantID, _ uuid.UUID,
 ) ([]string, error) {
+	// Scoped to the target tenant: an external accountant who is an
+	// administrator in their own partner tenant must not carry that role
+	// name into a token minted for a client tenant.
 	query := `
 		SELECT DISTINCT r.name
 		FROM iam_user_roles ur
 		INNER JOIN iam_roles r ON r.id = ur.role_id
 		WHERE ur.user_id = $1
+			AND r.tenant_id = $2
+			AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
 		ORDER BY r.name
 	`
 
-	rows, err := h.db.Query(ctx, query, userID)
+	rows, err := h.db.Query(ctx, query, userID, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query user roles: %w", err)
 	}
@@ -697,4 +806,22 @@ func (h *ContextHandler) auditLog(
 				zap.String("action", action))
 		}
 	}()
+}
+
+func userContextsCacheKey(userID uuid.UUID) string {
+	// v2: entries carry MembershipKind; older cached lists lack it.
+	return fmt.Sprintf("hexxlock:user:%s:contexts:v2", userID.String())
+}
+
+// InvalidateUserContextsCache drops a user's cached available-contexts list
+// so the tenant switcher reflects a granted or revoked external membership at
+// once. Best effort: a failure only delays the change until the cache TTL,
+// and SwitchContext re-checks access against PostgreSQL regardless.
+func InvalidateUserContextsCache(ctx context.Context, client *redis.Client, userID uuid.UUID) {
+	if client == nil {
+		return
+	}
+	if err := client.Redis().Del(ctx, userContextsCacheKey(userID)).Err(); err != nil {
+		logger.Log.Warn("Failed to invalidate user contexts cache", zap.Error(err), zap.String("user_id", userID.String()))
+	}
 }

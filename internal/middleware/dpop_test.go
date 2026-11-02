@@ -671,23 +671,23 @@ func TestVerifyTokenBinding_NoTokenCNFJKT(t *testing.T) {
 // non-nil *tls.ConnectionState.
 func TestBuildRequestURI_HTTPSFromTLS(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/v1/token", nil)
-	req.Host = "auth.hexxlock.com"
+	req.Host = "auth.example.com"
 	// Setting TLS to any non-nil value signals an active TLS connection.
 	req.TLS = &cryptotls.ConnectionState{}
 
 	uri := buildRequestURI(req)
-	assert.Equal(t, "https://auth.hexxlock.com/api/v1/token", uri)
+	assert.Equal(t, "https://auth.example.com/api/v1/token", uri)
 }
 
 // TestBuildRequestURI_HTTPSFromForwardedProto verifies that X-Forwarded-Proto
 // is respected when TLS is not active on the TCP connection (reverse proxy).
 func TestBuildRequestURI_HTTPSFromForwardedProto(t *testing.T) {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/api/v1/auth/login", nil)
-	req.Host = "auth.hexxlock.com"
+	req.Host = "auth.example.com"
 	req.Header.Set("X-Forwarded-Proto", "https")
 
 	uri := buildRequestURI(req)
-	assert.Equal(t, "https://auth.hexxlock.com/api/v1/auth/login", uri)
+	assert.Equal(t, "https://auth.example.com/api/v1/auth/login", uri)
 }
 
 // TestBuildRequestURI_PlainHTTP verifies that a plain HTTP request without any

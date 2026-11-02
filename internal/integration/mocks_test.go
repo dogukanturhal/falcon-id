@@ -99,6 +99,29 @@ func (m *userRepoMock) UnlockUser(ctx context.Context, userID uuid.UUID) error {
 	return args.Error(0)
 }
 
+func (m *userRepoMock) SetDeletionState(ctx context.Context, userID uuid.UUID, activationStatus string, deletionScheduledAt, deletionGracePeriodEndsAt *time.Time, deletionReason *string) error {
+	args := m.Called(ctx, userID, activationStatus, deletionScheduledAt, deletionGracePeriodEndsAt, deletionReason)
+	return args.Error(0)
+}
+
+func (m *userRepoMock) CountActiveOwners(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	args := m.Called(ctx, tenantID)
+	return args.Int(0), args.Error(1)
+}
+
+func (m *userRepoMock) HasRole(ctx context.Context, userID uuid.UUID, roleName string) (bool, error) {
+	args := m.Called(ctx, userID, roleName)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *userRepoMock) HardDeleteUser(ctx context.Context, userID uuid.UUID) (map[string]int, error) {
+	args := m.Called(ctx, userID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int), args.Error(1)
+}
+
 // ---------------------------------------------------------------------------
 // roleRepoMock implements userServiceRoleRepo + roleServiceRoleRepo + groupServiceRoleRepo
 // ---------------------------------------------------------------------------
@@ -169,6 +192,14 @@ func (m *roleRepoMock) AssignPermissions(ctx context.Context, roleID uuid.UUID, 
 	return args.Error(0)
 }
 
+// GrantPermissionsByName is a no-op stub: no test in this package exercises
+// the AcmeApp reconcile path, so it deliberately does not go through
+// m.Called (which would require every existing test using roleRepoMock to
+// add an unrelated expectation).
+func (m *roleRepoMock) GrantPermissionsByName(ctx context.Context, roleID uuid.UUID, permissionNames []string) error {
+	return nil
+}
+
 func (m *roleRepoMock) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]models.Permission, error) {
 	args := m.Called(ctx, roleID)
 	if v := args.Get(0); v != nil {
@@ -229,6 +260,14 @@ func (m *permissionRepoMock) ListByModules(ctx context.Context, modules []string
 	args := m.Called(ctx, modules)
 	if v := args.Get(0); v != nil {
 		return v.([]models.Permission), args.Error(1)
+	}
+	return nil, args.Error(1)
+}
+
+func (m *permissionRepoMock) GetByID(ctx context.Context, id uuid.UUID) (*models.Permission, error) {
+	args := m.Called(ctx, id)
+	if v := args.Get(0); v != nil {
+		return v.(*models.Permission), args.Error(1)
 	}
 	return nil, args.Error(1)
 }

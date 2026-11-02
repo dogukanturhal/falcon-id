@@ -116,3 +116,43 @@ type JITAccessGrantListResponse struct {
 	PageSize   int                      `json:"page_size"`
 	TotalPages int                      `json:"total_pages"`
 }
+
+// JITEligible represents a standing eligibility record: (user, role) pairs
+// that MAY be elevated via the JIT workflow, and the guardrails that apply
+// when they do. It is distinct from JITAccessGrant (the actual, time-boxed
+// elevation): eligibility says "this user is allowed to request/activate
+// this role, subject to these constraints"; a grant says "this user's
+// elevation is currently in flight/active."
+type JITEligible struct {
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	UserID             uuid.UUID  `json:"user_id" db:"user_id"`
+	RoleID             uuid.UUID  `json:"role_id" db:"role_id"`
+	TenantID           uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	MaxDurationSeconds int        `json:"max_duration_seconds" db:"max_duration_seconds"`
+	RequiresMFA        bool       `json:"requires_mfa" db:"requires_mfa"`
+	RequiresApproval   bool       `json:"requires_approval" db:"requires_approval"`
+	ValidFrom          *time.Time `json:"valid_from,omitempty" db:"valid_from"`
+	ValidUntil         *time.Time `json:"valid_until,omitempty" db:"valid_until"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+
+	// RoleName/RoleDisplayName are populated only by queries that join
+	// iam_roles (e.g. ListByUser); they are not columns on iam_jit_eligible.
+	RoleName        string `json:"role_name,omitempty" db:"-"`
+	RoleDisplayName string `json:"role_display_name,omitempty" db:"-"`
+}
+
+// IsCurrentlyValid reports whether this eligibility record is within its
+// standing validity window (valid_from/valid_until), independent of any
+// individual grant made under it. A nil ValidFrom/ValidUntil means
+// unbounded on that side.
+func (e *JITEligible) IsCurrentlyValid() bool {
+	now := time.Now()
+	if e.ValidFrom != nil && now.Before(*e.ValidFrom) {
+		return false
+	}
+	if e.ValidUntil != nil && now.After(*e.ValidUntil) {
+		return false
+	}
+	return true
+}

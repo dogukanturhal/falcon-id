@@ -77,7 +77,7 @@ func TestRecordProvisioningStep_Helper(t *testing.T) {
 }
 
 func TestRecordProvisioningStep_Failure(t *testing.T) {
-	timer := NewProvisioningTimer("migrating", "hotel-pms")
+	timer := NewProvisioningTimer("migrating", "example-pms")
 	require.NotNil(t, timer)
 
 	time.Sleep(5 * time.Millisecond)

@@ -181,7 +181,35 @@ func (s *EmailService) SendMFAFactorRemoved(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFAFactorRemoved, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFAFactorRemoved, to, subject, body, "")
+}
+
+// SendDeviceEnrolledViaAuthenticator tells a platform admin that a device
+// enrollment was witnessed with their authenticator-app code instead of a
+// passkey. Notification only (never carries a code): it is the legitimate
+// user's out-of-band signal to detect "wasn't me". Security-critical.
+func (s *EmailService) SendDeviceEnrolledViaAuthenticator(
+	tenantID uuid.UUID,
+	to, username, deviceUUID string,
+	evtCtx securityEventContext,
+) error {
+	subject := "Security alert: device enrolled with authenticator app - HexxLock"
+
+	lead := fmt.Sprintf(
+		"Hello %s,<br><br>A device (<code>%s</code>) was just enrolled for secure access and witnessed with your <strong>authenticator-app code</strong>. If this was not you, change your password and contact a HexxLock administrator immediately so the device can be revoked.",
+		template.HTMLEscapeString(username),
+		template.HTMLEscapeString(deviceUUID),
+	)
+
+	body := securityEventShell(
+		"#f59e0b,#d97706", // amber — high-trust action with a weaker factor
+		"Device enrolled with authenticator app",
+		lead,
+		renderEventContext(evtCtx),
+		s.accountSecurityCTAURL(),
+	)
+
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateDeviceWitnessTOTP, to, subject, body, "")
 }
 
 // SendPasswordChanged notifies the user that their password was
@@ -207,7 +235,7 @@ func (s *EmailService) SendPasswordChanged(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplatePasswordChanged, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplatePasswordChanged, to, subject, body, "")
 }
 
 // SendRecoveryEmailChanged notifies a user's PRIMARY email that a recovery
@@ -239,7 +267,7 @@ func (s *EmailService) SendRecoveryEmailChanged(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateRecoveryEmailChange, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateRecoveryEmailChange, to, subject, body, "")
 }
 
 // SendNewDeviceSignIn notifies the user that a sign-in succeeded from
@@ -268,7 +296,7 @@ func (s *EmailService) SendNewDeviceSignIn(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateNewDeviceSignIn, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateNewDeviceSignIn, to, subject, body, "")
 }
 
 // SendAccountLocked notifies the user that their account was just
@@ -320,7 +348,7 @@ func (s *EmailService) SendAccountLocked(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateAccountLocked, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateAccountLocked, to, subject, body, "")
 }
 
 // SendSuspiciousLogin notifies the user that the risk engine detected
@@ -366,5 +394,5 @@ func (s *EmailService) SendSuspiciousLogin(
 		s.accountSecurityCTAURL(),
 	)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateSuspiciousLogin, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateSuspiciousLogin, to, subject, body, "")
 }

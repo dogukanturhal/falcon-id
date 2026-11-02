@@ -12,7 +12,7 @@
 //
 // GET returns the entire bag so the client can render initial state for
 // every namespace it cares about in one round-trip. PATCH paths are
-// per-namespace so a Mearax PATCH can't accidentally clobber Hexx-Forge
+// per-namespace so a AcmeWeb PATCH can't accidentally clobber Hexx-Forge
 // state, and a future Hexx-Cloud product can write its subtree without
 // even reading siblings.
 //

@@ -288,7 +288,7 @@ func (d *BackchannelLogoutDrainer) deliverRow(ctx context.Context, tx repositori
 	// (BCL_SHARED_SECRET was a static cluster-wide string, not bound
 	// to the Falcon-ID identity that signed the logout_token).
 	//
-	// Memory: internal engineering notes — "delete
+	// operational notes — "delete
 	// INTERNAL_API_KEY config/middleware/env on sight". BCL_SHARED_SECRET
 	// is the same anti-pattern.
 

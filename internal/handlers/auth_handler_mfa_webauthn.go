@@ -49,22 +49,18 @@ func (h *AuthHandler) BeginMFAWebAuthn(c *gin.Context) {
 			zap.String("session_id", req.SessionID),
 			zap.Error(err),
 		)
-		// Distinguish "service not wired" (503) from other failures (400).
-		if strings.Contains(err.Error(), "webauthn service not configured") {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "WebAuthn not configured"})
-			return
-		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondMFAFlowError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, out)
 }
 
 // FinishMFAWebAuthn POST /api/v1/auth/mfa/webauthn/finish
-//   ?session_id=<temp MFA session id>
-//   &wa_session_id=<webauthn ceremony id from /begin>
-//   &remember_me=true|false        (optional)
-//   &device_id=<client device id>  (optional)
+//
+//	?session_id=<temp MFA session id>
+//	&wa_session_id=<webauthn ceremony id from /begin>
+//	&remember_me=true|false        (optional)
+//	&device_id=<client device id>  (optional)
 //
 // Request body: raw assertion JSON output by
 // @simplewebauthn/browser.startAuthentication() — passed through to
@@ -108,7 +104,7 @@ func (h *AuthHandler) FinishMFAWebAuthn(c *gin.Context) {
 			zap.String("reason", err.Error()),
 			zap.Time("timestamp", time.Now().UTC()),
 		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondMFAFlowError(c, err)
 		return
 	}
 
@@ -119,5 +115,5 @@ func (h *AuthHandler) FinishMFAWebAuthn(c *gin.Context) {
 	// on the next /oauth/authorize → silent SSO breaks → step-up loop.
 	h.SetLoginResponseCookies(c, response)
 
-	c.JSON(http.StatusOK, response)
+	writeMFACompletionResponse(c, response)
 }

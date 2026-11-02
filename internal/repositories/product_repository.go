@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/productslug"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -62,7 +63,7 @@ func (r *ProductRepository) Create(ctx context.Context, product *models.Product)
 func (r *ProductRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.Product, error) {
 	query := `
 		SELECT id, name, slug, description, type, status,
-		       icon_url, homepage_url, documentation_url, metadata, created_by,
+		       icon_url, homepage_url, documentation_url, metadata, capability_manifest, created_by,
 		       created_at, updated_at
 		FROM iam_products
 		WHERE id = $1
@@ -75,21 +76,31 @@ func (r *ProductRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.
 func (r *ProductRepository) GetBySlug(ctx context.Context, slug string) (*models.Product, error) {
 	query := `
 		SELECT id, name, slug, description, type, status,
-		       icon_url, homepage_url, documentation_url, metadata, created_by,
+		       icon_url, homepage_url, documentation_url, metadata, capability_manifest, created_by,
 		       created_at, updated_at
 		FROM iam_products
-		WHERE slug = $1
+		WHERE slug = ANY($1)
+		ORDER BY (slug = $2) DESC
+		LIMIT 1
 	`
 
-	return r.scanProduct(ctx, query, slug)
+	return r.scanProduct(ctx, query, productslug.Aliases(slug), slug)
 }
 
 // scanProduct is a helper that scans a single product row.
-func (r *ProductRepository) scanProduct(ctx context.Context, query string, arg interface{}) (*models.Product, error) {
+//
+// capability_manifest MUST be part of the SELECT list passed in — it drives
+// DefaultModuleEntitlementChecker.IsTenantEntitled's manifest-permission
+// match (internal/services/module_entitlement_checker.go). It was omitted
+// here for an unknown period, which meant every module entitlement lookup
+// silently fell back to the exact product-slug match only and manifest-declared
+// modules (e.g. "marketing") were NEVER entitled for any tenant, no matter
+// what capability_manifest held in the database.
+func (r *ProductRepository) scanProduct(ctx context.Context, query string, args ...interface{}) (*models.Product, error) {
 	var product models.Product
 	var metadataJSON []byte
 
-	err := r.db.QueryRow(ctx, query, arg).Scan(
+	err := r.db.QueryRow(ctx, query, args...).Scan(
 		&product.ID,
 		&product.Name,
 		&product.Slug,
@@ -100,6 +111,7 @@ func (r *ProductRepository) scanProduct(ctx context.Context, query string, arg i
 		&product.HomepageURL,
 		&product.DocumentationURL,
 		&metadataJSON,
+		&product.CapabilityManifest,
 		&product.CreatedBy,
 		&product.CreatedAt,
 		&product.UpdatedAt,

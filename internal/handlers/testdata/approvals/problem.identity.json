@@ -1,0 +1,1 @@
+{"type":"https://docs.example.com/errors/forbidden","title":"Access denied","status":403,"detail":"The acting user could not be identified; approval was refused.","instance":"/api/v1/mm/purchase-orders/33333333-3333-3333-3333-333333333333/actions/approve","code":"approver_identity_required","traceId":"approval-fixture"}

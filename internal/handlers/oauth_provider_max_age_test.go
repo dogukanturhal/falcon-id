@@ -26,7 +26,7 @@ func TestBuildAuthorizeURLFromRequest_MaxAge(t *testing.T) {
 	req := &models.OAuthAuthorizeRequest{
 		ResponseType: "code",
 		ClientID:     "svc-accounts",
-		RedirectURI:  "https://accounts.hexxlock.com/api/auth/oidc-callback",
+		RedirectURI:  "https://accounts.example.com/api/auth/oidc-callback",
 		Scope:        "openid email profile",
 		State:        "test-state",
 		AcrValues:    "mfa",
@@ -62,7 +62,7 @@ func TestBuildAuthorizeURLFromRequest_MaxAgeOmittedWhenNil(t *testing.T) {
 	req := &models.OAuthAuthorizeRequest{
 		ResponseType: "code",
 		ClientID:     "svc-accounts",
-		RedirectURI:  "https://accounts.hexxlock.com/api/auth/oidc-callback",
+		RedirectURI:  "https://accounts.example.com/api/auth/oidc-callback",
 		Scope:        "openid",
 		MaxAge:       nil,
 	}
@@ -85,7 +85,7 @@ func TestBuildAuthorizeURLFromRequest_MaxAgeZeroPropagated(t *testing.T) {
 	req := &models.OAuthAuthorizeRequest{
 		ResponseType: "code",
 		ClientID:     "svc-accounts",
-		RedirectURI:  "https://accounts.hexxlock.com/api/auth/oidc-callback",
+		RedirectURI:  "https://accounts.example.com/api/auth/oidc-callback",
 		Scope:        "openid",
 		MaxAge:       &zero,
 	}

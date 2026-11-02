@@ -125,8 +125,8 @@ func DefaultCSRFConfig() CSRFConfig {
 			//
 			// Anti-CSRF for these endpoints is the enrollment_token itself:
 			// IP+UA-bound and single-use, returned only to the originating
-			// browser by /auth/login (memory:
-			// internal engineering notes). An
+			// browser by /auth/login (see
+			// operational notes). An
 			// attacker on a different IP+UA cannot replay the token, so
 			// the cross-site forgery surface is closed at the application
 			// layer rather than the middleware layer.
@@ -182,7 +182,7 @@ func DefaultCSRFConfig() CSRFConfig {
 			// inside the right origin).
 			//
 			// Without this skip the new primary-login button at
-			// id.hexxlock.com/login surfaces "csrf_validation_failed"
+			// id.example.com/login surfaces "csrf_validation_failed"
 			// on every passkey ceremony attempt (live repro 2026-05-24:
 			// dogukanturhal Chrome/148 first POST after frontend!92
 			// deploy → POST /webauthn/conditional/begin → 403 size:75
@@ -206,7 +206,7 @@ func DefaultCSRFConfig() CSRFConfig {
 			// the same reasons — the session-bound synchronizer token does NOT
 			// fit this flow, and stronger protections already apply:
 			//
-			//  1. The witness page is launched by the HexxLock Access DESKTOP
+			//  1. The witness page is launched by the device-agent DESKTOP
 			//     app into the system browser (a cross-context, app-initiated
 			//     navigation). The single-slot per-session synchronizer token
 			//     (Redis CSRFRedisKeyPrefix:<sessionID> + the shared
@@ -236,6 +236,11 @@ func DefaultCSRFConfig() CSRFConfig {
 			"/api/auth/signup",             // Pre-auth: self-service signup (no session)
 			"/api/v1/auth/signup",          // Pre-auth: v1 route
 			"/api/v1/auth/signup/",         // Pre-auth: signup sub-routes (verify, complete)
+			// Pre-auth: invitation onboarding creates the account from a single-use
+			// invitation token (the credential); no session, so no synchronizer token
+			// can exist. Without this every invited-member signup 403s (csrf_validation_failed).
+			"/api/auth/invitations/register",
+			"/api/v1/auth/invitations/register",
 			"/api/auth/social/",            // Pre-auth: social auth callbacks (Apple POST uses form_post)
 			"/api/v1/auth/social/",         // Pre-auth: v1 social routes
 			"/api/auth/heartbeat",          // Session keepalive: protected by Bearer token auth
@@ -255,6 +260,12 @@ func DefaultCSRFConfig() CSRFConfig {
 // CSRFMiddleware creates a new CSRF protection middleware
 type CSRFMiddleware struct {
 	config CSRFConfig
+	// originRegistry is the Stage 3 tenant-registry-derived origin set
+	// consulted (in-memory, no per-request network call) alongside
+	// getAllowedCSRFOrigins()'s static patterns in validateOrigin. Nil
+	// (unset via SetOriginRegistry) behaves exactly as before Stage 3 —
+	// (*DynamicOriginRegistry)(nil).Contains is always false.
+	originRegistry *DynamicOriginRegistry
 }
 
 // NewCSRFMiddleware creates a new CSRF middleware with default config
@@ -264,6 +275,13 @@ func NewCSRFMiddleware(redisClient *redis.Client) *CSRFMiddleware {
 	return &CSRFMiddleware{
 		config: config,
 	}
+}
+
+// SetOriginRegistry wires the Stage 3 dynamic tenant-origin registry into
+// origin validation. Safe to call with nil (no-op — validateOrigin already
+// tolerates a nil registry).
+func (m *CSRFMiddleware) SetOriginRegistry(registry *DynamicOriginRegistry) {
+	m.originRegistry = registry
 }
 
 // NewCSRFMiddlewareWithConfig creates a new CSRF middleware with custom config
@@ -443,6 +461,17 @@ func (m *CSRFMiddleware) validateOrigin(c *gin.Context) bool {
 		}
 	}
 
+	// Stage 3: tenant-registry-derived origins, on top of the static
+	// patterns above. m.originRegistry.Contains is an in-memory lookup
+	// against the last successfully cached set (see
+	// DynamicOriginRegistry's fail-closed contract) — a nil registry, or
+	// one that has never refreshed successfully, contributes nothing
+	// here, so this can only ever ADD trusted origins on top of the
+	// static list, never substitute for it.
+	if m.originRegistry.Contains(origin) {
+		return true
+	}
+
 	log.Printf("WARN: CSRF origin mismatch - origin: %s, host: %s", origin, requestHost)
 	return false
 }
@@ -513,12 +542,25 @@ func getAllowedCSRFOrigins() []string {
 	switch env {
 	case envProductionName:
 		return []string{
-			"https://hexxlock.com",
-			"https://www.hexxlock.com",
-			"https://app.hexxlock.com",
-			"https://dashboard.hexxlock.com",
-			"https://admin.hexxlock.com",
-			"https://*.hexxlock.com",
+			"https://example.com",
+			"https://www.example.com",
+			"https://app.example.com",
+			"https://dashboard.example.com",
+			"https://admin.example.com",
+			"https://*.example.com",
+			// AcmeWeb serves example.com (acmeweb-prod HTTPRoute), including
+			// its wildcard for tenant subdomains. Absent here, a
+			// state-changing request from the live customer app is rejected
+			// as a cross-origin CSRF attempt.
+			//
+			// example.org was a legacy test apex retired 2026-09-24: the
+			// acmeweb-prod HTTPRoute now only 301-redirects it to example.com,
+			// it is never served as a first-class origin, so no browser ever
+			// submits a state-changing request with Origin: https://example.org.
+			// Removed here.
+			"https://example.com",
+			"https://www.example.com",
+			"https://*.example.com",
 			"https://example.com",
 			"https://www.example.com",
 			"https://app.example.com",
@@ -528,10 +570,10 @@ func getAllowedCSRFOrigins() []string {
 		}
 	case envStagingName:
 		return []string{
-			"https://staging.hexxlock.com",
-			"https://staging-app.hexxlock.com",
-			"https://staging-dashboard.hexxlock.com",
-			"https://*.staging.hexxlock.com",
+			"https://staging.example.com",
+			"https://staging-app.example.com",
+			"https://staging-dashboard.example.com",
+			"https://*.staging.example.com",
 			"https://staging.example.com",
 			"https://*.staging.example.com",
 		}
@@ -550,7 +592,7 @@ func getAllowedCSRFOrigins() []string {
 }
 
 // matchesOriginPattern checks if an origin matches an allowed pattern
-// Supports wildcard subdomain patterns like "https://*.hexxlock.com"
+// Supports wildcard subdomain patterns like "https://*.example.com"
 func matchesOriginPattern(origin, pattern string) bool {
 	if origin == pattern {
 		return true

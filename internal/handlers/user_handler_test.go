@@ -118,6 +118,29 @@ func (m *mockUserServiceUserRepo) UnlockUser(ctx context.Context, userID uuid.UU
 	return args.Error(0)
 }
 
+func (m *mockUserServiceUserRepo) SetDeletionState(ctx context.Context, userID uuid.UUID, activationStatus string, deletionScheduledAt, deletionGracePeriodEndsAt *time.Time, deletionReason *string) error {
+	args := m.Called(ctx, userID, activationStatus, deletionScheduledAt, deletionGracePeriodEndsAt, deletionReason)
+	return args.Error(0)
+}
+
+func (m *mockUserServiceUserRepo) CountActiveOwners(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	args := m.Called(ctx, tenantID)
+	return args.Int(0), args.Error(1)
+}
+
+func (m *mockUserServiceUserRepo) HasRole(ctx context.Context, userID uuid.UUID, roleName string) (bool, error) {
+	args := m.Called(ctx, userID, roleName)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *mockUserServiceUserRepo) HardDeleteUser(ctx context.Context, userID uuid.UUID) (map[string]int, error) {
+	args := m.Called(ctx, userID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int), args.Error(1)
+}
+
 // ---------------------------------------------------------------------------
 // Mock: userServiceRoleRepo
 // ---------------------------------------------------------------------------

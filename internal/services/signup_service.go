@@ -4,19 +4,30 @@ package services
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/hkdf"
+	"golang.org/x/text/unicode/norm"
 
+	"github.com/dogukanturhal/falcon-id/internal/metrics"
 	"github.com/dogukanturhal/falcon-id/internal/models"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
@@ -56,11 +67,114 @@ type SignupRequestRepo interface {
 	GetPendingByEmail(ctx context.Context, email string) (*models.SignupRequest, error)
 	MarkVerified(ctx context.Context, id uuid.UUID) error
 	MarkCompleted(ctx context.Context, id uuid.UUID, tenantID, userID uuid.UUID) error
+	// SetProvisionedTenant records a tenant-management registration that
+	// has succeeded but not yet been followed by local provisioning
+	// (CompleteSignup is not yet done — see provisionTenant's resume
+	// checkpoint). slug is the ACTUAL slug tenant-management accepted,
+	// which may differ from the originally-requested one after
+	// collision retries.
+	SetProvisionedTenant(ctx context.Context, id uuid.UUID, tenantID uuid.UUID, slug string) error
+	// SetCompanyDetails stores the company name and slug collected at
+	// completion, only while no tenant is provisioned yet (an empty slug
+	// stores NULL).
+	SetCompanyDetails(ctx context.Context, id uuid.UUID, name, slug string) error
+	// SetContinuation replaces the stored OIDC continuation of a pending
+	// (not completed) request that a repeated signup reuses.
+	SetContinuation(ctx context.Context, id uuid.UUID, continuation string) error
+	// SetCompletionSecretHash stores the hash of the single-use completion
+	// secret VerifyEmail issues (see CompleteSignup).
+	SetCompletionSecretHash(ctx context.Context, id uuid.UUID, hash string) error
+	// CountCompletedBusinessSignupsByEmailDomain counts COMPLETED business
+	// signups whose email's domain (the part after "@", case-insensitive)
+	// equals domain — see InitiateSignup's one-trial-per-work-domain abuse
+	// control, below, for why this exists and what it does and does not stop.
+	CountCompletedBusinessSignupsByEmailDomain(ctx context.Context, domain string) (int, error)
+	// ReserveVerificationResend admits one more code send (cooldown + hourly
+	// cap + per-row failed-guess cap, atomically); false means throttled.
+	// requireUnverified scopes the send to the unverified branch so a
+	// concurrent successful verify wins; the verified-recovery branch passes
+	// false.
+	ReserveVerificationResend(ctx context.Context, id uuid.UUID, cooldown, window time.Duration, maxPerWindow, maxFailedTotal int, requireUnverified bool) (bool, error)
+	// SetVerificationCode installs a new code hash, invalidating the old code
+	// and resetting its attempts.
+	SetVerificationCode(ctx context.Context, id uuid.UUID, hash string, expiresAt time.Time) error
+	// ClaimVerificationAttempt spends one attempt before the comparison.
+	ClaimVerificationAttempt(ctx context.Context, id uuid.UUID, maxAttempts, maxFailedTotal int) (hash string, expiresAt time.Time, attempts int, ok bool, err error)
+	// ConsumeVerificationCode makes the code single-use, marks verified and
+	// refunds the claimed attempt from the per-row failure total.
+	ConsumeVerificationCode(ctx context.Context, id uuid.UUID, hash string) (bool, error)
+}
+
+// Signup email-code limits.
+const (
+	signupCodeLength      = 6
+	signupCodeTTL         = 15 * time.Minute
+	signupCodeMaxAttempts = 5
+	// signupCodeRowMaxFailures caps wrong guesses per signup row across all
+	// codes: resends reset the per-code counter, not this one.
+	signupCodeRowMaxFailures = 15
+	signupResendCooldown     = 60 * time.Second
+	signupResendWindow       = time.Hour
+	signupResendMaxPerHour   = 5
+)
+
+var signupCodeRE = regexp.MustCompile(`^[0-9]{6}$`)
+
+// generateSignupCode returns a uniformly random zero-padded 6-digit code.
+// rand.Int draws by rejection sampling, so there is no modulo bias.
+func generateSignupCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", fmt.Errorf("generate verification code: %w", err)
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
+}
+
+const signupOTPKeyInfo = "falcon-id/signup-otp/v1"
+
+// DeriveSignupOTPKey derives the HMAC key for signup codes from the
+// deployment's TOKEN_HASH_SALT via HKDF-SHA256, so a leaked database alone
+// cannot brute-force the 10^6 code space offline.
+func DeriveSignupOTPKey(tokenHashSalt string) ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, []byte(tokenHashSalt), nil, []byte(signupOTPKeyInfo)), key); err != nil {
+		return nil, fmt.Errorf("derive signup otp key: %w", err)
+	}
+	return key, nil
+}
+
+// hashVerificationCode is HMAC-SHA256 over the signup request id and the code,
+// so a hash is useless for any other row. Only this hash is stored; never the
+// plaintext.
+func (s *SignupService) hashVerificationCode(id uuid.UUID, code string) string {
+	mac := hmac.New(sha256.New, s.otpKey)
+	mac.Write([]byte(id.String() + ":" + code))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// normalizeSignupCode strips the spaces and dashes users paste with the code.
+func normalizeSignupCode(raw string) string {
+	return strings.Map(func(r rune) rune {
+		if r == ' ' || r == '-' || r == '\u00a0' || r == '\t' {
+			return -1
+		}
+		return r
+	}, raw)
+}
+
+// issueVerificationCode generates a code and returns it with its hash and expiry.
+func (s *SignupService) issueVerificationCode(id uuid.UUID) (code, hash string, expires time.Time, err error) {
+	code, err = generateSignupCode()
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	return code, s.hashVerificationCode(id, code), time.Now().Add(signupCodeTTL), nil
 }
 
 // SignupEmailSender sends transactional email during the signup flow.
 type SignupEmailSender interface {
-	SendSignupVerificationEmail(ctx context.Context, email, token, name string) error
+	// SendSignupVerificationEmail emails the plaintext 6-digit code.
+	SendSignupVerificationEmail(ctx context.Context, email, code, name string) error
 }
 
 // SignupTenantCreator provisions a new tenant during account completion
@@ -95,6 +209,12 @@ type SignupUserLookup interface {
 // why "cannot verify" must never be treated as "available".
 type TenantSlugAvailabilityChecker interface {
 	IsSlugAvailable(ctx context.Context, slug string) (bool, error)
+}
+
+// SignupPreferencesWriter writes per-product user preferences. It carries the
+// marketing consent given at signup (best-effort; see CompleteSignup).
+type SignupPreferencesWriter interface {
+	PatchProduct(ctx context.Context, userID uuid.UUID, slug string, patch json.RawMessage) (json.RawMessage, error)
 }
 
 // TenantManagementRegisterRequest carries the fields tenant-management's
@@ -171,6 +291,14 @@ type PostSignupSessionIssuer interface {
 	IssueSessionForNewUser(ctx context.Context, tenantID uuid.UUID, user *models.User, ipAddress, userAgent string) (*models.LoginResponse, error)
 }
 
+// SignupContinuationValidator decides whether a submitted OIDC continuation may
+// be stored and later echoed back as a redirect (OAuthProviderService satisfies
+// it). Optional: without it a submitted continuation is refused, because
+// "cannot verify" must never be treated as "valid".
+type SignupContinuationValidator interface {
+	ValidateAuthorizeContinuation(ctx context.Context, raw string) error
+}
+
 // SignupService orchestrates the three-step self-service signup flow:
 //  1. InitiateSignup  – create a pending request and send a verification email.
 //  2. VerifyEmail     – validate the token and stamp the request as verified.
@@ -185,8 +313,12 @@ type SignupService struct {
 	postSignupHook  PostSignupHook
 	sessionIssuer   PostSignupSessionIssuer
 	slugChecker     TenantSlugAvailabilityChecker
+	prefsWriter     SignupPreferencesWriter
+	continuations   SignupContinuationValidator
+	defaultAppURL   string
 	consumerDomain  string
 	defaultPlanCode string
+	otpKey          []byte
 }
 
 // consumerEmailDomain returns the configured personal-account email domain,
@@ -203,15 +335,60 @@ func (s *SignupService) consumerEmailDomain() string {
 // the single source of truth (SIGNUP_DEFAULT_PLAN_CODE, see pkg/config) — this
 // fallback only guards direct construction (e.g. tests) that skip it.
 func (s *SignupService) defaultPlan() string {
-	if s.defaultPlanCode != "" {
-		return s.defaultPlanCode
-	}
-	return "starter"
+	// Legacy SIGNUP_DEFAULT_PLAN_CODE controls consumer defaults only. It
+	// must not turn a new business signup into Starter/Free/Marketing Scale.
+	return SignupTrialPackageCode
 }
 
 // deriveConsumerEmail builds a personal account's email from its username.
 func (s *SignupService) deriveConsumerEmail(username string) string {
 	return username + "@" + s.consumerEmailDomain()
+}
+
+// freeEmailProviderDomains holds well-known consumer webmail domains that
+// are routinely typed into a "work email" field by real, unrelated small
+// businesses/solo founders. See emailDomainTrialAbuseCheck's doc comment
+// (InitiateSignup, below) for why these are exempted from the
+// one-trial-per-work-domain check rather than fed into it: enforcing
+// domain-uniqueness on gmail.com would let the FIRST person who ever
+// signs up with a gmail.com address lock every other unrelated gmail.com
+// user out of a trial forever, which is not the abuse this control
+// targets. Not exhaustive — a determined abuser can still find or stand
+// up their own free-mail-alike domain; see the control's own doc comment
+// for what this does and does not stop.
+var freeEmailProviderDomains = map[string]struct{}{
+	"gmail.com":      {},
+	"googlemail.com": {},
+	"yahoo.com":      {},
+	"outlook.com":    {},
+	"hotmail.com":    {},
+	"live.com":       {},
+	"msn.com":        {},
+	"icloud.com":     {},
+	"me.com":         {},
+	"aol.com":        {},
+	"protonmail.com": {},
+	"proton.me":      {},
+	"mail.com":       {},
+	"gmx.com":        {},
+	"yandex.com":     {},
+	"zoho.com":       {},
+	"fastmail.com":   {},
+	"hey.com":        {},
+	"pm.me":          {},
+}
+
+// emailDomain returns the lowercased portion after the last "@" in email,
+// or "" if email has no "@". Used only for the abuse control below — not
+// a general email-parsing helper (no local-part validation, no IDN/
+// punycode handling — the addresses reaching here already passed
+// InitiateSignup's own upstream format checks).
+func emailDomain(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at < 0 || at == len(email)-1 {
+		return ""
+	}
+	return strings.ToLower(email[at+1:])
 }
 
 // SetPostSignupHook wires an optional post-signup hook that runs after
@@ -227,6 +404,35 @@ func (s *SignupService) SetPostSignupHook(hook PostSignupHook) {
 // fallback below.
 func (s *SignupService) SetSlugChecker(checker TenantSlugAvailabilityChecker) {
 	s.slugChecker = checker
+}
+
+// SetPreferencesWriter wires the optional user-preferences writer used to
+// store the marketing consent given at signup. Unset, consent is dropped.
+func (s *SignupService) SetPreferencesWriter(w SignupPreferencesWriter) {
+	s.prefsWriter = w
+}
+
+// SetContinuationValidator wires the validator for the OIDC continuation a
+// signup may carry (see SignupContinuationValidator).
+func (s *SignupService) SetContinuationValidator(v SignupContinuationValidator) {
+	s.continuations = v
+}
+
+// SetDefaultAppURL sets where a signup with no (valid) continuation is sent after
+// completion (env SIGNUP_DEFAULT_APP_URL). Only an absolute http(s) URL is
+// accepted; anything else is ignored with a warning so a misconfiguration can
+// never turn into an open or broken redirect.
+func (s *SignupService) SetDefaultAppURL(raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
+		logger.Warn("SIGNUP_DEFAULT_APP_URL ignored: not an absolute http(s) URL")
+		return
+	}
+	s.defaultAppURL = raw
 }
 
 // SetSessionIssuer wires the session-minting dependency used by
@@ -247,6 +453,7 @@ func NewSignupService(
 	userLookup SignupUserLookup,
 	consumerDomain string,
 	defaultPlanCode string,
+	otpKey []byte,
 ) *SignupService {
 	return &SignupService{
 		repo:            repo,
@@ -257,6 +464,7 @@ func NewSignupService(
 		userLookup:      userLookup,
 		consumerDomain:  consumerDomain,
 		defaultPlanCode: defaultPlanCode,
+		otpKey:          otpKey,
 	}
 }
 
@@ -314,13 +522,22 @@ func (s *SignupService) CheckSlugAvailable(ctx context.Context, rawSlug string) 
 
 // InitiateSignup creates a pending signup request and dispatches a verification
 // email.  If a live (unexpired, uncompleted) request already exists for the
-// address and has not yet been verified, the verification email is re-sent and
-// the existing record is returned so the caller can surface the same signup_id.
+// address, a new throttled code is emailed and the existing record is returned
+// so the caller can surface the same signup_id. That holds for a verified but
+// not yet completed request too: it must re-verify the new code, which issues a
+// new completion secret and invalidates the old one.
 func (s *SignupService) InitiateSignup(
 	ctx context.Context,
 	input *models.CreateSignupRequestInput,
 	ipAddress, userAgent string,
 ) (*models.SignupRequest, error) {
+	// A submitted OIDC continuation is validated up front and refused (never
+	// dropped) when it fails: it will be echoed back as a redirect later.
+	continuation, err := s.validatedContinuation(ctx, input.Continuation)
+	if err != nil {
+		return nil, err
+	}
+
 	// Resolve the email. Personal accounts choose a username and the server
 	// derives <username>@<consumerDomain> (authoritative — the client never
 	// invents the address); business accounts bring their own work email.
@@ -344,24 +561,128 @@ func (s *SignupService) InitiateSignup(
 		return nil, fmt.Errorf("an account with this email already exists")
 	}
 
+	// Abuse control (t-signup-no-plan-step, 2026-09-18): one cardless
+	// reverse-trial per work-email DOMAIN, for business accounts only.
+	//
+	// WHY: signup now hands out a full top-tier trial with no card and no
+	// plan choice (see this method's opening comment and
+	// signup_request.go's PlanCode doc comment) — removing the friction
+	// that used to slow down repeat signups. Before this check, nothing
+	// stopped the same person/company from re-running signup with
+	// alice@acme.com, then bob@acme.com, then carol@acme.com, each one a
+	// brand-new 14-day top-tier trial for the same organization. Personal
+	// accounts are excluded: every personal signup shares ONE consumer
+	// email domain (consumerEmailDomain(), <username>@downstream.com) and
+	// never starts a billing trial at all — TrialStarter.StartTrial is
+	// only ever called for business accounts (see
+	// signup_post_provisioner.go's OnSignupComplete step 7 gate on
+	// accountType == business) — so a per-domain rule on the shared
+	// consumer domain would be both meaningless (nothing to protect) and
+	// wrong (it would lock out unrelated people after the first one).
+	//
+	// Free consumer webmail domains (gmail.com, outlook.com, ...) are
+	// exempt — see freeEmailProviderDomains's doc comment: enforcing
+	// domain-uniqueness there would block the SECOND unrelated gmail.com
+	// user forever, not the abuser.
+	//
+	// WHAT THIS DOES NOT STOP (say so, don't bury it):
+	//   - A single domain still gets exactly one trial no matter how many
+	//     employees sign up — legitimate multi-person signup at the same
+	//     company after the first one will also be refused here. That is
+	//     the accepted tradeoff for closing the free-trial-farming path;
+	//     the second employee can still be invited into the FIRST trial's
+	//     tenant instead of starting a new one.
+	//   - Someone willing to register their OWN throwaway domain
+	//     (acme-trial-2.com, acme-trial-3.com, ...) is not blocked — DNS
+	//     registration cost is the only friction, and this control does
+	//     not attempt domain-similarity/typosquat detection.
+	//   - Someone using a free-webmail domain not on the exemption list,
+	//     or a disposable-email service, is not blocked (no card, no
+	//     disposable-domain blocklist — out of this change's scope; see
+	//     the task's explicit "do not add a credit-card requirement").
+	//   - This only counts COMPLETED signups; an abandoned/never-completed
+	//     signup at the same domain does not consume the domain's slot.
+	if input.AccountType == discoverAccountTypeBusiness {
+		if domain := emailDomain(email); domain != "" {
+			if _, free := freeEmailProviderDomains[domain]; !free {
+				n, err := s.repo.CountCompletedBusinessSignupsByEmailDomain(ctx, domain)
+				if err != nil {
+					return nil, fmt.Errorf("check domain trial eligibility: %w", err)
+				}
+				if n > 0 {
+					return nil, &SignupStateError{Code: "domain_trial_exists"}
+				}
+			}
+		}
+	}
+
 	// Re-use an existing pending request if we have one.
 	pending, _ := s.repo.GetPendingByEmail(ctx, email)
-	if pending != nil && !pending.Verified {
-		// Best-effort re-send: a delivery failure must not fail the request,
-		// but it must not be silent either (2026-08-02 — a six-minute
-		// greylist stall on this path went unnoticed for two days).
-		if err := s.emailSender.SendSignupVerificationEmail(ctx, email, pending.VerificationToken, input.FirstName); err != nil {
+	if pending != nil && continuation != nil {
+		// A repeated signup for the same pending email reuses its row; it only
+		// gains a continuation if it has none (never overwritten).
+		if err := s.refreshContinuation(ctx, pending, *continuation); err != nil {
+			return nil, err
+		}
+	}
+	if pending != nil && !pending.Completed && !pending.IsExpired() {
+		// Resend (unverified) or recovery (verified but never completed): both
+		// run the same throttled path (cooldown + hourly cap + per-row guess
+		// cap), then a NEW code replaces the old one and resets its attempts.
+		// Delivery is best-effort: a failure must not fail the request, but it
+		// must not be silent either (2026-08-02 — a six-minute greylist stall
+		// on this path went unnoticed for two days).
+		//
+		// A verified row resumes into CompleteSignup against the SAME request
+		// id rather than forking a second row (which used to mint an orphaned
+		// tenant-management tenant: production "atlasbadi" 938ba35f, zero
+		// users, then "atlasbadi-a1ad" cf097694). Resuming now requires proving
+		// the mailbox again: verifying the new code issues a new completion
+		// secret and the old one stops working, so merely knowing the email no
+		// longer yields a resumable session.
+		//
+		// requireUnverified (unverified branch only) lets a concurrent
+		// successful verify win over a resend.
+		ok, err := s.repo.ReserveVerificationResend(ctx, pending.ID, signupResendCooldown, signupResendWindow, signupResendMaxPerHour, signupCodeRowMaxFailures, !pending.Verified)
+		if err != nil {
+			return nil, fmt.Errorf("reserve verification resend: %w", err)
+		}
+		if !ok {
+			return nil, &SignupStateError{Code: "resend_throttled"}
+		}
+		code, hash, expires, err := s.issueVerificationCode(pending.ID)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.repo.SetVerificationCode(ctx, pending.ID, hash, expires); err != nil {
+			return nil, fmt.Errorf("store verification code: %w", err)
+		}
+		pending.VerificationCodeHash = &hash
+		pending.VerificationCodeExpiresAt = &expires
+		pending.VerificationAttempts = 0
+		firstName := ""
+		if pending.FirstName != nil {
+			firstName = *pending.FirstName
+		}
+		if err := s.emailSender.SendSignupVerificationEmail(ctx, email, code, firstName); err != nil {
 			logger.Error("signup verification re-send failed", zap.String("email", email), zap.Error(err))
 		}
 		return pending, nil
 	}
 
-	// Generate a cryptographically random 64-character hex token.
+	// verification_token is kept populated (legacy column) with an unusable
+	// random placeholder that is never emailed; verification is by code.
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return nil, fmt.Errorf("generate verification token: %w", err)
 	}
 	token := hex.EncodeToString(tokenBytes)
+
+	reqID := uuid.New()
+	code, codeHash, codeExpires, err := s.issueVerificationCode(reqID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Resolve company slug for business accounts. An explicit input.Slug
 	// (the up-front "claim your subdomain" signup step) takes priority
@@ -379,8 +700,9 @@ func (s *SignupService) InitiateSignup(
 			}
 			companySlug = &normalized
 		} else if input.CompanyName != "" {
-			slug := generateSlug(input.CompanyName)
-			companySlug = &slug
+			if slug := generateSlug(input.CompanyName); slug != "" {
+				companySlug = &slug
+			}
 		}
 	}
 
@@ -397,64 +719,238 @@ func (s *SignupService) InitiateSignup(
 	}
 
 	req := &models.SignupRequest{
-		ID:                uuid.New(),
-		Email:             email,
-		FirstName:         firstName,
-		LastName:          lastName,
-		AccountType:       input.AccountType,
-		CompanyName:       companyName,
-		CompanySlug:       companySlug,
-		VerificationToken: token,
-		IPAddress:         &ipAddress,
-		UserAgent:         &userAgent,
-		ExpiresAt:         time.Now().Add(24 * time.Hour),
+		ID:                        reqID,
+		Email:                     email,
+		FirstName:                 firstName,
+		LastName:                  lastName,
+		AccountType:               input.AccountType,
+		CompanyName:               companyName,
+		CompanySlug:               companySlug,
+		Continuation:              continuation,
+		VerificationToken:         token,
+		VerificationCodeHash:      &codeHash,
+		VerificationCodeExpiresAt: &codeExpires,
+		IPAddress:                 &ipAddress,
+		UserAgent:                 &userAgent,
+		ExpiresAt:                 time.Now().Add(24 * time.Hour),
 	}
 
 	if err := s.repo.Create(ctx, req); err != nil {
 		return nil, fmt.Errorf("create signup request: %w", err)
 	}
+	metrics.SignupFunnelInc(metrics.SignupStageInitiated, companyName != nil)
 
 	// Email delivery is best-effort: a failure here must not roll back the
 	// signup request so the user can request a re-send later. It is logged
 	// rather than discarded — see iam_email_send_failures_total for the
 	// corresponding metric.
-	if err := s.emailSender.SendSignupVerificationEmail(ctx, email, token, input.FirstName); err != nil {
+	if err := s.emailSender.SendSignupVerificationEmail(ctx, email, code, input.FirstName); err != nil {
 		logger.Error("signup verification send failed", zap.String("email", email), zap.Error(err))
 	}
 
 	return req, nil
 }
 
+// validatedContinuation returns nil for an empty continuation, a pointer to the
+// validated one otherwise, or a SignupStateError("invalid_continuation").
+func (s *SignupService) validatedContinuation(ctx context.Context, raw string) (*string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	if s.continuations == nil {
+		return nil, &SignupStateError{Code: "invalid_continuation"}
+	}
+	if err := s.continuations.ValidateAuthorizeContinuation(ctx, raw); err != nil {
+		if errors.Is(err, ErrInvalidAuthorizeContinuation) {
+			return nil, &SignupStateError{Code: "invalid_continuation"}
+		}
+		return nil, fmt.Errorf("validate signup continuation: %w", err)
+	}
+	return &raw, nil
+}
+
+// refreshContinuation stores continuation on a reused pending request that has
+// none.
+func (s *SignupService) refreshContinuation(ctx context.Context, pending *models.SignupRequest, continuation string) error {
+	// An unauthenticated caller must not redirect an existing signup: only a
+	// request with no continuation yet accepts one.
+	if pending.Continuation != nil {
+		return nil
+	}
+	if err := s.repo.SetContinuation(ctx, pending.ID, continuation); err != nil {
+		return fmt.Errorf("update signup continuation: %w", err)
+	}
+	pending.Continuation = &continuation
+	return nil
+}
+
+// completionRedirect decides where the browser goes once signup completes: the
+// stored OIDC continuation when it still validates (the client may have been
+// deactivated since it was stored), otherwise the configured default app URL,
+// otherwise "" (the caller then falls back to its own default).
+func (s *SignupService) completionRedirect(ctx context.Context, req *models.SignupRequest) string {
+	if req.Continuation != nil && *req.Continuation != "" && s.continuations != nil {
+		if err := s.continuations.ValidateAuthorizeContinuation(ctx, *req.Continuation); err == nil {
+			return *req.Continuation
+		}
+		logger.Warn("signup: stored continuation no longer valid; using default app URL",
+			zap.String("signup_request_id", req.ID.String()))
+	}
+	return s.defaultAppURL
+}
+
 // ---------------------------------------------------------------------------
 // VerifyEmail
 // ---------------------------------------------------------------------------
 
-// VerifyEmail validates the one-time token supplied by the user.  The
-// operation is idempotent: calling it again on an already-verified request
-// simply returns the request without error.
-func (s *SignupService) VerifyEmail(ctx context.Context, token string) (*models.SignupRequest, error) {
+// VerifyEmail validates the emailed 6-digit code (input.Code) for the signup
+// identified by input.SignupID or input.Email. The code is never looked up on
+// its own. A request that carries only the legacy long token is accepted for
+// rows that have no code hash (pre-OTP signups).
+//
+// Idempotence: the code is single-use, but a fresh completion secret is issued
+// to whoever proves the mailbox. Errors are SignupStateError with codes
+// verification_code_invalid (also for an expired code, so expiry is not an
+// oracle) and verification_attempts_exceeded (per-code or per-row cap).
+func (s *SignupService) VerifyEmail(ctx context.Context, input *models.VerifySignupEmailInput) (*models.SignupRequest, error) {
+	var req *models.SignupRequest
+	var err error
+	if strings.TrimSpace(input.Code) == "" && strings.TrimSpace(input.Token) != "" {
+		// TODO(2026-12-01): remove the legacy hex-token path once all pre-OTP
+		// pending signups (24h lifetime) and old frontend builds are gone.
+		req, err = s.verifyLegacyToken(ctx, strings.TrimSpace(input.Token))
+	} else {
+		req, err = s.verifyCode(ctx, input)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.issueCompletionSecret(ctx, req)
+}
+
+func (s *SignupService) verifyLegacyToken(ctx context.Context, token string) (*models.SignupRequest, error) {
 	req, err := s.repo.GetByToken(ctx, token)
 	if err != nil {
 		return nil, fmt.Errorf("invalid or expired verification token")
 	}
-
 	if req.ExpiresAt.Before(time.Now()) {
 		return nil, fmt.Errorf("verification token has expired")
 	}
+	if !req.Verified {
+		if err := s.repo.MarkVerified(ctx, req.ID); err != nil {
+			return nil, fmt.Errorf("mark verified: %w", err)
+		}
+		req.Verified = true
+		now := time.Now()
+		req.VerifiedAt = &now
+	}
+	return req, nil
+}
 
-	// Idempotent: already verified is not an error.
-	if req.Verified {
-		return req, nil
+func (s *SignupService) verifyCode(ctx context.Context, input *models.VerifySignupEmailInput) (*models.SignupRequest, error) {
+	invalid := &SignupStateError{Code: "verification_code_invalid"}
+	code := normalizeSignupCode(input.Code)
+	if !signupCodeRE.MatchString(code) {
+		return nil, invalid
 	}
 
-	if err := s.repo.MarkVerified(ctx, req.ID); err != nil {
-		return nil, fmt.Errorf("mark verified: %w", err)
+	var req *models.SignupRequest
+	switch {
+	case strings.TrimSpace(input.SignupID) != "":
+		id, perr := uuid.Parse(strings.TrimSpace(input.SignupID))
+		if perr != nil {
+			return nil, invalid
+		}
+		r, gerr := s.repo.GetByID(ctx, id)
+		if gerr != nil {
+			return nil, invalid
+		}
+		req = r
+	case strings.TrimSpace(input.Email) != "":
+		r, gerr := s.repo.GetPendingByEmail(ctx, strings.ToLower(strings.TrimSpace(input.Email)))
+		if gerr != nil {
+			return nil, invalid
+		}
+		req = r
+	default:
+		return nil, invalid
+	}
+	if req.Completed || req.ExpiresAt.Before(time.Now()) {
+		return nil, invalid
 	}
 
+	// Spend the attempt first (atomic), then compare.
+	storedHash, _, attempts, ok, err := s.repo.ClaimVerificationAttempt(ctx, req.ID, signupCodeMaxAttempts, signupCodeRowMaxFailures)
+	if err != nil {
+		return nil, fmt.Errorf("claim verification attempt: %w", err)
+	}
+	if !ok {
+		// The claim also fails for an expired code, which answers invalid.
+		if req.VerificationCodeHash != nil && (req.VerificationAttempts >= signupCodeMaxAttempts || req.VerificationFailedTotal >= signupCodeRowMaxFailures) {
+			metrics.SignupVerifyFailures.WithLabelValues("attempts_exceeded").Inc()
+			return nil, &SignupStateError{Code: "verification_attempts_exceeded"}
+		}
+		return nil, invalid
+	}
+	given := s.hashVerificationCode(req.ID, code)
+	if subtle.ConstantTimeCompare([]byte(storedHash), []byte(given)) != 1 {
+		if attempts >= signupCodeMaxAttempts || req.VerificationFailedTotal+1 >= signupCodeRowMaxFailures {
+			metrics.SignupVerifyFailures.WithLabelValues("attempts_exceeded").Inc()
+			return nil, &SignupStateError{Code: "verification_attempts_exceeded"}
+		}
+		metrics.SignupVerifyFailures.WithLabelValues("invalid").Inc()
+		return nil, invalid
+	}
+	consumed, err := s.repo.ConsumeVerificationCode(ctx, req.ID, storedHash)
+	if err != nil {
+		return nil, fmt.Errorf("consume verification code: %w", err)
+	}
+	if !consumed {
+		return nil, invalid
+	}
 	req.Verified = true
 	now := time.Now()
 	req.VerifiedAt = &now
+	metrics.SignupFunnelInc(metrics.SignupStageVerified, req.CompanyName != nil)
 	return req, nil
+}
+
+// issueCompletionSecret hands the caller who proved the mailbox a fresh
+// single-use completion secret.
+func (s *SignupService) issueCompletionSecret(ctx context.Context, req *models.SignupRequest) (*models.SignupRequest, error) {
+	secret, err := newCompletionSecret()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.SetCompletionSecretHash(ctx, req.ID, hashCompletionSecret(secret)); err != nil {
+		return nil, fmt.Errorf("store completion secret: %w", err)
+	}
+	req.CompletionSecret = secret
+	return req, nil
+}
+
+// newCompletionSecret returns 256 random bits, hex encoded.
+func newCompletionSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate completion secret: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func hashCompletionSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+// completionSecretMatches compares in constant time. A request with no stored
+// hash (never verified through VerifyEmail) never matches.
+func completionSecretMatches(req *models.SignupRequest, secret string) bool {
+	if req.CompletionSecretHash == nil || *req.CompletionSecretHash == "" || secret == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(*req.CompletionSecretHash), []byte(hashCompletionSecret(secret))) == 1
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +972,10 @@ type CompleteSignupResult struct {
 	// signups share the well-known consumer tenant and have no
 	// self-service slug, so this is "" for account_type=personal.
 	TenantSlug string
+	// RedirectURL is where the client sends the browser next: the validated
+	// OIDC continuation stored at signup (relative /oauth/authorize URL), else
+	// the configured default app URL, else "".
+	RedirectURL string
 }
 
 func (s *SignupService) CompleteSignup(ctx context.Context, input *models.CompleteSignupInput, ipAddress, userAgent string) (*CompleteSignupResult, error) {
@@ -503,6 +1003,14 @@ func (s *SignupService) CompleteSignup(ctx context.Context, input *models.Comple
 		return nil, &SignupStateError{Code: "signup_request_unavailable"}
 	}
 
+	// Mailbox proof: the signup id is handed to anyone who starts a signup for
+	// an address, so completing also needs the secret only the verify-email
+	// caller receives. Same answer as an unknown id, checked before any state
+	// (verified/completed/expired) is revealed.
+	if !completionSecretMatches(req, input.CompletionSecret) {
+		return nil, &SignupStateError{Code: "signup_request_unavailable"}
+	}
+
 	if !req.Verified {
 		return nil, &SignupStateError{Code: "signup_email_unverified"}
 	}
@@ -526,31 +1034,55 @@ func (s *SignupService) CompleteSignup(ctx context.Context, input *models.Comple
 	if err != nil {
 		return nil, err
 	}
-
-	// SECURITY/COMMERCIAL: a plan selection is now mandatory to complete
-	// signup. Skipping plan choice used to mean no trial subscription row
-	// was ever created for the tenant — nothing to expire, convert, or
-	// dun — the exact commercial gap this check closes. Checked here
-	// (service layer) rather than via a gin `binding:"required"` tag on
-	// models.CompleteSignupInput.PlanCode, mirroring how the password
-	// check above is validated in code, not by a binding tag.
-	if strings.TrimSpace(input.PlanCode) == "" {
-		return nil, &SignupStateError{Code: "plan_required"}
+	input.PlanCode, err = signupPlanSelection(input.PlanCode)
+	if err != nil {
+		return nil, err
 	}
+
+	// PlanCode is intentionally OPTIONAL again (reverted 2026-09-18 —
+	// t-signup-no-plan-step). It was made mandatory by e75eeb7
+	// (2026-09-17) because an empty plan meant no trial subscription row
+	// was ever created — nothing to expire, convert, or dun. That gap is
+	// now closed a layer down instead of by refusing signup: every
+	// self-serve signup provisions the reverse trial on the top self-serve
+	// tier regardless of PlanCode (subscription-management's
+	// TrialService.StartTrial resolves the trial-entitlement package via
+	// packageRepo.FindDefault when PlanCode is empty — see that function's
+	// 2026-09-18 reverse-trial-redesign doc comment in
+	// platform-commerce/services/subscription-management/internal/services/
+	// trial.go). PlanCode, when present, only ever picks the DESTINATION
+	// package the trial converts to at day 14 (or is ignored by an
+	// upgrade-moment picker later) — it never gated whether a trial started
+	// in the first place; that was purely this now-removed check.
+	// Step 7 of onSignupComplete below (trial start) logs at Error with a
+	// dedicated metric on failure and is repaired by tenant-management's
+	// trial-gap reconciler — it is not silently swallowed, so removing
+	// this gate does not reopen the original "trial start failure is
+	// invisible" half of the incident, only the "plan choice was
+	// mandatory" half.
+	if err := s.applyCompanyDetails(ctx, req, input); err != nil {
+		return nil, err
+	}
+	withCompany := req.CompanyName != nil
 
 	tenantID, tenantSlug, err := s.provisionTenant(ctx, req)
 	if err != nil {
+		metrics.SignupFunnelInc(metrics.SignupStageFailed, withCompany)
 		return nil, err
 	}
 
 	user, err := s.provisionUser(ctx, req, tenantID, input.Password, credential)
 	if err != nil {
+		metrics.SignupFunnelInc(metrics.SignupStageFailed, withCompany)
 		return nil, err
 	}
+	s.storeMarketingConsent(ctx, user.ID, input.MarketingConsent)
 
 	// Non-fatal: tenant and user already exist, so the failure here would
 	// only leave the record in a non-completed state.
 	_ = s.repo.MarkCompleted(ctx, req.ID, tenantID, user.ID)
+	metrics.SignupFunnelInc(metrics.SignupStageCompleted, withCompany)
+	metrics.SignupDuration.Observe(time.Since(req.CreatedAt).Seconds())
 
 	// Best-effort: run post-signup hook for default app access, subdomain,
 	// cardless trial start, etc. When the wired hook also implements
@@ -562,14 +1094,18 @@ func (s *SignupService) CompleteSignup(ctx context.Context, input *models.Comple
 	// SyncProductEntitlementProvisioner (falcon-id!360) — additive, not
 	// a breaking change to the base PostSignupHook interface.
 	if s.postSignupHook != nil {
+		var hookErr error
 		if planAware, ok := s.postSignupHook.(PlanAwarePostSignupHook); ok {
-			_ = planAware.OnSignupCompleteWithPlan(ctx, tenantID, user.ID, req.AccountType, input.PlanCode)
+			hookErr = planAware.OnSignupCompleteWithPlan(ctx, tenantID, user.ID, req.AccountType, input.PlanCode)
 		} else {
-			_ = s.postSignupHook.OnSignupComplete(ctx, tenantID, user.ID, req.AccountType)
+			hookErr = s.postSignupHook.OnSignupComplete(ctx, tenantID, user.ID, req.AccountType)
+		}
+		if errors.Is(hookErr, ErrSignupTrialAlreadyConsumed) {
+			return nil, &SignupStateError{Code: "TRIAL_ALREADY_CONSUMED"}
 		}
 	}
 
-	result := &CompleteSignupResult{User: user, TenantSlug: tenantSlug}
+	result := &CompleteSignupResult{User: user, TenantSlug: tenantSlug, RedirectURL: s.completionRedirect(ctx, req)}
 
 	// Session minting is deliberately best-effort, same as the hook above:
 	// the account and tenant already exist and MarkCompleted has already
@@ -595,6 +1131,60 @@ func (s *SignupService) CompleteSignup(ctx context.Context, input *models.Comple
 	return result, nil
 }
 
+// applyCompanyDetails persists the company name and slug sent with
+// CompleteSignup, for business accounts that have not provisioned a tenant
+// yet. A resumed completion (req.TenantID set) ignores both: the slug that
+// registered wins. An explicit slug is validated like the initiate-time
+// claim and refused with the same generic "slug_unavailable"; without one
+// the slug is derived from the name (and may be empty, which falls back to
+// a word pair in provisionTenant).
+func (s *SignupService) applyCompanyDetails(ctx context.Context, req *models.SignupRequest, input *models.CompleteSignupInput) error {
+	if req.AccountType != discoverAccountTypeBusiness || req.TenantID != nil {
+		return nil
+	}
+	name := strings.TrimSpace(input.CompanyName)
+	if name == "" {
+		return nil
+	}
+	if n := utf8.RuneCountInString(name); n < 2 || n > 120 || strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return &SignupStateError{Code: "invalid_company_name"}
+	}
+	var slug string
+	if explicit := normalizeUsername(input.Slug); explicit != "" {
+		if _, err := s.CheckSlugAvailable(ctx, explicit); err != nil {
+			return &SignupStateError{Code: "slug_unavailable"}
+		}
+		slug = explicit
+	} else {
+		slug = generateSlug(name)
+	}
+	if err := s.repo.SetCompanyDetails(ctx, req.ID, name, slug); err != nil {
+		return err
+	}
+	req.CompanyName = &name
+	req.CompanySlug = nil
+	if slug != "" {
+		req.CompanySlug = &slug
+	}
+	return nil
+}
+
+// storeMarketingConsent records the consent given on the company step under
+// the key the old onboarding wizard used, so its readers do not change.
+// Best-effort: it never fails the signup.
+func (s *SignupService) storeMarketingConsent(ctx context.Context, userID uuid.UUID, consent *bool) {
+	if consent == nil || s.prefsWriter == nil {
+		return
+	}
+	patch, err := json.Marshal(map[string]any{"onboarding_profile": map[string]any{"marketingConsent": *consent}})
+	if err == nil {
+		_, err = s.prefsWriter.PatchProduct(ctx, userID, "acmeweb", patch)
+	}
+	if err != nil {
+		logger.Warn("signup: storing marketing consent failed", zap.String("user_id", userID.String()), zap.Error(err))
+	}
+}
+
 func (s *SignupService) SignupPasswordPolicy() SignupPasswordPolicy {
 	return s.userCreator.SignupPasswordPolicy()
 }
@@ -604,7 +1194,7 @@ func (s *SignupService) provisionTenant(ctx context.Context, req *models.SignupR
 	var tenantReq *models.CreateTenantRequest
 
 	if req.AccountType == discoverAccountTypeBusiness {
-		tenantName := "My Company"
+		tenantName := models.PlaceholderTenantName
 		if req.CompanyName != nil {
 			tenantName = *req.CompanyName
 		}
@@ -637,6 +1227,53 @@ func (s *SignupService) provisionTenant(ctx context.Context, req *models.SignupR
 			lastName = *req.LastName
 		}
 
+		// RESUME CHECKPOINT: a prior CompleteSignup attempt against this
+		// same request may have already registered a tenant-management
+		// tenant (req.TenantID set by SetProvisionedTenant, immediately
+		// after a successful Register call below) before failing on the
+		// second, local-provisioning phase, or CompleteSignup may simply
+		// be getting called twice (client retry after a slow/lost
+		// response). Either way, calling s.tenantRegistrar.Register again
+		// here would mint a SECOND tenant-management row for the same
+		// signup — this is exactly the "atlasbadi" / "atlasbadi-a1ad"
+		// production duplicate (938ba35f then cf097694, 24 seconds apart,
+		// same person, first row left as a permanent zero-user orphan).
+		// So: if a tenant was already registered, resume from there
+		// instead of re-registering.
+		if req.TenantID != nil {
+			if existingLocal, err := s.tenantCreator.GetByID(ctx, *req.TenantID); err != nil {
+				return uuid.Nil, "", fmt.Errorf("look up already-provisioned tenant %s: %w", *req.TenantID, err)
+			} else if existingLocal != nil {
+				// Both phases already completed on a prior attempt —
+				// fully idempotent resume, no further provisioning calls.
+				return existingLocal.ID, existingLocal.Slug, nil
+			}
+
+			// Phase 1 (tenant-management registration) succeeded before;
+			// phase 2 (local iam_tenants row) did not. Resume straight
+			// into phase 2 using the slug that was actually registered
+			// (persisted into req.CompanySlug by SetProvisionedTenant —
+			// NOT the original candidate, which may have collided and
+			// been replaced by a later attempt).
+			resumeSlug := ""
+			if req.CompanySlug != nil {
+				resumeSlug = *req.CompanySlug
+			}
+			tenantReq = &models.CreateTenantRequest{
+				ID:          req.TenantID,
+				Name:        tenantName,
+				Slug:        resumeSlug,
+				DisplayName: tenantName,
+				Type:        "customer",
+				Plan:        s.defaultPlan(),
+			}
+			tenant, err := s.tenantCreator.CreateTenant(ctx, tenantReq)
+			if err != nil {
+				return uuid.Nil, "", fmt.Errorf("create %s tenant (resumed): %w", req.AccountType, err)
+			}
+			return tenant.ID, tenant.Slug, nil
+		}
+
 		// Register with tenant-management FIRST — it is the sole
 		// system-of-record for subscription plan/quota (ADR-0029 Phase 3).
 		// A hard failure here aborts CompleteSignup entirely: see
@@ -665,8 +1302,14 @@ func (s *SignupService) provisionTenant(ctx context.Context, req *models.SignupR
 			tenantSlug string
 			regErr     error
 		)
+		// Pre-check base, base-2..base-5 so a name collision lands on a
+		// readable slug; the hex4 retries below stay the fallback for races.
+		firstSlug, _ := s.firstAvailableSlug(ctx, baseSlug)
 		for attempt := 0; attempt < maxTenantSlugAttempts; attempt++ {
 			candidate, genErr := candidateTenantSlug(baseSlug, attempt)
+			if attempt == 0 && firstSlug != "" {
+				candidate, genErr = firstSlug, nil
+			}
 			if genErr != nil {
 				return uuid.Nil, "", fmt.Errorf("generate tenant slug: %w", genErr)
 			}
@@ -691,6 +1334,25 @@ func (s *SignupService) provisionTenant(ctx context.Context, req *models.SignupR
 		}
 		if regErr != nil {
 			return uuid.Nil, "", fmt.Errorf("register tenant with tenant-management after %d attempts: %w", maxTenantSlugAttempts, regErr)
+		}
+
+		// Checkpoint immediately: from this point on, a tenant-management
+		// row exists for this signup request. Persist it BEFORE the
+		// (separate, unsagaed) local CreateTenant call below so that if
+		// CreateTenant fails, or the process dies, or the client retries
+		// CompleteSignup, the resume branch above finds it and reuses it
+		// instead of registering a second tenant. Best-effort: a failure
+		// to persist the checkpoint must not undo a successful
+		// registration (there is nothing to roll back to), so it is
+		// logged, not fatal — this narrows, but does not fully close, the
+		// duplicate-tenant window down to "checkpoint write itself fails",
+		// versus today's "every retry re-registers."
+		if err := s.repo.SetProvisionedTenant(ctx, req.ID, registered.ID, tenantSlug); err != nil {
+			logger.Error("signup: failed to checkpoint provisioned tenant; a retry may re-register",
+				zap.String("signup_request_id", req.ID.String()),
+				zap.String("tenant_id", registered.ID.String()),
+				zap.Error(err),
+			)
 		}
 
 		tenantReq = &models.CreateTenantRequest{
@@ -781,6 +1443,9 @@ func (s *SignupService) provisionUser(
 		FirstName: ptr(firstName),
 		LastName:  ptr(lastName),
 		Password:  password,
+		// Completion is reachable only after the verification link was
+		// followed, so the mailbox is proven.
+		EmailVerified: true,
 	}
 
 	user, err := s.userCreator.CreateForSignup(ctx, userReq, credential)
@@ -794,34 +1459,141 @@ func (s *SignupService) provisionUser(
 // Helpers
 // ---------------------------------------------------------------------------
 
-// generateSlug converts a human-readable name into a URL-safe slug.
-// "Acme Corp!" → "acme-corp"
-func generateSlug(name string) string {
-	slug := strings.ToLower(name)
-	slug = strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r
-		case r >= '0' && r <= '9':
-			return r
-		case r == '-':
-			return r
-		case r == ' ':
-			return '-'
-		default:
-			return -1 // drop
-		}
-	}, slug)
+// slugTurkishReplacer maps Turkish letters before lowercasing: ToLower('İ')
+// yields "i" plus a combining dot, and 'I' is the dotless capital that must become "i".
+var slugTurkishReplacer = strings.NewReplacer(
+	"ç", "c", "Ç", "c", "ğ", "g", "Ğ", "g", "ı", "i", "I", "i", "İ", "i",
+	"ö", "o", "Ö", "o", "ş", "s", "Ş", "s", "ü", "u", "Ü", "u",
+)
 
-	// Collapse consecutive dashes.
-	for strings.Contains(slug, "--") {
-		slug = strings.ReplaceAll(slug, "--", "-")
+// slugLegalTails are trailing words (after transliteration) that name a
+// legal form or trade description, not the brand: "A.Ş.", "Ltd. Şti.",
+// "San. ve Tic.". Stripped from the end one phrase at a time.
+var slugLegalTails = [][]string{
+	{"a", "s"}, {"as"}, {"anonim"}, {"sirketi"}, {"limited"}, {"ltd"}, {"sti"},
+	{"san"}, {"sanayi"}, {"tic"}, {"ticaret"}, {"ve"},
+	{"inc"}, {"llc"}, {"gmbh"},
+}
+
+const maxGeneratedSlugLen = 40
+
+// generateSlug derives a tenant subdomain slug from a company name:
+// "Çağrı Yazılım A.Ş." becomes "cagri-yazilim". Turkish letters are mapped
+// before lowercasing, other accents are stripped (NFD), legal-form suffixes
+// are dropped, and the result is cut to 40 characters at a hyphen. It
+// returns "" when nothing usable is left (too short, not a valid slug); the
+// caller then falls back to a word pair, never a fixed literal. A reserved
+// word gets a "-2" suffix.
+func generateSlug(name string) string {
+	decomposed := norm.NFD.String(strings.ToLower(slugTurkishReplacer.Replace(name)))
+	// Drop combining marks first so "e" + U+0301 stays one word.
+	decomposed = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Mn, r) {
+			return -1
+		}
+		return r
+	}, decomposed)
+	words := strings.FieldsFunc(decomposed, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	})
+	for stripped := true; stripped; {
+		stripped = false
+		for _, tail := range slugLegalTails {
+			if len(words) > len(tail) && slicesEqual(words[len(words)-len(tail):], tail) {
+				words = words[:len(words)-len(tail)]
+				stripped = true
+				break
+			}
+		}
+	}
+	slug := strings.Join(words, "-")
+	if len(slug) > maxGeneratedSlugLen {
+		slug = slug[:maxGeneratedSlugLen+1]
+		if i := strings.LastIndexByte(slug, '-'); i > 0 {
+			slug = slug[:i]
+		} else {
+			slug = slug[:maxGeneratedSlugLen]
+		}
 	}
 	slug = strings.Trim(slug, "-")
-	if slug == "" {
-		slug = "company"
+	if !models.IsValidSlug(slug) {
+		return ""
+	}
+	if models.IsReservedSlug(slug) {
+		return slug + "-2"
 	}
 	return slug
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// slugCandidates lists the readable names to try for base: base, base-2 ..
+// base-5, without the reserved or invalid ones. Empty for an empty base.
+func slugCandidates(base string) []string {
+	if base == "" {
+		return nil
+	}
+	out := make([]string, 0, 5)
+	for i := 1; i <= 5; i++ {
+		c := base
+		if i > 1 {
+			c = fmt.Sprintf("%s-%d", base, i)
+		}
+		if models.IsValidSlug(c) && !models.IsReservedSlug(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// firstAvailableSlug returns the first slugCandidates(base) entry that
+// tenant-management reports free. With no checker, or when every check
+// errors or reports taken, it returns "" and false so the caller keeps its
+// existing retry behaviour.
+func (s *SignupService) firstAvailableSlug(ctx context.Context, base string) (string, bool) {
+	if s.slugChecker == nil {
+		return "", false
+	}
+	for _, c := range slugCandidates(base) {
+		if ok, err := s.slugChecker.IsSlugAvailable(ctx, c); err == nil && ok {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// SuggestSlug backs GET /signup/suggest-slug: the first available slug for a
+// company name. When the name yields nothing usable it suggests a word pair.
+// available=false means no free candidate could be confirmed (all taken, or
+// availability cannot be verified); the slug is then only a hint. Taken,
+// reserved and unverifiable are not told apart.
+func (s *SignupService) SuggestSlug(ctx context.Context, name string) (string, bool) {
+	base := generateSlug(name)
+	if base == "" {
+		pair, err := randomTenantSlug(false)
+		if err != nil {
+			return "", false
+		}
+		base = pair
+	}
+	if slug, ok := s.firstAvailableSlug(ctx, base); ok {
+		return slug, true
+	}
+	suffix, err := randomSlugDisambiguator()
+	if err != nil {
+		return base, false
+	}
+	return base + "-" + suffix, false
 }
 
 // slugAdjectives and slugNouns generate a memorable, human-presentable
@@ -941,7 +1713,7 @@ func randomTenantSlug(withDisambiguator bool) (string, error) {
 //     collided, so disambiguate it ("<base>-<hex4>") rather than
 //     discarding it — the tenant still gets a name related to what they
 //     supplied.
-//   - no base at all (the common case: Mearax's signup collects only
+//   - no base at all (the common case: AcmeWeb's signup collects only
 //     email+password): mint a word-pair fallback slug. attempt 0 tries a
 //     bare pair; any retry means the previous pair collided, so a short
 //     disambiguator is appended to guarantee a different candidate.

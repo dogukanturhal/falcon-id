@@ -31,10 +31,14 @@ var (
 	spicedbToken    = flag.String("spicedb-token", getEnv("SPICEDB_TOKEN", ""), "SpiceDB preshared key")
 	spicedbInsecure = flag.Bool("spicedb-insecure", getEnvBool("SPICEDB_INSECURE", true), "Use insecure connection")
 	databaseURL     = flag.String("database-url", getEnv("DATABASE_URL", ""), "PostgreSQL connection string")
-	schemaFile      = flag.String("schema-file", "schema/spicedb.zed", "Path to SpiceDB schema file")
-	schemaOnly      = flag.Bool("schema-only", false, "Only write schema, skip bootstrap")
-	bootstrapOnly   = flag.Bool("bootstrap-only", false, "Only bootstrap relationships, skip schema")
-	dryRun          = flag.Bool("dry-run", false, "Print what would be done without executing")
+	// D-68 (docs/adr/D-68-spicedb-schema-canonical.md): the Helm file is the
+	// single source of truth. The old default, "schema/spicedb.zed", was a
+	// stale copy that lacked `talon_route` and, if written to a fresh
+	// environment, reproduced the 2026-04-28 outage.
+	schemaFile    = flag.String("schema-file", "deploy/helm/spicedb-schema/files/spicedb.zed", "Path to SpiceDB schema file")
+	schemaOnly    = flag.Bool("schema-only", false, "Only write schema, skip bootstrap")
+	bootstrapOnly = flag.Bool("bootstrap-only", false, "Only bootstrap relationships, skip schema")
+	dryRun        = flag.Bool("dry-run", false, "Print what would be done without executing")
 )
 
 func main() {

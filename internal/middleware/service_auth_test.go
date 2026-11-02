@@ -20,6 +20,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/dogukanturhal/falcon-id/internal/models"
 )
 
 // ensure mockUsageRecorder satisfies the ServicePrincipalUsageRecorder interface at compile time.
@@ -332,7 +334,7 @@ func TestValidateServiceJWTAudience_MultiAud(t *testing.T) {
 			name: "self-issued array aud (post-multi-aud)",
 			aud: []interface{}{
 				"svc-talon",
-				"https://api.hexxlock.com",
+				"https://api.example.com",
 				"hexxlock-services",
 			},
 			isSelfIssued: true,
@@ -359,7 +361,7 @@ func TestValidateServiceJWTAudience_MultiAud(t *testing.T) {
 		},
 		{
 			name:         "external array aud containing falcon-id",
-			aud:          []interface{}{"falcon-id", "https://api.hexxlock.com"},
+			aud:          []interface{}{"falcon-id", "https://api.example.com"},
 			isSelfIssued: false,
 			wantErr:      false,
 		},
@@ -416,4 +418,92 @@ func TestExtractAudiences_AllShapes(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestServiceAuth_SelfIssuedTokenKinds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	key, kid := generateTestServiceKey(t)
+	lookup := &mockServiceLookup{
+		keys:  map[string]*rsa.PublicKey{kid: &key.PublicKey},
+		slugs: map[string]string{kid: "oauth-client"},
+	}
+	mw := NewServiceAuthMiddleware(lookup, "")
+	userID := uuid.New().String()
+	base := func(extra jwt.MapClaims) jwt.MapClaims {
+		c := jwt.MapClaims{
+			"iss":       "https://id.example",
+			"aud":       []string{"api"},
+			"exp":       time.Now().Add(5 * time.Minute).Unix(),
+			"iat":       time.Now().Unix(),
+			"jti":       uuid.New().String(),
+			"client_id": "svc-client",
+			"tenant_id": models.HexxlockInternalTenantID,
+			"scope":     "iam:roles:write",
+		}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return c
+	}
+
+	cases := []struct {
+		name   string
+		claims jwt.MapClaims
+		want   int
+	}{
+		{"auth code user token", base(jwt.MapClaims{"sub": userID, "tenant_id": uuid.New().String(), "email": "u@example.com", "auth_time": time.Now().Unix(), "sid": uuid.New().String()}), http.StatusUnauthorized},
+		{"user token without session claims", base(jwt.MapClaims{"sub": userID}), http.StatusUnauthorized},
+		{"refresh-minted token", base(jwt.MapClaims{"sub": userID, "auth_time": time.Now().Unix()}), http.StatusUnauthorized},
+		{"tenant exchange token", base(jwt.MapClaims{"sub": userID, "act": map[string]any{"sub": "bff"}}), http.StatusUnauthorized},
+		{"api_key type token", base(jwt.MapClaims{"sub": "svc-client", "type": "api_key"}), http.StatusUnauthorized},
+		{"client_credentials with foreign gty", base(jwt.MapClaims{"sub": "svc-client", "gty": "authorization_code"}), http.StatusUnauthorized},
+		{"genuine client_credentials", base(jwt.MapClaims{"sub": "svc-client", "gty": "client_credentials"}), http.StatusOK},
+		{"client_credentials from tenant-owned client", base(jwt.MapClaims{"sub": "svc-client", "gty": "client_credentials", "tenant_id": uuid.New().String()}), http.StatusUnauthorized},
+		{"pre-gty client_credentials fallback", base(jwt.MapClaims{"sub": "svc-client"}), http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := jwt.NewWithClaims(jwt.SigningMethodRS256, tc.claims)
+			tok.Header["kid"] = kid
+			s, err := tok.SignedString(key)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			_, r := gin.CreateTestContext(w)
+			r.GET("/t", mw.ServiceAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
+			req := httptest.NewRequestWithContext(context.Background(), "GET", "/t", nil)
+			req.Header.Set("Authorization", "Bearer "+s)
+			r.ServeHTTP(w, req)
+			assert.Equal(t, tc.want, w.Code)
+		})
+	}
+}
+
+func TestServiceAuth_RejectsAPIKeyTypeToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	key, kid := generateTestServiceKey(t)
+	lookup := &mockServiceLookup{
+		keys:  map[string]*rsa.PublicKey{kid: &key.PublicKey},
+		slugs: map[string]string{kid: "crm-service"},
+	}
+	mw := NewServiceAuthMiddleware(lookup, "")
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"iss": "crm-service", "aud": "falcon-id", "type": "api_key",
+		"exp": time.Now().Add(5 * time.Minute).Unix(), "iat": time.Now().Unix(),
+		"jti": uuid.New().String(),
+	})
+	token.Header["kid"] = kid
+	tokenString, err := token.SignedString(key)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	_, r := gin.CreateTestContext(w)
+	r.GET("/test", mw.ServiceAuth(), func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	req := httptest.NewRequestWithContext(context.Background(), "GET", "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenString)
+	r.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusOK, w.Code)
 }

@@ -97,24 +97,33 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	applied, rec, err := runner.IsApplied(ctx, head.Vehicle)
-	if err != nil {
-		fatal("query %s.%s for %s: %v", schema, trackingTable, head.Vehicle, err)
-	}
-	if !applied {
-		fmt.Fprintf(os.Stderr,
-			"keystone-migration-gate: FAIL CLOSED — HEAD bundle %s (from %s) is NOT applied in %s.%s.\n"+
-				"The falcon-id image at this migration HEAD MUST NOT roll until Keystone has applied its\n"+
-				"bundle. Apply the bundle in the GitOps repository first, verify, THEN retry the rollout.\n",
-			head.Vehicle, head.File, schema, trackingTable)
-		os.Exit(1)
-	}
-	if rec != nil && rec.Dirty {
-		fmt.Fprintf(os.Stderr,
-			"keystone-migration-gate: FAIL CLOSED — HEAD bundle %s is recorded DIRTY in %s.%s "+
-				"(a prior apply did not complete cleanly). Resolve the failed migration before rolling.\n",
-			head.Vehicle, schema, trackingTable)
-		os.Exit(1)
+	// Every versioned bundle in the lock must be applied, not just HEAD: a missing
+	// or dirty intermediate bundle means the schema is not what this image expects.
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if e.IsBaseline() || seen[e.Vehicle] {
+			continue
+		}
+		seen[e.Vehicle] = true
+		applied, rec, err := runner.IsApplied(ctx, e.Vehicle)
+		if err != nil {
+			fatal("query %s.%s for %s: %v", schema, trackingTable, e.Vehicle, err)
+		}
+		if !applied {
+			fmt.Fprintf(os.Stderr,
+				"keystone-migration-gate: FAIL CLOSED — bundle %s (from %s; HEAD is %s) is NOT applied in %s.%s.\n"+
+					"The falcon-id image at this migration HEAD MUST NOT roll until Keystone has applied its\n"+
+					"bundle. Apply the bundle in the GitOps repository first, verify, THEN retry the rollout.\n",
+				e.Vehicle, e.File, head.Vehicle, schema, trackingTable)
+			os.Exit(1)
+		}
+		if rec != nil && rec.Dirty {
+			fmt.Fprintf(os.Stderr,
+				"keystone-migration-gate: FAIL CLOSED — bundle %s is recorded DIRTY in %s.%s "+
+					"(a prior apply did not complete cleanly). Resolve the failed migration before rolling.\n",
+				e.Vehicle, schema, trackingTable)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Printf("keystone-migration-gate: OK — HEAD bundle %s (%s) is applied in %s.%s; safe to roll.\n",

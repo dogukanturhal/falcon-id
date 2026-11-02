@@ -6,24 +6,30 @@ package handlers
 //
 // Flow:
 //  1. POST /api/v1/auth/webauthn/witness/begin
-//     Authenticated operator POSTs { device_uuid, ek_pubkey_hash }.
+//     Platform-admin operator POSTs { device_uuid, ek_pubkey_hash, state }.
 //     Delegates to the existing BeginAuthentication ceremony (same challenge
-//     shape as /step-up/begin so the frontend reuses the same passkey UI).
+//     shape as /step-up/begin so the frontend reuses the same passkey UI) and
+//     persists {device_uuid, ek_pubkey_hash, state} server-side, keyed by the
+//     ceremony's wa_session_id.
 //
 //  2. POST /api/v1/auth/webauthn/witness/finish?wa_session_id=<id>
 //     Operator POSTs the W3C assertion response.
 //     Assertion is verified via FinishAuthentication (reuses service method —
 //     no duplicated WebAuthn logic).  On success, TokenService.MintWitnessJWS
-//     signs a compact JWS with the existing RS256 issuer key.
-//     Response: { signed_jws, admin_sub, issued_at, expires_at }.
+//     signs a compact JWS with the existing RS256 issuer key, using the
+//     device_uuid / ek_pubkey_hash stored at begin (the request body is NOT
+//     trusted for them).
+//     Response: { signed_jws, admin_sub, issued_at, expires_at, state }.
 //
 // Security posture:
 //   - Both endpoints require an authenticated session (RequireAuth inherited
-//     from the authProtected router group in cmd/routes.go).
-//   - The JWS aud is "https://internal.example.com/device-attest" — not
+//     from the authProtected router group in cmd/routes.go) AND the
+//     platform-admin gate (RequirePlatformAdmin, cmd/routes.go).
+//   - The JWS aud is "https://jess.internal.example.com/device-attest" — not
 //     accepted by any Falcon-ID resource-server gate.
 //   - exp = 10 minutes — matches jess's witnessFreshnessWindow.
-//   - device_uuid is embedded in the JWS, defeating cross-device replay.
+//   - device_uuid and ek_pubkey_hash are embedded in the JWS, defeating
+//     cross-device replay; amr=["hwk"], witness_method="passkey", jti.
 //   - wa_session_id reuse is defeated by WebAuthnService.FinishAuthentication
 //     which deletes the challenge from the ceremony store on first use.
 //   - AMR is elevated (mfa + hwk) on the current session for parity with
@@ -32,11 +38,8 @@ package handlers
 // ADR 0043 §3.c.0 / ZTNA Sprint 1.1 enforce-flip prerequisite.
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"time"
 
@@ -60,18 +63,18 @@ type witnessWebAuthnService interface {
 	FinishAuthentication(ctx context.Context, userID, tenantID uuid.UUID, sessionID string, r *http.Request) (*models.WebAuthnCredential, *models.User, error)
 }
 
+// witnessStateService persists the begin-time binding between the two passkey
+// witness calls. *services.WitnessService satisfies it.
+type witnessStateService interface {
+	SavePasskeyBinding(ctx context.Context, waSessionID string, b services.WitnessBinding) error
+	TakePasskeyBinding(ctx context.Context, waSessionID string, userID uuid.UUID) (*services.WitnessBinding, error)
+}
+
 // witnessBeginRequest is the JSON body for POST /witness/begin.
 type witnessBeginRequest struct {
 	DeviceUUID   string `json:"device_uuid" binding:"required"`
 	EKPubkeyHash string `json:"ek_pubkey_hash" binding:"required"`
-}
-
-// witnessFinishRequest is the supplemental JSON body for POST /witness/finish.
-// The W3C assertion bytes are in the raw HTTP body; device_uuid must be re-
-// supplied here because the WebAuthn ceremony store only holds the challenge
-// bytes, not the application-level device_uuid from the begin request.
-type witnessFinishRequest struct {
-	DeviceUUID string `json:"device_uuid" binding:"required"`
+	State        string `json:"state"`
 }
 
 // witnessFinishResponse is the JSON body returned on a successful /witness/finish.
@@ -80,6 +83,7 @@ type witnessFinishResponse struct {
 	AdminSub  string `json:"admin_sub"`
 	IssuedAt  string `json:"issued_at"`  // RFC3339
 	ExpiresAt string `json:"expires_at"` // RFC3339
+	State     string `json:"state,omitempty"`
 }
 
 // SetTokenService injects the TokenService so /witness/finish can mint the
@@ -90,16 +94,47 @@ func (h *WebAuthnHandler) SetTokenService(svc *services.TokenService) {
 	h.tokenService = svc
 }
 
-// BeginWitnessEnroll handles POST /api/v1/auth/webauthn/witness/begin.
-//
-// Returns a WebAuthn assertion challenge identical to /step-up/begin.
-// The body carries device_uuid + ek_pubkey_hash so the server can audit
-// which device the operator is claiming to witness.  Both fields are
-// required — absence implies a misconfigured enrollment client.
-func (h *WebAuthnHandler) BeginWitnessEnroll(c *gin.Context) {
+// SetWitnessState injects the store holding the begin-time device binding.
+// When unset both witness endpoints return 503 (fail closed).
+func (h *WebAuthnHandler) SetWitnessState(svc witnessStateService) {
+	h.witnessState = svc
+	if info, ok := svc.(witnessStatusProvider); ok {
+		h.witnessInfo = info
+	}
+}
+
+// witnessStatusProvider tells the witness page which methods to offer.
+type witnessStatusProvider interface {
+	Status(ctx context.Context, u *models.CurrentUser) services.WitnessTOTPStatus
+}
+
+// witnessUser returns the platform-admin caller or writes the refusal.
+// Defense in depth on top of the RequirePlatformAdmin route middleware.
+func (h *WebAuthnHandler) witnessUser(c *gin.Context) *models.CurrentUser {
 	user := middleware.GetCurrentUser(c)
 	if user == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return nil
+	}
+	if !user.IsPlatformAdmin || user.TenantID.String() != models.HexxlockInternalTenantID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Platform admin access required"})
+		return nil
+	}
+	return user
+}
+
+// BeginWitnessEnroll handles POST /api/v1/auth/webauthn/witness/begin.
+//
+// Returns a WebAuthn assertion challenge identical to /step-up/begin and
+// persists {device_uuid, ek_pubkey_hash, state} for /witness/finish.
+func (h *WebAuthnHandler) BeginWitnessEnroll(c *gin.Context) {
+	user := h.witnessUser(c)
+	if user == nil {
+		return
+	}
+	if h.witnessState == nil {
+		h.logger.Error("WebAuthn BeginWitnessEnroll: witness state store not wired")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "witness enrollment not configured"})
 		return
 	}
 
@@ -109,11 +144,15 @@ func (h *WebAuthnHandler) BeginWitnessEnroll(c *gin.Context) {
 		return
 	}
 
-	// Validate device_uuid is parseable as a UUID.  The jess verifier
-	// also validates this; rejecting early produces a clear error message
-	// rather than a downstream JWS with a malformed claim.
-	if _, parseErr := uuid.Parse(req.DeviceUUID); parseErr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "device_uuid must be a valid UUID"})
+	// Reject malformed bindings early: they would otherwise end up inside a
+	// signed JWS.
+	if err := services.ValidateWitnessBinding(req.DeviceUUID, req.EKPubkeyHash, req.State); err != nil {
+		var werr *services.WitnessError
+		if errors.As(err, &werr) {
+			c.JSON(werr.Status, gin.H{"error": werr.Message, "code": werr.Code})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -137,6 +176,14 @@ func (h *WebAuthnHandler) BeginWitnessEnroll(c *gin.Context) {
 		return
 	}
 
+	if err := h.witnessState.SavePasskeyBinding(c.Request.Context(), challenge.SessionID, services.WitnessBinding{
+		UserID: user.ID, DeviceUUID: req.DeviceUUID, EKPubkeyHash: req.EKPubkeyHash, State: req.State,
+	}); err != nil {
+		h.logger.Error("WebAuthn BeginWitnessEnroll: persist binding failed", zap.Error(err))
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "witness enrollment unavailable"})
+		return
+	}
+
 	h.logger.Info("WebAuthn witness enroll begin",
 		zap.String("user_id", user.ID.String()),
 		zap.String("device_uuid", req.DeviceUUID),
@@ -146,22 +193,21 @@ func (h *WebAuthnHandler) BeginWitnessEnroll(c *gin.Context) {
 
 // FinishWitnessEnroll handles POST /api/v1/auth/webauthn/witness/finish?wa_session_id=<id>.
 //
-// Verifies the WebAuthn assertion, then mints the enrollment witness JWS.
-// The assertion ceremony is identical to /step-up/finish; the difference is
-// the artefact produced: a compact JWS bound to this operator's sub and the
-// device_uuid from the begin request, rather than an elevated session AMR.
+// Verifies the WebAuthn assertion, then mints the enrollment witness JWS from
+// the binding stored at begin. The assertion ceremony is identical to
+// /step-up/finish; the difference is the artefact produced: a compact JWS
+// bound to this operator's sub, device and EK hash.
 //
 // AMR elevation (mfa + hwk) is performed for parity with FinishStepUp — cheap
 // to do and ensures session state is consistent with the completed passkey proof.
 func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
-	user := middleware.GetCurrentUser(c)
+	user := h.witnessUser(c)
 	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	if h.tokenService == nil {
-		h.logger.Error("WebAuthn FinishWitnessEnroll: TokenService not wired")
+	if h.tokenService == nil || h.witnessState == nil {
+		h.logger.Error("WebAuthn FinishWitnessEnroll: TokenService or witness state not wired")
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "witness enrollment not configured"})
 		return
 	}
@@ -172,27 +218,17 @@ func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
 		return
 	}
 
-	// device_uuid must be re-supplied so we can embed it in the JWS. CRITICAL:
-	// the SAME request body also carries the W3C assertion bytes that
-	// FinishAuthentication (protocol.ParseCredentialRequestResponse) re-reads
-	// below. c.ShouldBindJSON would consume c.Request.Body, leaving the ceremony
-	// parser with an empty stream → "assertion verification failed" 401. So read
-	// the body ONCE, restore it for the ceremony, and unmarshal device_uuid from
-	// the captured bytes (mirrors the audit middleware's read-and-restore).
-	bodyBytes, readErr := io.ReadAll(c.Request.Body)
-	if readErr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
-		return
-	}
-	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	var req witnessFinishRequest
-	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	// device_uuid is required; an empty/missing value fails uuid.Parse below.
-	if _, parseErr := uuid.Parse(req.DeviceUUID); parseErr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "device_uuid must be a valid UUID"})
+	// The binding is consumed (single use) BEFORE the assertion is checked, so
+	// a failed assertion forces a fresh begin. Whatever device_uuid the request
+	// body carries is ignored: the request body is the W3C assertion only.
+	binding, err := h.witnessState.TakePasskeyBinding(c.Request.Context(), waSessionID, user.ID)
+	if err != nil {
+		var werr *services.WitnessError
+		if errors.As(err, &werr) {
+			c.JSON(werr.Status, gin.H{"error": werr.Message, "code": werr.Code})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "witness enrollment failed"})
 		return
 	}
 
@@ -208,7 +244,7 @@ func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
 	// Verify the assertion. FinishAuthentication deletes the challenge from the
 	// ceremony store on first use — wa_session_id replay is impossible at the
 	// WebAuthn layer (same property FinishStepUp relies on).
-	_, _, err := svc.FinishAuthentication(c.Request.Context(), user.ID, user.TenantID, waSessionID, c.Request)
+	_, _, err = svc.FinishAuthentication(c.Request.Context(), user.ID, user.TenantID, waSessionID, c.Request)
 	if err != nil {
 		h.logger.Warn("WebAuthn FinishWitnessEnroll: assertion verification failed",
 			zap.String("user_id", user.ID.String()),
@@ -220,7 +256,12 @@ func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
 
 	// Mint the witness JWS using the existing RS256 issuer key.
 	adminSub := user.ID.String()
-	jws, err := h.tokenService.MintWitnessJWS(adminSub, req.DeviceUUID)
+	jws, err := h.tokenService.MintWitnessJWS(services.WitnessMintParams{
+		AdminSub:     adminSub,
+		DeviceUUID:   binding.DeviceUUID,
+		EKPubkeyHash: binding.EKPubkeyHash,
+		Method:       services.WitnessMethodPasskey,
+	})
 	if err != nil {
 		if errors.Is(err, services.ErrNoSigningKey) {
 			h.logger.Error("WebAuthn FinishWitnessEnroll: RS256 signing key unavailable",
@@ -259,7 +300,7 @@ func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
 
 	h.logger.Info("WebAuthn witness JWS minted",
 		zap.String("user_id", adminSub),
-		zap.String("device_uuid", req.DeviceUUID),
+		zap.String("device_uuid", binding.DeviceUUID),
 		zap.Time("expires_at", jws.ExpiresAt),
 	)
 	c.JSON(http.StatusOK, witnessFinishResponse{
@@ -267,5 +308,6 @@ func (h *WebAuthnHandler) FinishWitnessEnroll(c *gin.Context) {
 		AdminSub:  jws.AdminSub,
 		IssuedAt:  jws.IssuedAt.Format(time.RFC3339),
 		ExpiresAt: jws.ExpiresAt.Format(time.RFC3339),
+		State:     binding.State,
 	})
 }

@@ -1,13 +1,13 @@
 {{- if .Values.apisix.routes.enabled }}
-# ApisixRoute for id.hexxlock.com — single consolidated OIDC endpoint.
+# ApisixRoute for id.example.com — single consolidated OIDC endpoint.
 #
 # Tier-1 pattern (Google, Auth0, Azure): one issuer hostname for all tenants.
 # Realm discovery handles tenant routing at the application layer, not the
 # gateway. No X-Tenant-ID injection — falcon-id resolves tenant from
 # client_id (OAuth flows) or realm slug (login flows).
 #
-# Chain: Cloudflare → Traefik (TLS hexxlock-com-tls) → apisix-gateway
-#        → ApisixRoute(host=id.hexxlock.com) → falcon-id Service
+# Chain: Cloudflare → Traefik (TLS example-com-tls) → apisix-gateway
+#        → ApisixRoute(host=id.example.com) → falcon-id Service
 #
 # Route split:
 #   1. discovery  (priority 10) — /.well-known/*, /health, /ready, /metrics

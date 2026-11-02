@@ -212,8 +212,8 @@ type oauthStateEntry struct {
 // present it makes binding the default rather than an integration detail.
 //
 // WHY __Host- SPECIFICALLY, and why the binding is useless without it: the
-// threat is an attacker PLANTING a cookie from a sibling *.hexxlock.com origin
-// via Domain=.hexxlock.com. A binding secret carried in a plantable cookie is
+// threat is an attacker PLANTING a cookie from a sibling *.example.com origin
+// via Domain=.example.com. A binding secret carried in a plantable cookie is
 // planted along with it and matches by construction. The __Host- prefix is
 // what makes the cookie un-plantable — browsers reject the prefix unless the
 // cookie is Secure, Path=/ and carries NO Domain attribute, and cross-site

@@ -1,0 +1,1 @@
+{"type":"https://docs.example.com/errors/service-unavailable","title":"Service unavailable","status":503,"detail":"The approver directory is unavailable; approval was refused. Please retry later.","instance":"/api/v1/mm/purchase-orders/33333333-3333-3333-3333-333333333333/actions/approve","code":"approver_directory_unavailable","traceId":"approval-fixture"}

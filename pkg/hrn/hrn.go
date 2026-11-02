@@ -53,8 +53,8 @@ var (
 // All fields are accessible and mutable; use Validate to assert invariants
 // before persisting or transmitting an HRN.
 type HRN struct {
-	// Product identifies the HexxLock product that owns the resource
-	// (e.g. "erp", "hotel-pms", "car-rental").
+	// Product identifies the platform product that owns the resource
+	// (e.g. "erp", "example-pms", "car-rental").
 	Product string
 
 	// TenantID is the UUID of the tenant that owns the resource.

@@ -173,8 +173,8 @@ func TestCORS_MaxAgeInPreflight(t *testing.T) {
 
 // TestCORS_AllowedSubdomainPattern verifies the actual subdomain matching
 // behavior of the middleware. The hardcoded allowedSubdomainPatterns inside
-// CORSWithConfig (e.g. ".hexxlock.com") use an exact-dot-boundary check:
-// for origin "https://acme.hexxlock.com" the pattern ".hexxlock.com" matches
+// CORSWithConfig (e.g. ".example.com") use an exact-dot-boundary check:
+// for origin "https://acme.example.com" the pattern ".example.com" matches
 // via HasSuffix, giving prefixLen=4 and hostPart[prefixLen-1]='e' (not '.'),
 // so the subdomain branch is NOT taken. Origins that are not in
 // AllowedOrigins pass through (200) but receive no CORS headers.
@@ -183,9 +183,9 @@ func TestCORS_AllowedSubdomainPattern(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/resource", nil)
-	// acme.hexxlock.com is NOT in devCORSConfig AllowedOrigins; the internal
+	// acme.example.com is NOT in devCORSConfig AllowedOrigins; the internal
 	// subdomain pattern check does not grant it either (see comment above).
-	req.Header.Set("Origin", "https://acme.hexxlock.com")
+	req.Header.Set("Origin", "https://acme.example.com")
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code,
@@ -199,11 +199,11 @@ func TestCORS_AllowedSubdomainPattern(t *testing.T) {
 func TestCORS_MaliciousSubdomainRejected(t *testing.T) {
 	router := buildCORSRouter(devCORSConfig())
 
-	// Attempts to trick suffix matching: "evilhexxlock.com" contains ".hexxlock.com"
+	// Attempts to trick suffix matching: "evilexample.com" contains ".example.com"
 	// but is NOT a proper subdomain.
 	w := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/api/resource", nil)
-	req.Header.Set("Origin", "https://evilhexxlock.com")
+	req.Header.Set("Origin", "https://evilexample.com")
 	req.Header.Set("Access-Control-Request-Method", "GET")
 	router.ServeHTTP(w, req)
 

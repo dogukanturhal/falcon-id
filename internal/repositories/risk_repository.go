@@ -481,7 +481,7 @@ func (r *RiskRepository) CreateLoginRiskEvent(ctx context.Context, event *models
 // `limit` caps the result set; pass <= 0 for the default 50.
 //
 // Used by the user-facing /api/v1/auth/me/risk-events endpoint that powers
-// the "Sign-in security events" section of accounts.hexxlock.com — surfaces
+// the "Sign-in security events" section of accounts.example.com — surfaces
 // MFA-challenged + blocked logins so users can spot suspicious activity.
 func (r *RiskRepository) GetUserRecentLoginRiskEvents(
 	ctx context.Context,

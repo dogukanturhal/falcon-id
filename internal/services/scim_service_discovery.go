@@ -25,7 +25,7 @@ const (
 func (s *SCIMService) GetServiceProviderConfig() *models.SCIMServiceProviderConfig {
 	return &models.SCIMServiceProviderConfig{
 		Schemas:          []string{models.SCIMSchemaServiceProvider},
-		DocumentationURI: "https://docs.hexxlock.com/scim",
+		DocumentationURI: "https://docs.example.com/scim",
 		Patch:            models.SCIMSupported{Supported: true},
 		Bulk: models.SCIMBulkSupported{
 			Supported:      true,

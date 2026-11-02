@@ -55,9 +55,35 @@ func (s *OAuthProviderService) generateTokens(ctx context.Context, client *model
 // and the read-only claim resolvers deliberately are not (they run on other
 // connections/services and hold no lock on the auth-code row).
 func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, tokenSink oauthTokenCreator, client *models.OAuthClient, user *models.User, scopes []string, nonce *string, authzDetails []models.AuthorizationDetail, authMethods []string, idpSessionID *uuid.UUID) (*models.OAuthTokenResponse, error) {
+	// Last-line tenant suspension gate for every grant (authorization_code,
+	// refresh_token, client_credentials, token exchange): the user's tenant,
+	// or the client's own tenant when there is no user.
+	if user != nil {
+		if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+			return nil, err
+		}
+	} else if err := checkTenantNotSuspended(ctx, s.tenantSuspension, client.TenantID); err != nil {
+		return nil, err
+	}
 	now := time.Now()
-	accessTokenExpiry := now.Add(time.Duration(client.AccessTokenLifetime) * time.Second)
+	accessTokenLifetime := client.AccessTokenLifetime
+	accessTokenExpiry := now.Add(time.Duration(accessTokenLifetime) * time.Second)
 	refreshTokenExpiry := now.Add(time.Duration(client.RefreshTokenLifetime) * time.Second)
+	// Tenant token exchange: short lifetime, and the stored row expires with
+	// the access token (no refresh token is handed out on that path).
+	exchangeGrant, isTenantExchange := tenantExchangeGrantFromContext(ctx)
+	if isTenantExchange {
+		accessTokenLifetime = tenantExchangeLifetime(client)
+		accessTokenExpiry = now.Add(time.Duration(accessTokenLifetime) * time.Second)
+		// Never outlive the subject token: re-exchanging an exchanged token
+		// must not extend the session. TenantTokenExchange has already
+		// validated the subject, so the remaining time is positive.
+		if !exchangeGrant.SubjectExp.IsZero() && exchangeGrant.SubjectExp.Before(accessTokenExpiry) {
+			accessTokenExpiry = exchangeGrant.SubjectExp
+			accessTokenLifetime = int(accessTokenExpiry.Sub(now) / time.Second)
+		}
+		refreshTokenExpiry = accessTokenExpiry
+	}
 
 	// `aud` resolution — multi-audience JWT pattern (RFC 7519 §4.1.3,
 	// Auth0 / Microsoft Entra / Okta in-place-transition canonical):
@@ -211,7 +237,10 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 		// pick up their tokens via /oauth/token (incl. the IAP→BFF
 		// :jwt token-exchange path). Diagnosed live 2026-05-14 as the
 		// proximate cause of the admin-tier dashboard 401 cascade.
-		if user.TenantID.String() == models.HexxlockInternalTenantID {
+		//
+		// OPS_STRICT_PLATFORM_ROLES: platformAuthority replaces the
+		// tenant-membership rule with iam_platform_roles (nil = legacy).
+		if s.platformAuthority.AdminClaim(ctx, user.ID, user.TenantID, user.Email) {
 			accessTokenClaims["is_platform_admin"] = true
 		}
 
@@ -220,15 +249,15 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 		// /api/v1/auth/login mint path. Without this block, JWTs minted
 		// by the OAuth /oauth/token path (authorization_code +
 		// refresh_token + token-exchange grants — the canonical paths
-		// for centralized SSO at accounts.hexxlock.com and every product
+		// for centralized SSO at accounts.example.com and every product
 		// app's BFF code-exchange) silently dropped the `products`
-		// claim. Downstream product-entitlement middleware (mearax
-		// `productSlug: 'mearax'` gate in falcon-id-client) then had no
+		// claim. Downstream product-entitlement middleware (acmeweb
+		// `productSlug: 'acmeweb'` gate in falcon-id-client) then had no
 		// source for /app/* gating decisions and bounced every user to
 		// /unauthorized — the symmetric bug to the 2026-05-25 auth_time
 		// drop the surrounding comment block documents.
 		//
-		// Shape: array of { pid, slug, plan? }, resolved from active
+		// Shape: array of { pid, slug, plan?, state? }, resolved from active
 		// iam_product_instances rows for the user's tenant (see
 		// services/product_subscription_resolver.go). Empty resolved
 		// list is OMITTED — we drop the claim entirely rather than
@@ -250,18 +279,11 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 					zap.String("tenant_id", user.TenantID.String()),
 					zap.String("client_id", client.ClientID),
 				)
-			} else if len(resolved) > 0 {
-				products := make([]map[string]any, 0, len(resolved))
-				for _, pc := range resolved {
-					entry := map[string]any{
-						"pid":  pc.ProductID.String(),
-						"slug": pc.ProductSlug,
-					}
-					if pc.PlanID != nil {
-						entry["plan"] = *pc.PlanID
-					}
-					products = append(products, entry)
-				}
+			} else if products := toProductSubscriptionClaims(resolved); len(products) > 0 {
+				// Same typed conversion as token_service's mint paths, so
+				// `state` ("provisioning"/"failed") is carried and the
+				// falcon-id-client provisioning interstitial fires for
+				// OAuth-issued tokens too.
 				accessTokenClaims["products"] = products
 			}
 		}
@@ -286,6 +308,10 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 		// persisted row.
 		accessTokenClaims["sub"] = client.ClientID
 		accessTokenClaims["tenant_id"] = client.TenantID.String()
+		// RFC 9068-style grant marker. Internal-route middleware keys on this
+		// to tell service tokens apart from end-user tokens signed by the
+		// same key.
+		accessTokenClaims["gty"] = "client_credentials"
 	}
 
 	// Embed RAR authorization_details in the access token (RFC 9396 §7).
@@ -296,6 +322,10 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 	// round-trip. Subject to the same scope + per-client allowlist gating
 	// as the id_token — matches the Auth0/Okta enterprise default.
 	s.emitSubjectClaims(ctx, accessTokenClaims, user, client, scopes, authMethods)
+	if isTenantExchange && user != nil {
+		applyTenantExchangeClaims(accessTokenClaims, exchangeGrant,
+			s.containsString(scopes, OIDCScopeRoles) && clientAllowsClaimScope(client, OIDCScopeRoles))
+	}
 
 	// Emit the OIDC Session Management 1.0 §5 `sid` claim on the access
 	// token (in addition to the id_token below) so resource servers and
@@ -333,8 +363,9 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 	}
 
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodRS256, accessTokenClaims)
-	accessToken.Header["kid"] = s.keyID
-	accessTokenString, err := accessToken.SignedString(s.privateKey)
+	signKey, signKid := s.signingKey()
+	accessToken.Header["kid"] = signKid
+	accessTokenString, err := accessToken.SignedString(signKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign access token: %w", err)
 	}
@@ -377,12 +408,12 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 	refreshTokenHash := s.hashSecret(refreshTokenString)
 
 	oauthToken := &models.OAuthToken{
-		ID:           uuid.New(),
-		TenantID:     client.TenantID,
-		ClientID:     client.ID,
-		UserID:       userID,
-		TokenType:    "access_token",
-		Token:        s.hashSecret(accessTokenString), // Hash full JWT — its first ~70 chars are the identical header, so slicing would collide
+		ID:        uuid.New(),
+		TenantID:  client.TenantID,
+		ClientID:  client.ID,
+		UserID:    userID,
+		TokenType: "access_token",
+		Token:     s.hashSecret(accessTokenString), // Hash full JWT — its first ~70 chars are the identical header, so slicing would collide
 
 		Scopes:       scopes,
 		RefreshToken: &refreshTokenHash,
@@ -395,7 +426,12 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 		// Preserve the IdP session UUID so refresh rotations emit a stable
 		// `sid` claim across the session lifetime (migration 220).
 		IdpSessionID: idpSessionID,
+		// Bind to the iam_sessions row so explicit session end can revoke
+		// this token (migration 0028). Nil = unbound, like a legacy token.
+		SessionID: s.resolveLoginSessionRow(ctx, idpSessionID, user),
 	}
+
+	recordIssuedTokenID(ctx, oauthToken.ID)
 
 	// RFC 9700 §4.14 refresh-token family (lineage). On a rotation,
 	// RefreshTokens stashes the parent's family id via WithRefreshTokenFamily
@@ -426,7 +462,7 @@ func (s *OAuthProviderService) generateTokensWithSink(ctx context.Context, token
 	response := &models.OAuthTokenResponse{
 		AccessToken:          accessTokenString,
 		TokenType:            "Bearer",
-		ExpiresIn:            int64(client.AccessTokenLifetime),
+		ExpiresIn:            int64(accessTokenLifetime),
 		RefreshToken:         refreshTokenString,
 		Scope:                strings.Join(scopes, " "),
 		AuthorizationDetails: authzDetails, // nil when no RAR was requested; omitted in JSON via omitempty
@@ -502,8 +538,9 @@ func (s *OAuthProviderService) generateIDToken(ctx context.Context, client *mode
 	s.emitSubjectClaims(ctx, claims, user, client, scopes, authMethods)
 
 	idToken := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	idToken.Header["kid"] = s.keyID
-	return idToken.SignedString(s.privateKey)
+	signKey, signKid := s.signingKey()
+	idToken.Header["kid"] = signKid
+	return idToken.SignedString(signKey)
 }
 
 // ==================== UserInfo ====================
@@ -586,26 +623,26 @@ func (s *OAuthProviderService) GetDiscoveryDocument() *models.OIDCDiscoveryDocum
 	confidentialAuthMethods := []string{"client_secret_basic", "client_secret_post"}
 
 	doc := &models.OIDCDiscoveryDocument{
-		Issuer:                            issuer,
-		AuthorizationEndpoint:             issuer + "/oauth/authorize",
-		TokenEndpoint:                     issuer + "/oauth/token",
-		UserinfoEndpoint:                  issuer + "/oauth/userinfo",
-		JwksURI:                           issuer + "/.well-known/jwks.json",
-		RevocationEndpoint:                issuer + "/oauth/revoke",
-		IntrospectionEndpoint:             issuer + "/oauth/introspect",
-		EndSessionEndpoint:                issuer + "/oauth/logout",
-		ScopesSupported:                   []string{"openid", "profile", "email", "offline_access", OIDCScopeGroups, OIDCScopeRoles, OIDCScopeIntrospect},
+		Issuer:                issuer,
+		AuthorizationEndpoint: issuer + "/oauth/authorize",
+		TokenEndpoint:         issuer + "/oauth/token",
+		UserinfoEndpoint:      issuer + "/oauth/userinfo",
+		JwksURI:               issuer + "/.well-known/jwks.json",
+		RevocationEndpoint:    issuer + "/oauth/revoke",
+		IntrospectionEndpoint: issuer + "/oauth/introspect",
+		EndSessionEndpoint:    issuer + "/oauth/logout",
+		ScopesSupported:       []string{"openid", "profile", "email", "offline_access", OIDCScopeGroups, OIDCScopeRoles, OIDCScopeIntrospect},
 		// OAuth 2.1 (IAM-04): only `code` is conformant. Implicit
 		// (`token`, `id_token`, `id_token token`) and hybrid response
 		// types (`code id_token`, `code token`, `code id_token token`)
 		// are removed because we do not implement them and OAuth 2.1
 		// BCP-225 deprecates the implicit-flow tokens-in-URL-fragment
 		// pattern across the board.
-		ResponseTypesSupported:            []string{"code"},
-		ResponseModesSupported:            []string{"query", "fragment", "form_post"},
-		GrantTypesSupported:               []string{"authorization_code", "client_credentials", "refresh_token"},
-		SubjectTypesSupported:             []string{"public"},
-		IDTokenSigningAlgValuesSupported:  []string{oauthAlgRS256},
+		ResponseTypesSupported:           []string{"code"},
+		ResponseModesSupported:           []string{"query", "fragment", "form_post"},
+		GrantTypesSupported:              []string{"authorization_code", "client_credentials", "refresh_token"},
+		SubjectTypesSupported:            []string{"public"},
+		IDTokenSigningAlgValuesSupported: []string{oauthAlgRS256},
 		// `tls_client_auth` per RFC 8705 §2.1 — PKI-mode mTLS client
 		// authentication. Per-client opt-in via TLSClientAuthSubjectDN;
 		// X-Forwarded-Client-Cert from APISIX is the wiring contract.
@@ -646,9 +683,9 @@ func (s *OAuthProviderService) GetDiscoveryDocument() *models.OIDCDiscoveryDocum
 		// causing FAPI 2.0 conformance probers + spec-aware RP SDKs
 		// to skip JAR. `request_uri` is intentionally still false —
 		// PAR is the request-by-reference pattern.
-		RequestParameterSupported:                 true,
-		RequestURIParameterSupported:              false,
-		RequireRequestURIRegistration:             false,
+		RequestParameterSupported:     true,
+		RequestURIParameterSupported:  false,
+		RequireRequestURIRegistration: false,
 		// RFC 9101 §10.5 — mirrors isSupportedJARAlg in
 		// internal/services/oauth_provider_jar.go. Update both
 		// in lockstep when adding a new alg.
@@ -747,7 +784,7 @@ func (s *OAuthProviderService) ValidateAccessToken(tokenString string) (jwt.MapC
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
-		return s.publicKey, nil
+		return s.verifyKeyFunc(token)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
@@ -900,6 +937,15 @@ func (s *OAuthProviderService) RevokeToken(ctx context.Context, callerClient *mo
 
 	if err := s.clientRepo.RevokeOAuthToken(ctx, tokenHash); err != nil {
 		return fmt.Errorf("RevokeToken: %w", err)
+	}
+
+	// RFC 7009 §2.1: revoking a refresh token SHOULD also revoke the other
+	// tokens of the same authorization grant, i.e. the whole rotation family.
+	// Access-token revocation stays single-token.
+	if row.RefreshToken != nil && *row.RefreshToken == tokenHash && row.TokenFamilyID != nil {
+		if _, err := s.clientRepo.RevokeRefreshTokenFamily(ctx, *row.TokenFamilyID); err != nil {
+			return fmt.Errorf("RevokeToken: revoke family: %w", err)
+		}
 	}
 
 	// Emit CAEP session_revoked so SSE-subscribed RPs invalidate within
@@ -1155,7 +1201,7 @@ func (s *OAuthProviderService) Issuer() string {
 // Used by the OIDC RP-Initiated Logout endpoint.
 func (s *OAuthProviderService) EndSession(ctx context.Context, idTokenHint string) (*models.OAuthClient, *uuid.UUID, error) {
 	// Parse and validate the id_token JWT
-	claims, err := s.ValidateAccessToken(idTokenHint)
+	claims, err := s.validateLogoutHint(idTokenHint)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid id_token_hint: %w", err)
 	}
@@ -1191,4 +1237,45 @@ func (s *OAuthProviderService) EndSession(ctx context.Context, idTokenHint strin
 	}
 
 	return client, userID, nil
+}
+
+// LogoutHintSID returns the `sid` (IdP session id) and `sub` (user id) claims
+// of a signature-verified id_token_hint.
+func (s *OAuthProviderService) LogoutHintSID(idTokenHint string) (sid, subject uuid.UUID, ok bool) {
+	claims, err := s.validateLogoutHint(idTokenHint)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, false
+	}
+	rawSID, _ := claims["sid"].(string)
+	rawSub, _ := claims["sub"].(string)
+	sid, errSID := uuid.Parse(rawSID)
+	subject, errSub := uuid.Parse(rawSub)
+	if errSID != nil || errSub != nil || sid == uuid.Nil || subject == uuid.Nil {
+		return uuid.Nil, uuid.Nil, false
+	}
+	return sid, subject, true
+}
+
+// RP-Initiated Logout 1.0 §2 permits an expired ID token as a hint. It is
+// never an access credential: still verify RS256 signature, issuer, subject
+// and audience; exp is intentionally not an authorization/liveness gate.
+func (s *OAuthProviderService) validateLogoutHint(hint string) (jwt.MapClaims, error) {
+	token, err := jwt.Parse(hint, s.verifyKeyFunc, jwt.WithValidMethods([]string{"RS256"}), jwt.WithoutClaimsValidation())
+	if err != nil || token == nil || !token.Valid {
+		return nil, fmt.Errorf("invalid logout hint")
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, fmt.Errorf("invalid logout claims")
+	}
+	issuer, _ := claims.GetIssuer()
+	sub, _ := claims.GetSubject()
+	aud, _ := claims.GetAudience()
+	if issuer != s.getIssuer() || sub == "" || len(aud) != 1 {
+		return nil, fmt.Errorf("invalid logout claims")
+	}
+	if _, err := uuid.Parse(sub); err != nil {
+		return nil, fmt.Errorf("invalid logout subject")
+	}
+	return claims, nil
 }

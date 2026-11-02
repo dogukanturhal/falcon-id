@@ -108,9 +108,9 @@ type BCLAuditPublisher interface {
 
 // BCLAuditPayload is the canonical audit-event payload emitted by
 // every BCL pipeline state transition. Lands in the audit-archive
-// MinIO bucket via the existing audit-archiver NATS pipeline (memory:
-// internal engineering notes); 7-year WORM
-// retention per internal engineering notes.
+// MinIO bucket via the existing audit-archiver NATS pipeline (see
+// operational notes); 7-year WORM
+// retention per operational notes.
 //
 // Field shape mirrors what an auditor needs to reconstruct a Sign Out
 // cascade after the fact: who logged out (Sub), from which session
@@ -368,7 +368,7 @@ func (s *BackchannelLogoutService) enqueueOne(ctx context.Context, tenantID stri
 	// F1: emit a structured audit event for every successful enqueue.
 	// Lands in the WORM audit-archive bucket via the integration-bus →
 	// NATS → audit-archiver pipeline. 7-year retention per
-	// internal engineering notes.
+	// operational notes.
 	s.emitAuditEvent(tenantID, BCLEventTypeEnqueued, BCLAuditPayload{
 		EventType:     "bcl_enqueued",
 		RPClientID:    client.ClientID,

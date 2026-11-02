@@ -371,7 +371,7 @@ func (h *AuthHandler) ResetPassword(c *gin.Context) {
 //	this file pointed callers at the legacy alias, which in
 //	production goes through an APISIX route to Next.js (frontend-
 //	login) and returns 404 — frontend!N (2026-05-12) updated the
-//	id.hexxlock.com login app's CSRF_TOKEN_PATH constant after
+//	id.example.com login app's CSRF_TOKEN_PATH constant after
 //	live repro of "csrf token fetch failed: HTTP 404" on the
 //	step-up MFA enrollment page.
 //

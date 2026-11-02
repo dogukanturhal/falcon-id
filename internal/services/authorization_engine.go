@@ -157,6 +157,23 @@ type ModuleEntitlementChecker interface {
 // Every tenant has access to core platform and IAM permissions.
 var UniversalModules = []string{"core", "iam"}
 
+// isUniversalModule reports whether module is exempt from module-entitlement
+// checks (see UniversalModules). RoleService.getEntitledModules and
+// PermissionService's equivalent module listing already special-case these
+// two modules; the per-request entitlement guard in CheckPermission (and,
+// via checkEntitlementDenial, BatchCheckPermissions) must agree with that
+// same exemption or every "core:*"/"iam:*" permission gets silently denied
+// for any tenant whose sole active product instance is a paid module (e.g.
+// "acmeweb") that does not itself declare core/iam in its manifest.
+func isUniversalModule(module string) bool {
+	for _, m := range UniversalModules {
+		if m == module {
+			return true
+		}
+	}
+	return false
+}
+
 // authorizationEngine is the concrete implementation of AuthorizationEngine.
 // SpiceDB is the sole authorization authority — no RBAC/PostgreSQL fallback.
 type authorizationEngine struct {
@@ -281,6 +298,89 @@ func NewAuthorizationEngineWithSunset(
 	}
 }
 
+// preSpiceDBDenial evaluates the sunset and module-entitlement guards that
+// must deny a permission BEFORE SpiceDB is ever consulted. It is shared by
+// CheckPermission (used by RequirePermission middleware) and
+// BatchCheckPermissions (used by POST /authorize/batch) so the two
+// authorities can never disagree about a permission's sunset/entitlement
+// status the way they used to: CheckPermission applied these guards and
+// BatchCheckPermissions skipped them entirely, so authorize/batch reported
+// "allowed" for module:resource:action permissions RequirePermission denied
+// outright — most visibly "iam:*"/"core:*" permissions, which are declared
+// universal (UniversalModules) but were never exempted here, so ANY tenant
+// whose only active product instance doesn't itself declare "core"/"iam" in
+// its manifest (e.g. a AcmeWeb-only tenant) had every core/iam permission
+// denied by CheckPermission while authorize/batch kept saying "true".
+//
+// Returns (denied, metricReason, message). The two guards below have
+// deliberately different error-handling policies — see spec 23 §1.4:
+//   - Sunset lookup errors are fail-OPEN (proceeds to SpiceDB): this guard is
+//     a low-risk metadata optimization, not a security decision, so a DB miss
+//     must never become an accidental deny.
+//   - Module entitlement check errors are fail-CLOSED (denies): this guard is
+//     security-relevant (it is the only thing standing between an
+//     unentitled tenant and a SpiceDB relationship graph that may still say
+//     "allowed"), so an entitlement-repo outage must not silently widen
+//     access to every module.
+func (e *authorizationEngine) preSpiceDBDenial(ctx context.Context, tenantID uuid.UUID, permission string) (bool, string, string) {
+	// Sunset guard — permission has passed its sunset date (GAP 8).
+	// A DB miss or lookup error must never become an accidental deny.
+	// Kept intentionally fail-open per spec 23 §1.4 (deliberate, narrow,
+	// low-risk: metadata lookup only, never the actual authz decision).
+	if e.sunsetChecker != nil {
+		perm, lookupErr := e.sunsetChecker.GetPermissionByName(ctx, permission)
+		if lookupErr != nil {
+			e.logger.Warn("sunset lookup failed, proceeding to SpiceDB",
+				zap.Error(lookupErr),
+				zap.String("permission", permission),
+			)
+		} else if perm != nil && perm.IsSunset() {
+			e.logger.Info("permission is sunset, denying immediately",
+				zap.String("permission", permission),
+				zap.Timep("sunset_at", perm.SunsetAt),
+			)
+			return true, "permission_sunset", fmt.Sprintf("permission %q is sunset and no longer honoured", permission)
+		}
+	}
+
+	// Module entitlement guard — tenant's subscription must include the
+	// module associated with this permission (e.g. "crm" from
+	// "crm:contacts:read"). Only applies to module:resource:action format
+	// permissions, and never to UniversalModules (core, iam): every tenant
+	// has those regardless of which paid product instances are active.
+	//
+	// Errors are fail-CLOSED (spec 23 §1.4): unlike the sunset lookup above,
+	// this guard is a security-relevant gate, not a metadata optimization —
+	// an entitlement-repo outage must never let SpiceDB decide alone,
+	// because SpiceDB's relationship graph can still say "allowed" for a
+	// tenant that was never entitled to the module in the first place.
+	if e.entitlementChecker != nil {
+		parts := strings.SplitN(permission, ":", 3)
+		if len(parts) == 3 && !isUniversalModule(parts[0]) {
+			module := parts[0]
+			entitled, entErr := e.entitlementChecker.IsTenantEntitled(ctx, tenantID, module)
+			if entErr != nil {
+				e.logger.Warn("module entitlement check failed, denying access (fail-closed)",
+					zap.Error(entErr),
+					zap.String("tenant_id", tenantID.String()),
+					zap.String("module", module),
+					zap.String("permission", permission),
+				)
+				return true, "entitlement_check_unavailable", fmt.Sprintf("module entitlement check unavailable: %s", module)
+			} else if !entitled {
+				e.logger.Info("module not entitled, denying immediately",
+					zap.String("module", module),
+					zap.String("permission", permission),
+					zap.String("tenant_id", tenantID.String()),
+				)
+				return true, "module_not_entitled", fmt.Sprintf("module not entitled: %s", module)
+			}
+		}
+	}
+
+	return false, "", ""
+}
+
 // CheckPermission checks module-level permissions via SpiceDB.
 // Uses access_grant object type with the permission string as object ID.
 func (e *authorizationEngine) CheckPermission(ctx context.Context, req PermissionRequest) (*PermissionResult, error) {
@@ -320,62 +420,18 @@ func (e *authorizationEngine) CheckPermission(ctx context.Context, req Permissio
 		}, nil
 	}
 
-	// Sunset guard — check whether the permission has passed its sunset date.
-	// If so, deny immediately without consulting SpiceDB (GAP 8).
-	// If the lookup fails or returns nil, we proceed to SpiceDB — a DB miss or
-	// lookup error must never become an accidental deny.
-	if e.sunsetChecker != nil {
-		perm, lookupErr := e.sunsetChecker.GetPermissionByName(ctx, req.Permission)
-		if lookupErr != nil {
-			e.logger.Warn("sunset lookup failed, proceeding to SpiceDB",
-				zap.Error(lookupErr),
-				zap.String("permission", req.Permission),
-			)
-		} else if perm != nil && perm.IsSunset() {
-			e.logger.Info("permission is sunset, denying immediately",
-				zap.String("permission", req.Permission),
-				zap.Timep("sunset_at", perm.SunsetAt),
-			)
-			metrics.RecordAuthzCheck("spicedb", "denied", "module", time.Since(startTime).Seconds())
-			metrics.RecordAuthzDenial(req.Permission, "permission_sunset")
-			return &PermissionResult{
-				Allowed: false,
-				Reason:  fmt.Sprintf("permission %q is sunset and no longer honoured", req.Permission),
-				Source:  "spicedb",
-			}, nil
-		}
-	}
-
-	// Module entitlement guard — check whether the tenant's subscription includes
-	// the module associated with this permission (e.g., "crm" from "crm:contacts:read").
-	// Only applies to module:resource:action format permissions.
-	// Errors are fail-open: entitlement is an optimization, SpiceDB is the authority.
-	if e.entitlementChecker != nil {
-		parts := strings.SplitN(req.Permission, ":", 3)
-		if len(parts) == 3 {
-			module := parts[0]
-			entitled, entErr := e.entitlementChecker.IsTenantEntitled(ctx, req.TenantID, module)
-			if entErr != nil {
-				e.logger.Warn("module entitlement check failed, proceeding to SpiceDB (fail-open)",
-					zap.Error(entErr),
-					zap.String("module", module),
-					zap.String("permission", req.Permission),
-				)
-			} else if !entitled {
-				e.logger.Info("module not entitled, denying immediately",
-					zap.String("module", module),
-					zap.String("permission", req.Permission),
-					zap.String("tenant_id", req.TenantID.String()),
-				)
-				metrics.RecordAuthzCheck("spicedb", "denied", "module", time.Since(startTime).Seconds())
-				metrics.RecordAuthzDenial(req.Permission, "module_not_entitled")
-				return &PermissionResult{
-					Allowed: false,
-					Reason:  fmt.Sprintf("module not entitled: %s", module),
-					Source:  "spicedb",
-				}, nil
-			}
-		}
+	// Sunset + module-entitlement guards — deny immediately, without
+	// consulting SpiceDB, when either applies. See preSpiceDBDenial: this is
+	// the SAME check BatchCheckPermissions runs per-permission, so the two
+	// authorities agree on every permission that goes through either path.
+	if denied, metricReason, message := e.preSpiceDBDenial(ctx, req.TenantID, req.Permission); denied {
+		metrics.RecordAuthzCheck("spicedb", "denied", "module", time.Since(startTime).Seconds())
+		metrics.RecordAuthzDenial(req.Permission, metricReason)
+		return &PermissionResult{
+			Allowed: false,
+			Reason:  message,
+			Source:  "spicedb",
+		}, nil
 	}
 
 	// Check permission via SpiceDB
@@ -639,15 +695,28 @@ func (e *authorizationEngine) CheckContextualPermission(ctx context.Context, req
 		return nil, fmt.Errorf("OPA evaluation failed: %w", err)
 	}
 
+	// OPA is deny-only: it can withhold access but never grants it. An OPA
+	// "allow" (no deny fired) still needs the ReBAC (SpiceDB) grant.
+	if result.Allowed {
+		rebac, rerr := e.checkContextualFallbackSpiceDB(ctx, req, startTime)
+		if rerr != nil || rebac == nil || !rebac.Allowed {
+			metrics.RecordOPAEvaluation("allowed", opaDuration)
+			if rerr != nil {
+				return nil, rerr
+			}
+			return rebac, nil
+		}
+	}
+
 	permResult := &PermissionResult{
 		Allowed: result.Allowed,
 		Source:  "opa",
 	}
 
 	if result.Allowed {
-		permResult.Reason = "granted via OPA policy"
+		permResult.Reason = "granted via SpiceDB; no OPA deny"
 		if len(result.Reasons) > 0 {
-			permResult.Reason = fmt.Sprintf("granted via OPA: %s", strings.Join(result.Reasons, "; "))
+			permResult.Reason = fmt.Sprintf("granted via SpiceDB; OPA: %s", strings.Join(result.Reasons, "; "))
 		}
 		metrics.RecordOPAEvaluation("allowed", opaDuration)
 		metrics.RecordAuthzCheck("opa", "allowed", "contextual", time.Since(startTime).Seconds())
@@ -720,8 +789,47 @@ func (e *authorizationEngine) checkContextualFallbackSpiceDB(ctx context.Context
 }
 
 // BatchCheckPermissions checks multiple module-level permissions via SpiceDB
-// using the native CheckBulkPermissions API (single gRPC call).
+// using the native CheckBulkPermissions API (single gRPC call). It is the
+// bool projection of BatchCheckDecisions.
 func (e *authorizationEngine) BatchCheckPermissions(ctx context.Context, userID, tenantID uuid.UUID, permissions []string) (map[string]bool, error) {
+	decisions, err := e.BatchCheckDecisions(ctx, userID, tenantID, permissions)
+	if err != nil {
+		return nil, err
+	}
+	results := make(map[string]bool, len(decisions))
+	for perm, d := range decisions {
+		results[perm] = d.Allowed
+	}
+	return results, nil
+}
+
+// detailedBulkChecker is the optional SpiceDBChecker extension that keeps why a
+// bulk check was not allowed (undecided caveat, per-item error). *spicedb.Client
+// implements it; test doubles that do not fall back to the bool API and every
+// deny is then classified permission_denied.
+type detailedBulkChecker interface {
+	CheckBulkPermissionsDetailed(ctx context.Context, tenantID, userID uuid.UUID, objectType string, objectIDs []string, permission string) (map[string]spicedb.CheckOutcome, error)
+}
+
+// preDenialReason maps preSpiceDBDenial's metric reason to the API reason.
+func preDenialReason(metricReason string) models.DecisionReason {
+	switch metricReason {
+	case "module_not_entitled":
+		return models.DecisionReasonEntitlementMissing
+	case "permission_sunset":
+		return models.DecisionReasonPermissionSunset
+	case "entitlement_check_unavailable":
+		return models.DecisionReasonUnavailable
+	default:
+		return models.DecisionReasonUnknown
+	}
+}
+
+// BatchCheckDecisions is BatchCheckPermissions with the reason for every deny
+// (spec 23 §7 authorize/batch). The verdicts are identical to
+// BatchCheckPermissions; only the explanation is added. Fail-closed throughout:
+// a dependency failure denies with DecisionReasonUnavailable.
+func (e *authorizationEngine) BatchCheckDecisions(ctx context.Context, userID, tenantID uuid.UUID, permissions []string) (map[string]models.PermissionDecision, error) {
 	startTime := time.Now()
 	defer func() {
 		duration := time.Since(startTime).Seconds()
@@ -734,53 +842,87 @@ func (e *authorizationEngine) BatchCheckPermissions(ctx context.Context, userID,
 	}
 
 	if len(permissions) == 0 {
-		return make(map[string]bool), nil
+		return make(map[string]models.PermissionDecision), nil
 	}
 
-	results := make(map[string]bool, len(permissions))
+	results := make(map[string]models.PermissionDecision, len(permissions))
+	denyAll := func(perms []string, reason models.DecisionReason) {
+		for _, perm := range perms {
+			results[perm] = models.PermissionDecision{Reason: reason}
+		}
+	}
 
-	// SpiceDB is required — if nil, deny all (fail-closed)
+	// Apply the SAME sunset + module-entitlement guards CheckPermission
+	// applies, permission by permission, BEFORE consulting SpiceDB. Without
+	// this, authorize/batch reported a permission as allowed whenever
+	// SpiceDB held the access_grant relationship, even when RequirePermission
+	// (via CheckPermission) would deny it as sunset or not-entitled — the
+	// divergence that broke Settings -> Team for tenants entitled only to a
+	// non-core/iam product. Permissions denied here never reach SpiceDB;
+	// everything else still goes through the bulk call below unchanged.
+	spicedbPermissions := make([]string, 0, len(permissions))
+	for _, perm := range permissions {
+		if denied, metricReason, _ := e.preSpiceDBDenial(ctx, tenantID, perm); denied {
+			d := models.PermissionDecision{Reason: preDenialReason(metricReason)}
+			if d.Reason == models.DecisionReasonEntitlementMissing {
+				d.Module = strings.SplitN(perm, ":", 2)[0]
+			}
+			results[perm] = d
+			continue
+		}
+		spicedbPermissions = append(spicedbPermissions, perm)
+	}
+
+	if len(spicedbPermissions) == 0 {
+		return results, nil
+	}
+
+	// SpiceDB is required — if nil, deny all remaining (fail-closed)
 	if e.spicedbClient == nil {
 		e.logger.Error("SpiceDB client is nil — denying all batch permissions (fail-closed)")
-		for _, perm := range permissions {
-			results[perm] = false
-		}
+		denyAll(spicedbPermissions, models.DecisionReasonUnavailable)
 		return results, nil
 	}
 
 	// Translate permission names to SpiceDB-safe IDs for the bulk check
-	spicedbIDs := make([]string, len(permissions))
-	spicedbToOriginal := make(map[string]string, len(permissions))
-	for i, perm := range permissions {
+	spicedbIDs := make([]string, len(spicedbPermissions))
+	spicedbToOriginal := make(map[string]string, len(spicedbPermissions))
+	for i, perm := range spicedbPermissions {
 		sid := spicedb.PermissionToSpiceDBID(perm)
 		spicedbIDs[i] = sid
 		spicedbToOriginal[sid] = perm
 	}
 
-	// Native CheckBulkPermissions — single gRPC call for all permissions
-	bulkResults, err := e.spicedbClient.CheckBulkPermissions(
-		ctx, tenantID, userID,
-		"access_grant", spicedbIDs, "check",
-	)
+	// Native CheckBulkPermissions — single gRPC call for all remaining permissions
+	var outcomes map[string]spicedb.CheckOutcome
+	var err error
+	if dc, ok := e.spicedbClient.(detailedBulkChecker); ok {
+		outcomes, err = dc.CheckBulkPermissionsDetailed(ctx, tenantID, userID, "access_grant", spicedbIDs, "check")
+	} else {
+		var plain map[string]bool
+		plain, err = e.spicedbClient.CheckBulkPermissions(ctx, tenantID, userID, "access_grant", spicedbIDs, "check")
+		outcomes = make(map[string]spicedb.CheckOutcome, len(plain))
+		for id, allowed := range plain {
+			outcomes[id] = spicedb.CheckOutcome{Allowed: allowed}
+		}
+	}
 	if err != nil {
-		// Fail-closed: bulk error → deny all
+		// Fail-closed: bulk error → deny all remaining
 		e.logger.Error("SpiceDB CheckBulkPermissions failed — denying all (fail-closed)",
 			zap.Error(err),
 			zap.String("user_id", userID.String()),
-			zap.Int("permission_count", len(permissions)),
+			zap.Int("permission_count", len(spicedbPermissions)),
 		)
-		for _, perm := range permissions {
-			results[perm] = false
-		}
+		denyAll(spicedbPermissions, models.DecisionReasonUnavailable)
 		return results, nil
 	}
 
 	grantedCount := 0
 	for _, sid := range spicedbIDs {
 		originalPerm := spicedbToOriginal[sid]
-		allowed := bulkResults[sid]
-		results[originalPerm] = allowed
-		if allowed {
+		o := outcomes[sid]
+		results[originalPerm] = decisionFromOutcome(o)
+		if o.Allowed {
 			grantedCount++
 		}
 	}
@@ -795,6 +937,21 @@ func (e *authorizationEngine) BatchCheckPermissions(ctx context.Context, userID,
 	)
 
 	return results, nil
+}
+
+// decisionFromOutcome classifies one SpiceDB outcome. Only HAS_PERMISSION
+// allows; everything else is a deny with the most specific reason known.
+func decisionFromOutcome(o spicedb.CheckOutcome) models.PermissionDecision {
+	switch {
+	case o.Allowed:
+		return models.PermissionDecision{Allowed: true}
+	case o.Conditional:
+		return models.PermissionDecision{Reason: models.DecisionReasonCaveatFailed, MissingContext: o.MissingContext}
+	case o.Errored:
+		return models.PermissionDecision{Reason: models.DecisionReasonUnavailable}
+	default:
+		return models.PermissionDecision{Reason: models.DecisionReasonPermissionDenied}
+	}
 }
 
 // CheckProductAccess verifies that a user can access a product instance via SpiceDB.
@@ -894,8 +1051,8 @@ func (e *authorizationEngine) resourceToModulePermission(resourceType, action st
 		"opportunity": "crm",
 		"account":     "accounting",
 		"document":    "documents",
-		"project":     "pm",
-		"task":        "pm",
+		"project":     "projects",
+		"task":        "projects",
 	}
 
 	module, ok := moduleMap[resourceType]

@@ -76,8 +76,35 @@ type RealmDomainProvisioner interface {
 	DeprovisionCustomHostname(ctx context.Context, realmID uuid.UUID, domain string) error
 }
 
+// realmWitnessPolicyRepo is the optional per-realm device-witness policy store
+// (*repositories.RealmRepository satisfies it).
+type realmWitnessPolicyRepo interface {
+	GetDeviceWitnessTOTPAllowedByRealm(ctx context.Context, realmID uuid.UUID) (bool, error)
+	SetDeviceWitnessTOTPAllowed(ctx context.Context, realmID uuid.UUID, allowed bool) error
+}
+
+// realmSessionPolicyRepo is the optional per-realm SSO session policy store
+// (*repositories.RealmRepository satisfies it).
+type realmSessionPolicyRepo interface {
+	GetSessionAbsoluteTTLSeconds(ctx context.Context, realmID uuid.UUID) (*int, error)
+	SetSessionAbsoluteTTLSeconds(ctx context.Context, realmID uuid.UUID, secs *int) error
+}
+
+// Bounds for realm.session_absolute_ttl_seconds (1h .. 90d).
+const (
+	MinSessionAbsoluteTTLSeconds = 3600
+	MaxSessionAbsoluteTTLSeconds = 90 * 24 * 3600
+)
+
+// ErrInvalidSessionTTL is returned for an out-of-range session lifetime.
+var ErrInvalidSessionTTL = fmt.Errorf("session_absolute_ttl_seconds must be between %d and %d", MinSessionAbsoluteTTLSeconds, MaxSessionAbsoluteTTLSeconds)
+
 // RealmService provides business logic for realm management
 type RealmService struct {
+	// sessionPolicy backs the session-policy admin API; nil -> 503.
+	sessionPolicy realmSessionPolicyRepo
+	// witnessPolicy backs the device-witness-policy admin API; nil -> 503.
+	witnessPolicy realmWitnessPolicyRepo
 	repo   realmServiceRepo
 	config *config.Config
 	logger *zap.Logger
@@ -967,4 +994,52 @@ func (s *RealmService) addRealmIDPConsolidated(ctx context.Context, realmID uuid
 
 	s.logger.Info("Added realm identity provider (consolidated)", zap.String("realm_id", realmID.String()), zap.String("idp_id", provider.ID.String()), zap.String("type", provider.Type))
 	return idpToRealmIDP(provider), nil
+}
+
+// SetWitnessPolicyRepository wires the device-witness policy store.
+func (s *RealmService) SetWitnessPolicyRepository(r realmWitnessPolicyRepo) {
+	s.witnessPolicy = r
+}
+
+// ErrWitnessPolicyUnavailable is returned when the policy store is not wired.
+var ErrWitnessPolicyUnavailable = fmt.Errorf("device witness policy store not configured")
+
+// GetDeviceWitnessTOTPAllowed returns the realm's authenticator-app witness flag.
+func (s *RealmService) GetDeviceWitnessTOTPAllowed(ctx context.Context, realmID uuid.UUID) (bool, error) {
+	if s.witnessPolicy == nil {
+		return false, ErrWitnessPolicyUnavailable
+	}
+	return s.witnessPolicy.GetDeviceWitnessTOTPAllowedByRealm(ctx, realmID)
+}
+
+// SetDeviceWitnessTOTPAllowed sets the realm's authenticator-app witness flag.
+func (s *RealmService) SetDeviceWitnessTOTPAllowed(ctx context.Context, realmID uuid.UUID, allowed bool) error {
+	if s.witnessPolicy == nil {
+		return ErrWitnessPolicyUnavailable
+	}
+	return s.witnessPolicy.SetDeviceWitnessTOTPAllowed(ctx, realmID, allowed)
+}
+
+// SetSessionPolicyRepository wires the session-policy store.
+func (s *RealmService) SetSessionPolicyRepository(r realmSessionPolicyRepo) {
+	s.sessionPolicy = r
+}
+
+// GetSessionAbsoluteTTL returns the realm's SSO session cap in seconds (nil = global default).
+func (s *RealmService) GetSessionAbsoluteTTL(ctx context.Context, realmID uuid.UUID) (*int, error) {
+	if s.sessionPolicy == nil {
+		return nil, ErrWitnessPolicyUnavailable
+	}
+	return s.sessionPolicy.GetSessionAbsoluteTTLSeconds(ctx, realmID)
+}
+
+// SetSessionAbsoluteTTL validates and sets the realm's SSO session cap (nil clears it).
+func (s *RealmService) SetSessionAbsoluteTTL(ctx context.Context, realmID uuid.UUID, secs *int) error {
+	if s.sessionPolicy == nil {
+		return ErrWitnessPolicyUnavailable
+	}
+	if secs != nil && (*secs < MinSessionAbsoluteTTLSeconds || *secs > MaxSessionAbsoluteTTLSeconds) {
+		return ErrInvalidSessionTTL
+	}
+	return s.sessionPolicy.SetSessionAbsoluteTTLSeconds(ctx, realmID, secs)
 }

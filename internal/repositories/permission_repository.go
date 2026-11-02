@@ -114,6 +114,29 @@ func (r *PermissionRepository) List(ctx context.Context) ([]models.Permission, e
 	return permissions, nil
 }
 
+// ListConcreteNames returns the names of every non-wildcard permission in the
+// catalog. It is the authoritative set wildcard grants are expanded against.
+func (r *PermissionRepository) ListConcreteNames(ctx context.Context) ([]string, error) {
+	rows, err := r.db.Query(ctx, `SELECT name FROM iam_permissions WHERE position('*' in name) = 0 ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("ListConcreteNames: %w", err)
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, fmt.Errorf("ListConcreteNames: %w", err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListConcreteNames: rows iteration: %w", err)
+	}
+	return names, nil
+}
+
 // ListByModule is an exported function.
 func (r *PermissionRepository) ListByModule(ctx context.Context, module string) ([]models.Permission, error) {
 	query := `

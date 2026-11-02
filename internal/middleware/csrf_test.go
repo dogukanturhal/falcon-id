@@ -545,7 +545,7 @@ func TestExtractOriginFromURL_ValidURL(t *testing.T) {
 	}{
 		{"https://example.com/path/to/page", "https://example.com"},
 		{"http://localhost:3000/dashboard", "http://localhost:3000"},
-		{"https://app.hexxlock.com/login?q=1", "https://app.hexxlock.com"},
+		{"https://app.example.com/login?q=1", "https://app.example.com"},
 	}
 
 	for _, tt := range tests {
@@ -564,17 +564,17 @@ func TestExtractOriginFromURL_NoScheme_ReturnsEmpty(t *testing.T) {
 // ==================== matchesOriginPattern unit tests ====================
 
 func TestMatchesOriginPattern_ExactMatch(t *testing.T) {
-	assert.True(t, matchesOriginPattern("https://hexxlock.com", "https://hexxlock.com"))
-	assert.False(t, matchesOriginPattern("https://hexxlock.com", "https://other.com"))
+	assert.True(t, matchesOriginPattern("https://example.com", "https://example.com"))
+	assert.False(t, matchesOriginPattern("https://example.com", "https://other.com"))
 }
 
 func TestMatchesOriginPattern_WildcardSubdomain(t *testing.T) {
-	pattern := "https://*.hexxlock.com"
-	assert.True(t, matchesOriginPattern("https://app.hexxlock.com", pattern))
-	assert.True(t, matchesOriginPattern("https://dashboard.hexxlock.com", pattern))
-	assert.True(t, matchesOriginPattern("https://hexxlock.com", pattern))
+	pattern := "https://*.example.com"
+	assert.True(t, matchesOriginPattern("https://app.example.com", pattern))
+	assert.True(t, matchesOriginPattern("https://dashboard.example.com", pattern))
+	assert.True(t, matchesOriginPattern("https://example.com", pattern))
 	assert.False(t, matchesOriginPattern("https://evil.com", pattern))
-	assert.False(t, matchesOriginPattern("http://app.hexxlock.com", pattern)) // wrong scheme
+	assert.False(t, matchesOriginPattern("http://app.example.com", pattern)) // wrong scheme
 }
 
 // ==================== DefaultCSRFConfig ====================

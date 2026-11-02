@@ -45,7 +45,6 @@ type row struct {
 	id         string
 	tenantID   string
 	tenantName string
-	certRaw    string // saml_sp_config->>'idp_certificate'
 }
 
 type report struct {
@@ -149,7 +148,7 @@ func parseCertificate(raw string) (*x509.Certificate, error) {
 
 func printReport(results []report) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "TENANT\tPROVIDER_ID\tCERT_PRESENT\tPARSES\tEXPIRY\tSIG_ALGORITHM\tNOTE")
+	_, _ = fmt.Fprintln(w, "TENANT\tPROVIDER_ID\tCERT_PRESENT\tPARSES\tEXPIRY\tSIG_ALGORITHM\tNOTE")
 
 	var missing, unparseable, expired int
 	now := time.Now()
@@ -166,10 +165,10 @@ func printReport(results []report) {
 		} else if !r.certParses {
 			unparseable++
 		}
-		fmt.Fprintf(w, "%s\t%s\t%v\t%v\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%v\t%v\t%s\t%s\t%s\n",
 			r.tenant, r.id, r.certPresent, r.certParses, r.expiry, r.sigAlgorithm, note)
 	}
-	w.Flush()
+	_ = w.Flush()
 
 	fmt.Printf("\n%d SAML SP providers audited: %d missing certificate, %d unparseable, %d expired\n",
 		len(results), missing, unparseable, expired)

@@ -17,6 +17,7 @@ import (
 	"github.com/dogukanturhal/falcon-id/pkg/clientctx"
 	"github.com/dogukanturhal/falcon-id/pkg/crypto"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
+	"github.com/dogukanturhal/falcon-id/pkg/redis"
 	"go.uber.org/zap"
 )
 
@@ -205,47 +206,53 @@ func (s *AuthService) authenticateLDAP(ctx context.Context, tenantID uuid.UUID, 
 	return nil, fmt.Errorf("LDAP authentication failed")
 }
 
-// invalidateExistingSessionsBeforeLogin invalidates any active sessions from the same IP/device
-// before creating a new session. This prevents session fixation attacks.
-// SECURITY: This is a critical security control to prevent session fixation vulnerabilities.
-func (s *AuthService) invalidateExistingSessionsBeforeLogin(ctx context.Context, userID uuid.UUID, ipAddress string) error {
-	// Get all active sessions for this user
-	activeSessions, err := s.sessionRepo.GetActiveSessions(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("failed to get active sessions: %w", err)
+// presentedSessionID resolves the iam_user_sessions.id of the session the
+// CURRENT browser presented (via its falcon_idp_session cookie, stashed on ctx
+// by middleware.PresentIdpSession) together with that IdP record's id. It
+// returns uuid.Nil when the browser presented nothing, the record is gone, or
+// it belongs to a different user. Matching is never done by IP: behind
+// WireGuard/NAT many devices share one address.
+func (s *AuthService) presentedSessionID(ctx context.Context, userID uuid.UUID) (sessionID, idpID uuid.UUID) {
+	idpID = redis.PresentedIdpSessionFromContext(ctx)
+	if idpID == uuid.Nil || s.sessionCache == nil {
+		return uuid.Nil, uuid.Nil
 	}
+	data, err := s.sessionCache.GetIdpSession(ctx, idpID)
+	if err != nil || data == nil || data.UserID != userID {
+		return uuid.Nil, uuid.Nil
+	}
+	return data.SessionID, idpID
+}
 
-	// Invalidate sessions from the same IP address (likely same device/browser)
-	// This prevents an attacker from using a pre-authenticated session
-	for _, session := range activeSessions {
-		if session.IPAddress != nil && *session.IPAddress == ipAddress {
-			// End the old session
-			if err := s.sessionRepo.EndSession(ctx, session.ID, "session_regenerated_on_login"); err != nil {
-				logger.Warn("Failed to end old session during login",
-					zap.Error(err),
-					zap.String("session_id", session.ID.String()),
-				)
-				continue
-			}
-
-			// Clear session from cache if available
-			if s.sessionCache != nil {
-				if err := s.sessionCache.Delete(ctx, session.ID); err != nil {
-					logger.Warn("Failed to clear session from cache",
-						zap.Error(err),
-						zap.String("session_id", session.ID.String()),
-					)
-				}
-			}
-
-			logger.Info("Invalidated existing session before creating new one",
-				zap.String("user_id", userID.String()),
-				zap.String("old_session_id", session.ID.String()),
-				zap.String("ip_address", ipAddress),
+// invalidateExistingSessionsBeforeLogin ends the session THIS browser
+// presented (if any) before a new one is created, so the old session id cannot
+// be reused after authentication (session fixation). Sessions of the user's
+// other devices are left alone, even when they share the client IP.
+func (s *AuthService) invalidateExistingSessionsBeforeLogin(ctx context.Context, userID uuid.UUID) error {
+	oldID, idpID := s.presentedSessionID(ctx, userID)
+	if idpID != uuid.Nil {
+		if err := s.sessionCache.DeleteIdpSession(ctx, idpID); err != nil {
+			logger.Warn("Failed to delete presented IdP session during login", zap.Error(err))
+		}
+	}
+	if oldID == uuid.Nil {
+		return nil
+	}
+	if err := s.sessionRepo.EndSession(ctx, oldID, models.SessionEndReasonRegeneratedOnLogin); err != nil {
+		return fmt.Errorf("failed to end presented session: %w", err)
+	}
+	if s.sessionCache != nil {
+		if err := s.sessionCache.Delete(ctx, oldID); err != nil {
+			logger.Warn("Failed to clear session from cache",
+				zap.Error(err),
+				zap.String("session_id", oldID.String()),
 			)
 		}
 	}
-
+	logger.Info("Invalidated presented session before creating new one",
+		zap.String("user_id", userID.String()),
+		zap.String("old_session_id", oldID.String()),
+	)
 	return nil
 }
 
@@ -296,6 +303,16 @@ func (s *AuthService) sessionTTLForLogin(rememberMe bool) time.Duration {
 //   - true → SessionTTLRememberMe (default 30d) — extended TTL so the
 //     session survives browser restart for the "Remember me" UX.
 func (s *AuthService) createSession(ctx context.Context, userID uuid.UUID, ipAddress, userAgent string, authMethods []string, rememberMe bool) (*models.Session, error) {
+	// Tenant suspension gate (R1-GAPS row 27): every session-minting path
+	// (password, MFA completion, WebAuthn, enrollment, signup, refresh drift)
+	// funnels through here, so a suspended tenant can never obtain a session.
+	if s.tenantSuspension != nil {
+		if u, uerr := s.userRepo.GetByID(ctx, userID); uerr == nil && u != nil {
+			if err := checkTenantNotSuspended(ctx, s.tenantSuspension, u.TenantID); err != nil {
+				return nil, err
+			}
+		}
+	}
 	sessionToken, err := crypto.GenerateSecureToken()
 	if err != nil {
 		return nil, fmt.Errorf("createSession: failed to generate session token: %w", err)
@@ -331,7 +348,7 @@ func (s *AuthService) createSession(ctx context.Context, userID uuid.UUID, ipAdd
 	}
 
 	// Persist the edge-stamped geo enrichment (Cloudflare Worker
-	// id-hexxlock-geo-stamp, infrastructure-iac MR-114, surfaced via
+	// geo-stamp, the edge infrastructure repository, surfaced via
 	// middleware.ClientGeo → clientctx.WithGeo at the handler boundary).
 	// Each field is stamped only when present — leaving the column
 	// NULL on absence (pre-Worker, internal service path, etc.) rather
@@ -388,7 +405,7 @@ func (s *AuthService) createSession(ctx context.Context, userID uuid.UUID, ipAdd
 //   - services.WithRequestIP             — gateway-resolved client IP
 //   - services.WithRequestUserAgent      — current request User-Agent
 //   - clientctx.WithCountry              — CF-IPCountry (free tier)
-//   - clientctx.WithGeo                  — id-hexxlock-geo-stamp output
+//   - clientctx.WithGeo                  — geo-stamp output
 //
 // Any of those missing → that column stays NULL on the new row,
 // preserving the same "absent = NULL not empty-string" invariant the
@@ -418,6 +435,33 @@ func (s *AuthService) GetSessionByID(ctx context.Context, sessionID uuid.UUID) (
 		return nil, nil
 	}
 	return s.sessionRepo.GetByID(ctx, sessionID)
+}
+
+// GetSessionByIDInRealm is the realm-scoped variant of GetSessionByID (RLS
+// safe). Satisfies the sessionContextService interface.
+func (s *AuthService) GetSessionByIDInRealm(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error) {
+	if s.sessionRepo == nil {
+		return nil, nil
+	}
+	return s.sessionRepo.GetByIDWithRealmContext(ctx, sessionID, realmID)
+}
+
+// GetSessionByIDInRealmForShare is GetSessionByIDInRealm with FOR SHARE (waits
+// for a concurrent session end). Satisfies the sessionContextService interface.
+func (s *AuthService) GetSessionByIDInRealmForShare(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error) {
+	if s.sessionRepo == nil {
+		return nil, nil
+	}
+	return s.sessionRepo.GetByIDWithRealmContextForShare(ctx, sessionID, realmID)
+}
+
+// EndSession ends a session row; explicit reasons also sweep its OAuth tokens.
+// Satisfies the sessionContextService interface.
+func (s *AuthService) EndSession(ctx context.Context, sessionID uuid.UUID, reason string) error {
+	if s.sessionRepo == nil {
+		return nil
+	}
+	return s.sessionRepo.EndSession(ctx, sessionID, reason)
 }
 
 // GetSessionAuthMethods returns the RFC 8176 Authentication Method References

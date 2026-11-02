@@ -138,7 +138,7 @@ func (s *ImpersonationService) StartImpersonation(
 	}
 
 	// Generate tokens for target user with impersonator claim
-	accessToken, refreshToken, expiresIn, err := s.authService.GenerateImpersonationTokens(
+	accessToken, expiresIn, err := s.authService.GenerateImpersonationTokens(
 		ctx,
 		targetUser,
 		roles,
@@ -163,7 +163,6 @@ func (s *ImpersonationService) StartImpersonation(
 	return &models.ImpersonationResponse{
 		ImpersonationSessionID: impersonationSession.ID.String(),
 		AccessToken:            accessToken,
-		RefreshToken:           refreshToken,
 		ExpiresIn:              expiresIn,
 		TokenType:              "Bearer",
 		TargetUser:             targetUser,

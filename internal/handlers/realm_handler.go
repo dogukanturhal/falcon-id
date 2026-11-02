@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -272,6 +273,121 @@ func (h *RealmHandler) UpdateSecurityPolicy(c *gin.Context) {
 	h.logAudit(c, id, "realm.security_policy.updated", "security_policy", nil, nil)
 
 	c.JSON(http.StatusOK, policy.ToResponse())
+}
+
+// ==================== Device Witness Policy ====================
+
+type deviceWitnessPolicy struct {
+	// DeviceWitnessTOTPAllowed lets platform admins without a passkey witness
+	// ZTNA device enrollment with an authenticator-app code (also requires
+	// the FALCON_WITNESS_TOTP_ENABLED kill switch).
+	DeviceWitnessTOTPAllowed bool `json:"device_witness_totp_allowed"`
+}
+
+// GetDeviceWitnessPolicy returns the realm's device-witness policy.
+// GET /api/v1/platform/realms/:id/device-witness-policy
+func (h *RealmHandler) GetDeviceWitnessPolicy(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRealmID})
+		return
+	}
+	allowed, err := h.realmService.GetDeviceWitnessTOTPAllowed(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, services.ErrWitnessPolicyUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, deviceWitnessPolicy{DeviceWitnessTOTPAllowed: allowed})
+}
+
+// UpdateDeviceWitnessPolicy sets the realm's device-witness policy.
+// PUT /api/v1/platform/realms/:id/device-witness-policy
+func (h *RealmHandler) UpdateDeviceWitnessPolicy(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRealmID})
+		return
+	}
+	var req struct {
+		DeviceWitnessTOTPAllowed *bool `json:"device_witness_totp_allowed" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRequestBody, "details": err.Error()})
+		return
+	}
+	if err := h.realmService.SetDeviceWitnessTOTPAllowed(c.Request.Context(), id, *req.DeviceWitnessTOTPAllowed); err != nil {
+		if errors.Is(err, services.ErrWitnessPolicyUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.logAudit(c, id, "realm.device_witness_policy.updated", "device_witness_policy", nil, nil)
+	c.JSON(http.StatusOK, deviceWitnessPolicy{DeviceWitnessTOTPAllowed: *req.DeviceWitnessTOTPAllowed})
+}
+
+// ==================== Session Policy ====================
+
+type sessionPolicy struct {
+	// SessionAbsoluteTTLSeconds caps the SSO session lifetime (from sign-in)
+	// for users of the realm. null = global default.
+	SessionAbsoluteTTLSeconds *int `json:"session_absolute_ttl_seconds"`
+}
+
+// GetSessionPolicy returns the realm's SSO session policy.
+// GET /api/v1/platform/realms/:id/session-policy
+func (h *RealmHandler) GetSessionPolicy(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRealmID})
+		return
+	}
+	secs, err := h.realmService.GetSessionAbsoluteTTL(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, services.ErrWitnessPolicyUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, sessionPolicy{SessionAbsoluteTTLSeconds: secs})
+}
+
+// UpdateSessionPolicy sets the realm's SSO session policy. The field must be
+// present; null restores the global default, otherwise 1h..90d in seconds.
+// PUT /api/v1/platform/realms/:id/session-policy
+func (h *RealmHandler) UpdateSessionPolicy(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRealmID})
+		return
+	}
+	var req map[string]*int
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRequestBody, "details": err.Error()})
+		return
+	}
+	secs, present := req["session_absolute_ttl_seconds"]
+	if !present {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRealmInvalidRequestBody, "details": "session_absolute_ttl_seconds is required (null = default)"})
+		return
+	}
+	if err := h.realmService.SetSessionAbsoluteTTL(c.Request.Context(), id, secs); err != nil {
+		if errors.Is(err, services.ErrWitnessPolicyUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	h.logAudit(c, id, "realm.session_policy.updated", "session_policy", nil, nil)
+	c.JSON(http.StatusOK, sessionPolicy{SessionAbsoluteTTLSeconds: secs})
 }
 
 // ==================== Identity Providers ====================

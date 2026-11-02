@@ -1,0 +1,1 @@
+{"type":"https://docs.example.com/errors/forbidden","title":"Access denied","status":403,"detail":"This document requires approval by a different eligible user.","instance":"/api/v1/mm/purchase-orders/33333333-3333-3333-3333-333333333333/actions/approve","code":"separation_of_duties_violation","traceId":"approval-fixture","documentType":"purchase_order","otherApproverCount":1}

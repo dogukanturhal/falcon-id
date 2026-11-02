@@ -68,11 +68,62 @@ func TestRequirePlatformAdmin_ValidPlatformAdmin_Passes(t *testing.T) {
 		TenantID:        hexxlockTenantID,
 		Username:        "platform-admin",
 		IsPlatformAdmin: true,
+		Roles:           []string{"platform_admin"},
 	}
 	m := newAuthMW()
 
 	w := runRequest(injectUser(user), m.RequirePlatformAdmin(), okHandler)
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRequirePlatformAdmin_ValidIAMAdmin_Passes(t *testing.T) {
+	user := &models.CurrentUser{
+		ID:              uuid.New(),
+		TenantID:        hexxlockTenantID,
+		Username:        "iam-admin",
+		IsPlatformAdmin: true,
+		Roles:           []string{"iam_admin"},
+	}
+	m := newAuthMW()
+
+	w := runRequest(injectUser(user), m.RequirePlatformAdmin(), okHandler)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// SECURITY (R0 audit finding F1): tenant membership in exampletenant is
+// NOT sufficient on its own — an internal-tenant account with no
+// platform-plane role (e.g. a service/integration account, or a customer
+// tenant admin whose "admin" role name happens to satisfy the OLD, broken
+// check) must be denied.
+func TestRequirePlatformAdmin_InternalTenantWithoutPlatformRole_Returns403(t *testing.T) {
+	user := &models.CurrentUser{
+		ID:              uuid.New(),
+		TenantID:        hexxlockTenantID,
+		Username:        "payment-provider-sync",
+		IsPlatformAdmin: true, // server-computed from tenant membership alone
+		Roles:           []string{"payment-provider-sync-admin"},
+	}
+	m := newAuthMW()
+
+	w := runRequest(injectUser(user), m.RequirePlatformAdmin(), okHandler)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// SECURITY (R0 audit): a customer tenant's own "admin" role holder must
+// never reach platform-plane routes, even if IsPlatformAdmin were somehow
+// mis-set (defense in depth — tenant check + role check both apply).
+func TestRequirePlatformAdmin_CustomerTenantAdminRole_Returns403(t *testing.T) {
+	user := &models.CurrentUser{
+		ID:              uuid.New(),
+		TenantID:        uuid.New(), // a customer tenant, not exampletenant
+		Username:        "customer-tenant-admin",
+		IsPlatformAdmin: false,
+		Roles:           []string{"admin"},
+	}
+	m := newAuthMW()
+
+	w := runRequest(injectUser(user), m.RequirePlatformAdmin(), okHandler)
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 func TestRequirePlatformAdmin_NoUserInContext_Returns401(t *testing.T) {
@@ -201,6 +252,7 @@ func TestRequireTenantAdminOrPlatformAdmin_PlatformAdmin_Passes(t *testing.T) {
 		TenantID:        hexxlockTenantID,
 		Username:        "plat-admin",
 		IsPlatformAdmin: true,
+		Roles:           []string{"platform_admin"},
 	}
 	m := newAuthMW()
 

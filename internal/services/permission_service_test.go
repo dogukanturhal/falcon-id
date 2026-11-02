@@ -754,3 +754,141 @@ func TestPermissionService_Delete_NoSyncer_Succeeds(t *testing.T) {
 
 	require.NoError(t, err)
 }
+
+// ---------------------------------------------------------------------------
+// TestPermissionService_getEntitledModules / ListForTenant / etc. — fail-closed
+//
+// spec 23 §1.4: an entitlement-repo outage must never make the permission
+// catalog show everything. A per-module check error excludes that module; a
+// repo-level error (can't even list modules) returns an empty set plus an
+// error rather than falling back to "all modules".
+// ---------------------------------------------------------------------------
+
+func TestPermissionService_GetEntitledModules_TableDriven(t *testing.T) {
+	tenantID := uuid.New()
+
+	tests := []struct {
+		name            string
+		noChecker       bool
+		modulesErr      error
+		entitlementFunc func(module string) (bool, error)
+		wantModules     []string
+		wantErr         bool
+	}{
+		{
+			name:      "no entitlement checker wired: nil,nil signals unfiltered fallback",
+			noChecker: true,
+		},
+		{
+			name:       "repo error listing modules: fail-closed, empty set + error",
+			modulesErr: errors.New("postgres unavailable"),
+			wantErr:    true,
+		},
+		{
+			name: "per-module entitlement check error: module excluded (fail-closed)",
+			entitlementFunc: func(module string) (bool, error) {
+				if module == "crm" {
+					return false, errors.New("redis unavailable")
+				}
+				return module == "hr", nil
+			},
+			wantModules: []string{"core", "iam", "hr"},
+		},
+		{
+			name: "happy path: entitled modules returned, non-entitled excluded",
+			entitlementFunc: func(module string) (bool, error) {
+				return module == "hr", nil
+			},
+			wantModules: []string{"core", "iam", "hr"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := new(mockPermissionServiceRepo)
+			svc := newPermissionServiceForTest(t, repo)
+
+			if tt.noChecker {
+				modules, err := svc.getEntitledModules(ctx, tenantID)
+				assert.NoError(t, err)
+				assert.Nil(t, modules)
+				return
+			}
+
+			if tt.modulesErr != nil {
+				repo.On("GetModules", ctx).Return(nil, tt.modulesErr)
+			} else {
+				repo.On("GetModules", ctx).Return([]string{"crm", "hr"}, nil)
+			}
+
+			checker := &funcEntitlementChecker{fn: tt.entitlementFunc}
+			svc.SetModuleEntitlementChecker(checker)
+
+			modules, err := svc.getEntitledModules(ctx, tenantID)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Empty(t, modules)
+				return
+			}
+			assert.NoError(t, err)
+			assert.ElementsMatch(t, tt.wantModules, modules)
+		})
+	}
+}
+
+// funcEntitlementChecker adapts a plain function to ModuleEntitlementChecker
+// for table-driven tests.
+type funcEntitlementChecker struct {
+	fn func(module string) (bool, error)
+}
+
+func (f *funcEntitlementChecker) IsTenantEntitled(_ context.Context, _ uuid.UUID, module string) (bool, error) {
+	return f.fn(module)
+}
+
+func TestPermissionService_ListForTenant_EntitlementRepoError_FailsClosed(t *testing.T) {
+	ctx := context.Background()
+	tenantID := uuid.New()
+	repo := new(mockPermissionServiceRepo)
+	svc := newPermissionServiceForTest(t, repo)
+
+	repo.On("GetModules", ctx).Return(nil, errors.New("postgres unavailable"))
+	svc.SetModuleEntitlementChecker(&funcEntitlementChecker{fn: func(string) (bool, error) { return true, nil }})
+
+	result, err := svc.ListForTenant(ctx, tenantID)
+
+	assert.Error(t, err, "an entitlement-check outage must be surfaced as an error, not silently return everything")
+	assert.Nil(t, result)
+	repo.AssertNotCalled(t, "List", mock.Anything)
+}
+
+func TestPermissionService_ListForTenant_NoEntitlementChecker_FallsBackToAll(t *testing.T) {
+	ctx := context.Background()
+	tenantID := uuid.New()
+	repo := new(mockPermissionServiceRepo)
+	svc := newPermissionServiceForTest(t, repo)
+
+	repo.On("List", ctx).Return([]models.Permission{{Module: "crm", Resource: "contacts", Action: "read", Name: "crm:contacts:read"}}, nil)
+
+	result, err := svc.ListForTenant(ctx, tenantID)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Len(t, result.Permissions, 1)
+}
+
+func TestPermissionService_ListModulesForTenant_EntitlementRepoError_FailsClosed(t *testing.T) {
+	ctx := context.Background()
+	tenantID := uuid.New()
+	repo := new(mockPermissionServiceRepo)
+	svc := newPermissionServiceForTest(t, repo)
+
+	repo.On("GetModules", ctx).Return(nil, errors.New("postgres unavailable"))
+	svc.SetModuleEntitlementChecker(&funcEntitlementChecker{fn: func(string) (bool, error) { return true, nil }})
+
+	modules, err := svc.ListModulesForTenant(ctx, tenantID)
+
+	assert.Error(t, err)
+	assert.Empty(t, modules)
+}

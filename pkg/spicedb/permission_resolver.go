@@ -221,6 +221,7 @@ var moduleRegistry = map[string]bool{
 	"inventory":  true,
 	"invoicing":  true,
 	"pm":         true,
+	"projects":   true, // RPM WP-22: the PM permission module key (IModule.Id stays pm); pm stays for old grants until the rename tool has run
 	"marketing":  true,
 
 	// SAP-style modules

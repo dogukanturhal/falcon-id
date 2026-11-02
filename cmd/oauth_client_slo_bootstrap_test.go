@@ -50,8 +50,8 @@ func (m *mockSeedRepo) Update(ctx context.Context, client *models.OAuthClient) e
 // applyOAuthClientSLODesired would converge on for svc-talon —
 // matching the matrix exactly. Used to assert idempotency.
 func newSvcTalonRowAtSteady() *models.OAuthClient {
-	bcl := "https://internal.example.com/auth/backchannel-logout"
-	fcl := "https://internal.example.com/auth/frontchannel-logout"
+	bcl := "https://auth.internal.example.com/auth/backchannel-logout"
+	fcl := "https://auth.internal.example.com/auth/frontchannel-logout"
 	return &models.OAuthClient{
 		ID:                                uuid.New(),
 		ClientID:                          "svc-talon",
@@ -92,8 +92,8 @@ func TestApplyOAuthClientSLODesired_FirstRunPatchesEverything(t *testing.T) {
 		// load-bearing fields converged.
 		require.NotNil(t, c.BackchannelLogoutURI, "BCL URI must be patched")
 		require.NotNil(t, c.FrontchannelLogoutURI, "FCL URI must be patched")
-		assert.Equal(t, "https://internal.example.com/auth/backchannel-logout", *c.BackchannelLogoutURI)
-		assert.Equal(t, "https://internal.example.com/auth/frontchannel-logout", *c.FrontchannelLogoutURI)
+		assert.Equal(t, "https://auth.internal.example.com/auth/backchannel-logout", *c.BackchannelLogoutURI)
+		assert.Equal(t, "https://auth.internal.example.com/auth/frontchannel-logout", *c.FrontchannelLogoutURI)
 		assert.True(t, c.BackchannelLogoutSessionRequired)
 		assert.True(t, c.FrontchannelLogoutSessionRequired)
 		assert.Equal(t, 900, c.AccessTokenLifetime)

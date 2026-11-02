@@ -128,12 +128,12 @@ func (s *WebAuthnService) SetCAEPEmitter(em *CAEPEmitter) {
 
 // WebAuthnConfig wires the relying-party identity to the service.
 //
-//   - RPID is the eTLD+1 root (e.g. "hexxlock.com"). It is immutable per
+//   - RPID is the eTLD+1 root (e.g. "example.com"). It is immutable per
 //     credential — every previously-registered passkey is bound to this
 //     value. Changing RPID after credentials exist invalidates all of them.
 //   - RPDisplayName is shown by the authenticator UI during ceremony prompts.
 //   - RPOrigins MUST cover every host running the login or accounts UI
-//     (e.g. "https://accounts.hexxlock.com", "https://id.hexxlock.com").
+//     (e.g. "https://accounts.example.com", "https://id.example.com").
 //     Subdomains of RPID are not auto-trusted; they must be listed.
 type WebAuthnConfig struct {
 	RPID          string

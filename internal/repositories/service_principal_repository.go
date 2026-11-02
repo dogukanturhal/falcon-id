@@ -148,13 +148,27 @@ func (r *ServicePrincipalRepository) ListByTenant(ctx context.Context, tenantID 
 
 // ListTenantInventory returns a credential-free tenant-scoped projection.
 // The global List method remains the platform administration surface.
+//
+// Tenant API keys (iam_api_keys, kind 'tenant') are machine principals too:
+// they are listed alongside service principals with the display name
+// "API anahtarı: <name>" and kind "api_key".
 func (r *ServicePrincipalRepository) ListTenantInventory(ctx context.Context, tenantID uuid.UUID, page, pageSize int) ([]models.TenantMachinePrincipal, int64, error) {
+	const union = `
+		SELECT id, name, status, created_at, 'service_principal' AS kind, 'iam_service_principals' AS source
+		FROM iam_service_principals WHERE tenant_id = $1
+		UNION ALL
+		SELECT id, 'API anahtarı: ' || name,
+		       CASE WHEN revoked_at IS NOT NULL OR NOT COALESCE(is_active, TRUE) THEN 'revoked'
+		            WHEN expires_at IS NOT NULL AND expires_at <= NOW() THEN 'expired'
+		            ELSE 'active' END,
+		       created_at, 'api_key', 'iam_api_keys'
+		FROM iam_api_keys WHERE tenant_id = $1 AND kind = 'tenant'`
 	var total int64
-	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM iam_service_principals WHERE tenant_id = $1`, tenantID).Scan(&total); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM (`+union+`) m`, tenantID).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count tenant service principals: %w", err)
 	}
-	rows, err := r.pool.Query(ctx, `SELECT id, name, status, created_at FROM iam_service_principals
-		WHERE tenant_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`, tenantID, pageSize, (page-1)*pageSize)
+	rows, err := r.pool.Query(ctx, `SELECT id, name, status, created_at, kind, source FROM (`+union+`) m
+		ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`, tenantID, pageSize, (page-1)*pageSize)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list tenant service principals: %w", err)
 	}
@@ -162,10 +176,9 @@ func (r *ServicePrincipalRepository) ListTenantInventory(ctx context.Context, te
 	items := make([]models.TenantMachinePrincipal, 0)
 	for rows.Next() {
 		var item models.TenantMachinePrincipal
-		if err := rows.Scan(&item.ID, &item.Name, &item.Status, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.Status, &item.CreatedAt, &item.Kind, &item.Source); err != nil {
 			return nil, 0, fmt.Errorf("scan tenant service principal: %w", err)
 		}
-		item.Kind, item.Source = "service_principal", "iam_service_principals"
 		items = append(items, item)
 	}
 	return items, total, rows.Err()

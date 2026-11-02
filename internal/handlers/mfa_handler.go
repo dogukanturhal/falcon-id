@@ -16,6 +16,7 @@ import (
 	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
+	redispkg "github.com/dogukanturhal/falcon-id/pkg/redis"
 )
 
 const (
@@ -24,11 +25,18 @@ const (
 
 // MFAHandler is an exported type.
 type MFAHandler struct {
-	mfaService  *services.MFAService
-	stepUpRepo  *repositories.StepUpVerificationRepository
-	sessionRepo *repositories.SessionRepository
-	logger      *zap.Logger
+	mfaService   *services.MFAService
+	stepUpRepo   *repositories.StepUpVerificationRepository
+	sessionRepo  *repositories.SessionRepository
+	sessionCache *redispkg.SessionCache
+	logger       *zap.Logger
+	// platformPasskeyOnly mirrors PLATFORM_ADMIN_REQUIRE_PHISHING_RESISTANT_MFA:
+	// platform admins may not step up with TOTP/email codes.
+	platformPasskeyOnly bool
 }
+
+// SetPlatformPasskeyOnly enables the platform-admin passkey-only step-up rule.
+func (h *MFAHandler) SetPlatformPasskeyOnly(on bool) { h.platformPasskeyOnly = on }
 
 // NewMFAHandler is an exported function.
 func NewMFAHandler(mfaService *services.MFAService) *MFAHandler {
@@ -57,6 +65,7 @@ func (h *MFAHandler) SetStepUpRepo(repo *repositories.StepUpVerificationReposito
 func (h *MFAHandler) SetSessionRepo(repo *repositories.SessionRepository) {
 	h.sessionRepo = repo
 }
+func (h *MFAHandler) SetSessionCache(cache *redispkg.SessionCache) { h.sessionCache = cache }
 
 // elevateCurrentSessionAMR appends an RFC 8176 authentication-method
 // reference (typically "mfa") to the request's session.AuthMethodsUsed if a
@@ -390,11 +399,16 @@ func (h *MFAHandler) SendMFACode(c *gin.Context) {
 			zap.String("user_id", user.ID.String()),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondMFAFlowError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Verification code sent to your email"})
+	status, err := h.mfaService.GetMFAStatus(c.Request.Context(), user.ID)
+	if err != nil {
+		respondMFAFlowError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Verification code sent to your email", "masked_email": status.MaskedEmail, "expires_in_seconds": status.EmailCodeTTL, "resend_after_seconds": 60})
 }
 
 // VerifyMFACode verifies an MFA code
@@ -696,9 +710,18 @@ func (h *MFAHandler) VerifyStepUp(c *gin.Context) {
 		return
 	}
 
+	if h.platformPasskeyOnly && middleware.IsPasskeyBoundPlatformAdmin(user) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   middleware.ErrCodePhishingResistantMFARequired,
+			"message": "Platform admins must step up with a passkey",
+		})
+		return
+	}
+
 	var req struct {
 		Code   string `json:"code" binding:"required,min=1,max=20"`
 		Action string `json:"action" binding:"required,min=1,max=100"`
+		Method string `json:"method" binding:"omitempty,oneof=totp email backup_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: code and action are required"})
@@ -706,19 +729,34 @@ func (h *MFAHandler) VerifyStepUp(c *gin.Context) {
 	}
 
 	// Verify the MFA code.
-	valid, err := h.mfaService.VerifyMFACode(c.Request.Context(), user.ID, req.Code)
+	valid, err := h.mfaService.VerifyMFACodeForMethod(c.Request.Context(), user.ID, req.Code, req.Method)
 	if err != nil {
 		h.logger.Error("Step-up MFA verification failed",
 			zap.String("user_id", user.ID.String()),
 			zap.String("action", req.Action),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondMFAFlowError(c, err)
 		return
 	}
 	if !valid {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid MFA code"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Wrong code, try again", "code": "mfa_code_invalid"})
 		return
+	}
+
+	// A spent TOTP code must not be replayable on login or the device
+	// witness (shared MFAService.ClaimTOTP namespace).
+	if req.Method == "totp" {
+		fresh, claimErr := h.mfaService.ClaimTOTP(c.Request.Context(), user.ID, req.Code)
+		if claimErr != nil {
+			h.logger.Error("Step-up TOTP replay claim failed", zap.String("user_id", user.ID.String()), zap.Error(claimErr))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "verification unavailable"})
+			return
+		}
+		if !fresh {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Wrong code, try again", "code": "mfa_code_invalid"})
+			return
+		}
 	}
 
 	// Extract session_id from context (set by RequireAuth).
@@ -735,7 +773,10 @@ func (h *MFAHandler) VerifyStepUp(c *gin.Context) {
 
 	// Record the step-up verification (5-minute TTL matches middleware config).
 	const stepUpTTL = 5 * time.Minute
-	method := "totp" // default; the MFAService.VerifyMFACode auto-detects method
+	method := req.Method
+	if method == "" {
+		method = "mfa"
+	} // Legacy clients did not select a method.
 	if err := h.stepUpRepo.RecordVerification(c.Request.Context(), sessionID, user.ID, req.Action, method, stepUpTTL); err != nil {
 		h.logger.Error("Failed to record step-up verification",
 			zap.String("user_id", user.ID.String()),
@@ -760,7 +801,12 @@ func (h *MFAHandler) VerifyStepUp(c *gin.Context) {
 	// /auth/mfa/challenge redirect even after a successful step-up — the
 	// session is unchanged. Append "mfa" to the AMR so the next /authorize
 	// passes the `requiresMFA(acr) && !contains(amr,"mfa")` gate.
-	h.elevateCurrentSessionAMR(c, "mfa")
+	if h.sessionRepo != nil {
+		if _, err := h.sessionRepo.AppendAuthMethod(c.Request.Context(), sessionID, "mfa"); err != nil {
+			respondMFAFlowError(c, err)
+			return
+		}
+	}
 
 	// Bump iam_sessions.authenticated_at so RequireFreshAuth (RFC 9470
 	// max_age check) on the RETRIED sensitive endpoint sees a fresh
@@ -786,7 +832,12 @@ func (h *MFAHandler) VerifyStepUp(c *gin.Context) {
 				zap.String("action", req.Action),
 				zap.Error(err),
 			)
+			respondMFAFlowError(c, err)
+			return
 		}
+	}
+	if !refreshStepUpIdpSession(c, h.sessionCache) {
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{

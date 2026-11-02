@@ -6,7 +6,7 @@ version: 0.2.0
 appVersion: "0.1.0"
 maintainers:
   - name: HexxLock Platform Team
-    email: platform@hexxlock.com
+    email: platform@example.com
 keywords:
   - identity
   - oidc

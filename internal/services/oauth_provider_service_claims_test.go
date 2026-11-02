@@ -74,6 +74,7 @@ func subjectUser() *models.User {
 		TenantID: uuid.New(),
 		Username: "admin@example.com",
 		Email:    "admin@example.com",
+		IsActive: true,
 	}
 }
 

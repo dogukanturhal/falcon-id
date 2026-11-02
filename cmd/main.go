@@ -31,8 +31,8 @@ import (
 // @version 1.0.0
 // @description Falcon ID — Identity & Access Management for Hexxlock Technologies. Provides authentication, authorization, user management, role-based access control, multi-factor authentication, social login, SAML/OIDC federation, and compliance features.
 // @contact.name Hexxlock API Support
-// @contact.email api-support@hexxlock.com
-// @host falcon.hexxlock.com
+// @contact.email dogukanturhal@hexxlock.com
+// @host falcon.example.com
 // @BasePath /api/v1
 // @schemes http https
 // @securityDefinitions.apikey BearerAuth
@@ -88,7 +88,7 @@ func main() {
 	//      ServiceClientClaim provisioning chain breaks at the head.
 	//      Independent of the realm/admin chain — safe to run before
 	//      either, but kept in this position to keep all seed steps
-	//      grouped. Per memory internal engineering notes
+	//      grouped. Per operational notes
 	//      — survives falcon-id-pg fresh-initdb without operator
 	//      intervention (replaces the legacy bash bootstrap-job.yaml's
 	//      create flow, which is blocked by risk-MFA login interrupt
@@ -139,6 +139,27 @@ func main() {
 		if err != nil {
 			logger.Fatal("IAM self-registration failed; refusing to serve protected routes", zap.Error(err))
 		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		err = selfRegisterCorePermissions(ctx, services.Permission)
+		cancel()
+		if err != nil {
+			logger.Fatal("core permission self-registration failed; refusing to serve protected routes", zap.Error(err))
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		err = selfRegisterAccountPermissions(ctx, services.Permission)
+		cancel()
+		if err != nil {
+			logger.Fatal("account permission self-registration failed; refusing to serve protected routes", zap.Error(err))
+		}
+
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		err = selfRegisterAcmeAppReservedPermissions(ctx, services.Permission)
+		cancel()
+		if err != nil {
+			logger.Fatal("AcmeApp reserved permission self-registration failed; refusing to serve protected routes", zap.Error(err))
+		}
 	}
 
 	handlers := initHandlers(services, repos, infra)
@@ -161,23 +182,23 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.Info("Shutting down server...")
-	backgroundTasks.Stop(services)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Error("Server forced to shutdown", zap.Error(err))
-	}
-
-	if pprofSrv != nil {
-		if err := pprofSrv.Shutdown(ctx); err != nil {
-			logger.Warn("pprof listener forced to shutdown", zap.Error(err))
-		}
-	}
-
-	shutdownTracing(ctx, infra)
+	logger.Info("Shutdown signal received")
+	gracefulShutdown(
+		durationFromEnv("SHUTDOWN_DRAIN_DELAY", defaultShutdownDrainDelay),
+		durationFromEnv("SHUTDOWN_TIMEOUT", defaultShutdownTimeout),
+		time.Sleep,
+		func(ctx context.Context) error {
+			err := srv.Shutdown(ctx)
+			if pprofSrv != nil {
+				if perr := pprofSrv.Shutdown(ctx); perr != nil {
+					logger.Warn("pprof listener forced to shutdown", zap.Error(perr))
+				}
+			}
+			return err
+		},
+		func() { backgroundTasks.Stop(services) },
+		func(ctx context.Context) { shutdownTracing(ctx, infra) },
+	)
 	logger.Info("Server exited")
 }
 
@@ -297,12 +318,104 @@ func selfRegisterPermissions(ctx context.Context, permSvc *services.PermissionSe
 			{Resource: "realms", Actions: []string{"create", "read", "update", "delete", "configure"}, Description: "Realm configuration"},
 			{Resource: "oauth-clients", Actions: []string{"create", "read", "update", "delete", "rotate_secret"}, Description: "OIDC/OAuth client registration"},
 			{Resource: "api-keys", Actions: []string{"create", "read", "update", "delete", "rotate"}, Description: "API key management"},
+			// WO#20 developer access: tenant-facing API keys and webhooks.
+			// Distinct from the platform-admin "api-keys" resource above.
+			{Resource: "api_keys", Actions: []string{"read", "manage"}, Description: "Tenant API keys (developer access)"},
+			{Resource: "webhooks", Actions: []string{"read", "manage"}, Description: "Tenant webhook endpoints (developer access)"},
 			{Resource: "audit-logs", Actions: []string{"read", "export"}, Description: "Security audit trail"},
 			{Resource: "mfa", Actions: []string{"configure", "enforce", "reset"}, Description: "Multi-factor authentication policies"},
 			{Resource: "saml", Actions: []string{"create", "read", "update", "delete", "configure"}, Description: "SAML identity provider federation"},
 			{Resource: "ldap", Actions: []string{"create", "read", "update", "delete", "configure", "sync"}, Description: "LDAP/Active Directory integration"},
 			{Resource: "scim", Actions: []string{"configure", "read"}, Description: "SCIM provisioning"},
 			{Resource: "password-policies", Actions: []string{"read", "configure"}, Description: "Password strength and rotation policies"},
+		},
+	}
+	_, err := permSvc.RegisterModule(ctx, req)
+	return err
+}
+
+// selfRegisterCorePermissions registers the "core" permission namespace.
+//
+// t-acmeapp-rbac (2026-09-18): cmd/routes.go gates the exact endpoints that
+// back Settings -> Team (GET /roles, GET /users, GET /permissions and their
+// children — permCoreUsersRead/permCoreRolesRead/permCorePermsRead) on
+// "core:users:read" / "core:roles:read" / "core:permissions:read". Until this
+// function existed, selfRegisterPermissions above only ever registered the
+// SAME resources under the "iam" module ("iam:users:read", "iam:roles:read",
+// ...) — "core:*" was never written to iam_permissions. Consequence: no role
+// could ever be granted "core:roles:read" through the normal Create/
+// AssignPermissions flow (the permission_id lookup has nothing to find), so
+// GET /roles — the exact call Settings -> Team's useRoles() hook makes —
+// could never be satisfied by any role built through the product's own role
+// management UI. The only tenant observed with a working "core:roles:read"
+// grant got there via an out-of-band SpiceDB tuple, never round-tripped
+// through iam_permissions/iam_roles.
+//
+// This is purely additive: it does not touch the existing "iam:*" catalog
+// rows or any already-granted SpiceDB relationship (RegisterPermissionsBatch
+// is idempotent/upsert), so it cannot regress a tenant that is already
+// working. It just makes "core:roles:read" etc. a real, assignable catalog
+// entry going forward.
+func selfRegisterCorePermissions(ctx context.Context, permSvc *services.PermissionService) error {
+	req := &models.RegisterModuleRequest{
+		Module: "core",
+		Permissions: []models.PermissionDefinition{
+			{Resource: "users", Actions: []string{"read", "update"}, Description: "Tenant user directory (core:* mirror of iam:users, matches cmd/routes.go gating)"},
+			{Resource: "roles", Actions: []string{"read", "create", "update", "delete"}, Description: "Tenant role management (core:* mirror of iam:roles, matches cmd/routes.go gating)"},
+			{Resource: "permissions", Actions: []string{"read"}, Description: "Permission catalog visibility (core:* mirror of iam:permissions, matches cmd/routes.go gating)"},
+		},
+	}
+	_, err := permSvc.RegisterModule(ctx, req)
+	return err
+}
+
+// selfRegisterAccountPermissions registers the "account" permission namespace.
+//
+// cmd/routes.go gates the SoD rule/violation routes on account:sod:manage
+// (permAccountSoDManage), but nothing ever wrote that name to iam_permissions,
+// so no role could be granted it and even a tenant Owner got 403 on
+// Settings -> Team -> SoD. It is the only account:* permission any route or
+// the AcmeWeb frontend checks today. AcmeAppRoleCatalog grants it to Owner and
+// Admin only; the startup reconcile tops existing tenants up from that catalog.
+func selfRegisterAccountPermissions(ctx context.Context, permSvc *services.PermissionService) error {
+	req := &models.RegisterModuleRequest{
+		Module: "account",
+		Permissions: []models.PermissionDefinition{
+			{Resource: "sod", Actions: []string{"manage"}, Description: "Segregation of duties: manage tenant SoD rules and review violations (matches cmd/routes.go gating)"},
+		},
+	}
+	_, err := permSvc.RegisterModule(ctx, req)
+	return err
+}
+
+// selfRegisterAcmeAppReservedPermissions registers RESERVED, not-yet-enforced
+// permission names for the two capabilities the AcmeApp RBAC role model
+// (t-acmeapp-rbac, 2026-09-18) needs a home for but that have no backend
+// enforcement point in falcon-id or the `business` service today:
+//
+//   - core:billing:read / manage / request and core:billing_profile:update —
+//     tenant billing. Enforcement lives in the commerce services
+//     (subscription-management, billing, payment-gateway), not falcon-id;
+//     falcon-id only owns the names and the role grants.
+//   - core:reports:read — the report-builder surface lives in
+//     platform-content (out of falcon-id's ownership) and was not verified
+//     as part of this change; reserved for the same reason.
+//
+// Registering these does not create a false impression of enforcement: they
+// are additive catalog rows, gate nothing by themselves, and are called out
+// explicitly in the AcmeApp role-model design notes as reserved-not-enforced.
+func selfRegisterAcmeAppReservedPermissions(ctx context.Context, permSvc *services.PermissionService) error {
+	req := &models.RegisterModuleRequest{
+		Module: "core",
+		Permissions: []models.PermissionDefinition{
+			{Resource: "billing", Actions: []string{"read", "manage", "request"}, Description: "AcmeApp tenant subscription/billing: read, manage (direct change and approve/reject), request (ask Owner/Admin to approve a change)"},
+			{Resource: "billing_profile", Actions: []string{"update"}, Description: "AcmeApp tenant invoice profile (invoice name, tax id, address) edits"},
+			{Resource: "reports", Actions: []string{"read"}, Description: "RESERVED: report-builder read access — owned by platform-content, not verified/enforced here (t-acmeapp-rbac)"},
+			// Enforced by the `business` service (IModulePermissionAuthorizer on
+			// /api/core/settings/*), which checks the SpiceDB access_grant for
+			// these names. They must be real catalog rows so AcmeAppRoleCatalog
+			// can grant them to the AcmeApp system roles.
+			{Resource: "settings", Actions: []string{"read", "update"}, Description: "Tenant settings (Settings pages, e.g. Approvals) - enforced by the business service"},
 		},
 	}
 	_, err := permSvc.RegisterModule(ctx, req)

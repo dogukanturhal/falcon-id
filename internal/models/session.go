@@ -27,8 +27,8 @@ type Session struct {
 	CountryCode *string `json:"country_code,omitempty" db:"country_code"`
 
 	// Edge-stamped geo enrichment added in platform migration
-	// v0.232.246 — sourced from the `id-hexxlock-geo-stamp` Cloudflare
-	// Worker (infrastructure-iac MR-114) which reads request.cf at
+	// v0.232.246 — sourced from the `geo-stamp` Cloudflare
+	// Worker (the edge infrastructure repository) which reads request.cf at
 	// edge time and stamps X-Geo-* request headers. falcon-id's
 	// middleware.ClientGeo reads those, clientctx.WithGeo propagates
 	// onto the request ctx, and createSession persists below.
@@ -36,7 +36,7 @@ type Session struct {
 	// All fields nullable: pre-migration rows have no values; sessions
 	// created while the Worker is not in path (local-dev, internal
 	// service calls, future non-Cloudflare ingress) also have no
-	// values. Display surface (accounts.hexxlock.com Login History)
+	// values. Display surface (accounts.example.com Login History)
 	// handles each field as optional.
 	//
 	// ASN: numeric AS number kept as string to round-trip CF's wire
@@ -209,4 +209,29 @@ func (s *SessionWithUser) ToResponse(currentSessionID *uuid.UUID) *SessionRespon
 	resp := s.Session.ToResponse(currentSessionID)
 	resp.Username = s.Username
 	return resp
+}
+
+// Non-explicit iam_sessions.end_reason values: the SSO session lapsed or was
+// swapped for a fresh one without anyone ending it. Refresh tokens bound to
+// such a session stay valid (they carry their own lifetime); every other
+// reason (logout, revoked, password_change, ...) is an explicit end.
+const (
+	SessionEndReasonExpired            = "expired"
+	SessionEndReasonInactivityTimeout  = "inactivity_timeout"
+	SessionEndReasonRegenerated        = "session_regenerated"
+	SessionEndReasonRegeneratedOnLogin = "session_regenerated_on_login"
+)
+
+// IsExplicitSessionEnd reports whether a session ended for a reason that must
+// also terminate the refresh tokens bound to it. Fail-closed: an unknown or
+// future reason counts as explicit, only the lapse/rotation reasons above do not.
+func IsExplicitSessionEnd(endReason string) bool {
+	switch endReason {
+	case SessionEndReasonExpired,
+		SessionEndReasonInactivityTimeout,
+		SessionEndReasonRegenerated,
+		SessionEndReasonRegeneratedOnLogin:
+		return false
+	}
+	return true
 }

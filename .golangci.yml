@@ -4,27 +4,59 @@ linters:
   enable:
     - errcheck
     - bodyclose
-
-linters-settings:
-  errcheck:
-    exclude-functions:
-      - (*database/sql.DB).Close
-      - (*database/sql.Rows).Close
-      - (*database/sql.Stmt).Close
-      - (*database/sql.Tx).Rollback
-      - (*net/http.Response).Body.Close
-      - (io.Closer).Close
-      - (*os.File).Close
-      - (*github.com/jackc/pgx/v5/pgxpool.Pool).Close
-      - (*github.com/redis/go-redis/v9.Client).Close
-      - (*github.com/redis/go-redis/v9.PubSub).Close
-      - (*go.uber.org/zap.Logger).Sync
-      - (*text/tabwriter.Writer).Flush
-      - (*encoding/csv.Writer).Write
-      - fmt.Fprintf
-      - fmt.Fprintln
-      - fmt.Fprint
-      - fmt.Sscanf
+    - staticcheck
+  exclusions:
+    rules:
+      # Unchecked errors in tests are noise, not defects.
+      - path: _test\.go
+        linters:
+          - errcheck
+  settings:
+    govet:
+      # The Go 1.26 `inline` modernizer flags reflect.Ptr (pre-existing).
+      disable:
+        - inline
+    staticcheck:
+      # staticcheck's default set minus rules that flag pre-existing style and
+      # deprecation debt (SA1019 deprecated APIs, ST1005 error capitalisation,
+      # QF* quickfix suggestions).
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1005
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -ST1023
+        - -S1002
+        - -SA1019
+        - -QF1001
+        - -QF1003
+        - -QF1006
+        - -QF1007
+        - -QF1008
+        - -QF1011
+    errcheck:
+      exclude-functions:
+        - (*database/sql.DB).Close
+        - (*database/sql.Rows).Close
+        - (*database/sql.Stmt).Close
+        - (*database/sql.Tx).Rollback
+        - (*net/http.Response).Body.Close
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*github.com/jackc/pgx/v5/pgxpool.Pool).Close
+        - (*github.com/redis/go-redis/v9.Client).Close
+        - (*github.com/redis/go-redis/v9.PubSub).Close
+        - (*go.uber.org/zap.Logger).Sync
+        - (*text/tabwriter.Writer).Flush
+        - (*encoding/csv.Writer).Write
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+        - fmt.Sscanf
 
 issues:
   max-issues-per-linter: 0

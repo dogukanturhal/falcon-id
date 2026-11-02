@@ -12,7 +12,7 @@
 //
 // In wave-2 the emit was best-effort synchronous: the HTTP POST happened
 // inline with the auth flow, and a transient receiver outage was lost.
-// Phase 6 (ADR 0040 §Phase 6, also memory internal engineering notes)
+// Phase 6 (ADR 0040 §Phase 6, also operational notes)
 // promotes emit to a PG-backed transactional outbox + a separate drainer
 // goroutine that delivers with at-least-once semantics and a 35.6-minute
 // retry budget before a row enters status='dead'.

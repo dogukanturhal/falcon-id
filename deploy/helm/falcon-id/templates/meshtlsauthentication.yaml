@@ -14,7 +14,7 @@
 #      edge-26.5.1 — verified 2026-05-09 by direct proxy-log
 #      inspection (defectdojo.monitoring matched authz.kind=default
 #      authz.name=audit despite cnpg-allow-monitoring-ns AuthZ).
-#      See internal engineering notes.
+#      See operational notes.
 #      Linkerd docs at https://linkerd.io/2-edge/reference/authorization-policy/
 #      confirm identityRefs supports ONLY kind: ServiceAccount.
 #   2. spec.identities accepts SPIFFE patterns including the namespace

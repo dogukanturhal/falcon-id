@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
@@ -42,7 +43,7 @@ type SeatQuotaReconcileStats struct {
 // seatQuotaReconcileRequest/-Result mirror quota-service's admin reconcile
 // wire contract exactly (internal/handlers/quota_handler.go's Reconcile,
 // internal/services/reconciliation_service.go's ReconciliationResult in
-// hexxlock/platform-commerce) and hexxlock/business's QuotaClient.
+// the platform-commerce service repository) and the business service repository's QuotaClient.
 // ReconcileAsync C# counterpart. Kept local to this file rather than adding
 // a Reconcile method to platform-shared/quota.QuotaClient: doing so would
 // require cutting a new platform-shared release and bumping this module's
@@ -89,7 +90,7 @@ type seatQuotaReconcileEnvelope struct {
 // never incremented quota-service). None of that can self-correct via
 // increment/decrement alone — only a periodic absolute recount from the
 // same source of truth can, regardless of which code path wrote the row.
-// This mirrors hexxlock/business's ContactsQuotaReconcilerService for the
+// This mirrors the business service repository's ContactsQuotaReconcilerService for the
 // "contacts" resource exactly, and does NOT replace the synchronous
 // check/increment/decrement path, which still gates and records in real
 // time for the common create/delete case.
@@ -269,7 +270,31 @@ func (r *SeatQuotaReconciler) Reconcile(ctx context.Context) (*SeatQuotaReconcil
 		return nil, fmt.Errorf("seat quota reconcile: count seats: %w", err)
 	}
 
-	for tenantID, count := range counts {
+	users := repositories.NewUserRepository(r.db)
+	seatCounters := repositories.NewSeatCounterRepository(r.db)
+	for tenantID := range counts {
+		// Use the same authoritative, tenant-scoped count as the internal seat endpoint.
+		// Memberships have FORCE RLS; counting without tenant scope silently bills free classes.
+		billable, err := users.CountActiveByTenant(ctx, tenantID)
+		if err != nil {
+			logger.Warn("Seat-quota reconciliation skipped tenant: billable seat count failed",
+				zap.String("tenant_id", tenantID.String()), zap.Error(err))
+			stats.Errors++
+			continue
+		}
+		count := int64(billable)
+		// tenant_seat_counters.seats_used (the invitation/reactivation gate) is recomputed from the membership
+		// ledger; a path that skipped Release/OccupyUsedSeat otherwise leaves it drifted forever. The quota-service
+		// push below keeps the iam_users-based billable count: users created outside invitations have no membership
+		// row, so the ledger alone would under-report them there.
+		if prev, actual, err := seatCounters.RecomputeUsedSeats(ctx, tenantID); err != nil {
+			logger.Warn("Seat counter recompute failed", zap.String("tenant_id", tenantID.String()), zap.Error(err))
+			stats.Errors++
+		} else if prev != actual {
+			logger.Info("Seat counter drift corrected",
+				zap.String("tenant_id", tenantID.String()), zap.Int("recorded", prev), zap.Int("actual", actual))
+		}
+
 		tenantCtx, cancel := context.WithTimeout(ctx, seatQuotaReconcileTimeout)
 		result, err := r.reconcileTenant(tenantCtx, tenantID, count)
 		cancel()
@@ -299,29 +324,13 @@ func (r *SeatQuotaReconciler) Reconcile(ctx context.Context) (*SeatQuotaReconcil
 	return stats, nil
 }
 
-// countBillableSeatsByTenant recounts, per tenant, real active users that
-// occupy a billable seat.
-//
-// Exclusions (see the SeatQuotaReconciler doc comment for the full
-// rationale):
-//   - is_active = false: deactivated/disabled accounts do not occupy a seat.
-//     Also already true for svc-payment-provider-sync today.
-//   - deletion_scheduled_at IS NOT NULL: users in their pending-deletion
-//     grace period — same condition the GET /internal/v1/tenants/:id/
-//     users/count endpoint (UserRepository.CountActiveByTenant) already
-//     uses.
-//   - username ILIKE 'svc-%': the established convention for machine/
-//     service identities recorded directly in iam_users outside the
-//     dedicated (currently empty) iam_service_accounts table. Applied even
-//     though is_active already excludes the one known instance today, so a
-//     future svc-* row left active by mistake is still not billed.
+// countBillableSeatsByTenant discovers tenants, including those whose last
+// billable user became inactive. Reconcile replaces these discovery counts with
+// UserRepository.CountActiveByTenant under each tenant's FORCE-RLS scope.
 func (r *SeatQuotaReconciler) countBillableSeatsByTenant(ctx context.Context) (map[uuid.UUID]int64, error) {
 	const query = `
 		SELECT tenant_id, COUNT(*)
 		FROM iam_users
-		WHERE is_active = true
-		  AND deletion_scheduled_at IS NULL
-		  AND username NOT ILIKE 'svc-%'
 		GROUP BY tenant_id
 	`
 

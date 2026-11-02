@@ -125,5 +125,6 @@ var knownTemplates = map[string]struct{}{
 	metrics.EmailTemplateNewDeviceSignIn:     {},
 	metrics.EmailTemplateAccountLocked:       {},
 	metrics.EmailTemplateSuspiciousLogin:     {},
+	metrics.EmailTemplateDeviceWitnessTOTP:   {},
 	TeamInvitationEmailTemplate:              {},
 }

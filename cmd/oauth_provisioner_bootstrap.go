@@ -60,7 +60,7 @@ import (
 // by ExternalSecret from a Vault path the operator wrote once at cluster
 // init. Same trust boundary as `bootstrapAdminUser` (FALCON_ADMIN_*).
 //
-// PER PROJECT MEMORY internal engineering notes
+// OPERATIONAL NOTE
 // ============================================================
 // 2026-05-07 falcon-id-pg fresh-initdb during cluster recovery wiped
 // iam_oauth_clients but Vault retained the stored credentials (Vault is
@@ -221,7 +221,7 @@ func bootstrapProvisionerOAuthClient(repos *Repositories) {
 		AllowedCORSOrigins:                []string{},
 		BackchannelLogoutSessionRequired:  false,
 		FrontchannelLogoutSessionRequired: false,
-		Contacts:                          []string{"platform-team@hexxlock.com"},
+		Contacts:                          []string{"platform-team@example.com"},
 		RequirePushedAuthorizationRequests: false,
 		CreatedAt:                          now,
 		UpdatedAt:                          now,

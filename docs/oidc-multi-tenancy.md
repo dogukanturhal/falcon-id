@@ -6,13 +6,13 @@ Falcon-ID is a **single-issuer multi-tenant** identity provider. The canonical O
 issuer for all platform and workforce SSO is:
 
 ```
-https://auth.hexxlock.com
+https://auth.example.com
 ```
 
 Customer-facing tenants receive their own subdomain
-(`<slug>.auth.hexxlock.com`) and their own Realm record. Internal platform
+(`<slug>.auth.example.com`) and their own Realm record. Internal platform
 tooling (Backstage, ArgoCD, Grafana, Atlantis, Harbor, SonarQube, …) uses
-the bare `auth.hexxlock.com` domain via the **platform tenant**.
+the bare `auth.example.com` domain via the **platform tenant**.
 
 ---
 
@@ -20,12 +20,12 @@ the bare `auth.hexxlock.com` domain via the **platform tenant**.
 
 | Endpoint | URL | Public? |
 |---|---|---|
-| OpenID Configuration | `https://auth.hexxlock.com/.well-known/openid-configuration` | Yes (RFC 8414) |
-| JWKS | `https://auth.hexxlock.com/.well-known/jwks.json` | Yes (RFC 8414) |
-| Platform JWKS (unified) | `https://auth.hexxlock.com/.well-known/platform-jwks.json` | Yes |
-| Authorization | `https://auth.hexxlock.com/oauth/authorize` | Platform tenant |
-| Token | `https://auth.hexxlock.com/oauth/token` | Platform tenant |
-| UserInfo | `https://auth.hexxlock.com/oauth/userinfo` | Authenticated |
+| OpenID Configuration | `https://auth.example.com/.well-known/openid-configuration` | Yes (RFC 8414) |
+| JWKS | `https://auth.example.com/.well-known/jwks.json` | Yes (RFC 8414) |
+| Platform JWKS (unified) | `https://auth.example.com/.well-known/platform-jwks.json` | Yes |
+| Authorization | `https://auth.example.com/oauth/authorize` | Platform tenant |
+| Token | `https://auth.example.com/oauth/token` | Platform tenant |
+| UserInfo | `https://auth.example.com/oauth/userinfo` | Authenticated |
 
 Per **RFC 8414 §3** and **OpenID Connect Discovery 1.0 §4**, the `/.well-known/*`
 paths are publicly accessible — no authentication, no `X-Tenant-ID` header, no
@@ -46,7 +46,7 @@ Defined in: `falcon-id/internal/models/well_known_ids.go`
 
 ### How it works
 
-1. A request arrives at `auth.hexxlock.com`.
+1. A request arrives at `auth.example.com`.
 2. APISIX matches the `falcon-id-platform` route (priority 5, catch-all).
 3. APISIX injects `X-Tenant-ID: 00000000-0000-0000-0000-000000000003` via the
    `proxy-rewrite` plugin before forwarding to falcon-id.
@@ -68,19 +68,19 @@ All internal tools register under the **platform tenant**
 
 ```bash
 # Obtain a platform-admin token first
-TOKEN=$(curl -s -X POST https://auth.hexxlock.com/oauth/token \
+TOKEN=$(curl -s -X POST https://auth.example.com/oauth/token \
   -H "X-Tenant-ID: 00000000-0000-0000-0000-000000000003" \
   -d "grant_type=client_credentials&client_id=<platform-admin-client>&client_secret=<secret>&scope=platform:admin" \
   | jq -r .access_token)
 
 # Register the new OIDC client
-curl -X POST https://auth.hexxlock.com/api/v1/oauth/clients \
+curl -X POST https://auth.example.com/api/v1/oauth/clients \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Tenant-ID: 00000000-0000-0000-0000-000000000003" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "backstage",
-    "redirect_uris": ["https://backstage.hexxlock.com/api/auth/oidc/handler/frame"],
+    "redirect_uris": ["https://backstage.example.com/api/auth/oidc/handler/frame"],
     "grant_types": ["authorization_code", "refresh_token"],
     "response_types": ["code"],
     "scope": "openid profile email groups"
@@ -88,7 +88,7 @@ curl -X POST https://auth.hexxlock.com/api/v1/oauth/clients \
 ```
 
 Use the returned `client_id` and `client_secret` in the tool's OIDC
-configuration. Set the issuer URL to `https://auth.hexxlock.com`.
+configuration. Set the issuer URL to `https://auth.example.com`.
 
 ### Example: Backstage `app-config.yaml`
 
@@ -98,7 +98,7 @@ auth:
   providers:
     oidc:
       production:
-        metadataUrl: https://auth.hexxlock.com/.well-known/openid-configuration
+        metadataUrl: https://auth.example.com/.well-known/openid-configuration
         clientId: ${BACKSTAGE_OIDC_CLIENT_ID}
         clientSecret: ${BACKSTAGE_OIDC_CLIENT_SECRET}
         scope: openid profile email groups
@@ -112,7 +112,7 @@ auth:
 ```yaml
 oidc.config: |
   name: HexxLock SSO
-  issuer: https://auth.hexxlock.com
+  issuer: https://auth.example.com
   clientID: $oidc.clientId
   clientSecret: $oidc.clientSecret
   requestedScopes: ["openid", "profile", "email", "groups"]
@@ -126,13 +126,13 @@ oidc.config: |
 Each enterprise or shared-tier customer is provisioned with:
 
 1. A **Realm** record (`RealmType = enterprise` or `shared`) in the database.
-2. A subdomain `<slug>.auth.hexxlock.com` pointing to APISIX.
+2. A subdomain `<slug>.auth.example.com` pointing to APISIX.
 3. An **ApisixRoute** in the customer's product namespace that injects
    `X-Tenant-ID: <customer-realm-uuid>`.
 
 Customer tokens carry `tenant_id` as a JWT claim. The OIDC issuer for
-customer tenants is `https://<slug>.auth.hexxlock.com` (separate realm,
-separate discovery document at `<slug>.auth.hexxlock.com/.well-known/openid-configuration`).
+customer tenants is `https://<slug>.auth.example.com` (separate realm,
+separate discovery document at `<slug>.auth.example.com/.well-known/openid-configuration`).
 
 ---
 
@@ -143,7 +143,7 @@ Cloudflare → Traefik (TLS) → APISIX
                                 │
               ┌─────────────────┼─────────────────────┐
               │                 │                      │
-  auth.hexxlock.com     acme.auth.hexxlock.com  ...
+  auth.example.com     acme.auth.example.com  ...
   (platform tenant)    (enterprise tenant)
               │                 │
    ┌──────────┴────────┐  ┌─────┴──────────────┐

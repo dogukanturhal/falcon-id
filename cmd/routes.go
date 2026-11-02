@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -19,6 +20,7 @@ import (
 
 	_ "github.com/dogukanturhal/falcon-id/docs"
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
+	"github.com/dogukanturhal/falcon-id/internal/shared/database"
 	sharedmiddleware "github.com/dogukanturhal/falcon-id/internal/shared/middleware"
 	sharedtracing "github.com/dogukanturhal/falcon-id/internal/shared/tracing"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
@@ -32,11 +34,21 @@ const (
 	permCoreRolesRead        = "core:roles:read"
 	permCorePermsRead        = "core:permissions:read"
 	permIAMUsersRead         = "iam:users:read"
+	permIAMUsersCreate       = "iam:users:create"
 	permIAMUsersUpdate       = "iam:users:update"
 	permIAMUsersDelete       = "iam:users:delete"
+	scopeTeamsRead           = "iam:teams:read" // service-token scope for the internal team-scope route
 	permIAMInvitationsRead   = "iam:invitations:read"
 	permIAMInvitationsCreate = "iam:invitations:create"
 	permIAMInvitationsDelete = "iam:invitations:delete"
+	// WO#20 developer access (tenant API keys, webhooks).
+	permIAMAPIKeysRead   = "iam:api_keys:read"
+	permIAMAPIKeysManage = "iam:api_keys:manage"
+	// ADR-A10 SoD rule matrix + violation report
+	// (23-authorization-rbac-abac-rebac.md §8.3, 17-module-account.md §5.1/
+	// §5.2): tenant admin manages their SoD rule additions/overrides and
+	// reviews detected violations.
+	permAccountSoDManage = "account:sod:manage"
 
 	// Health status strings
 	statusHealthy   = "healthy"
@@ -59,7 +71,7 @@ func registerRoutes(handlers *Handlers, services *Services, repos *Repositories,
 	// trusted-devices feature on 2026-05-11: every session/device row
 	// recorded the cluster Pod CIDR IP as the "client IP", making the
 	// enrollment_token IP-binding ineffective (memo:
-	// internal engineering notes) AND making
+	// operational notes) AND making
 	// the "Trusted devices" UI list show internal pod IPs. APISIX's
 	// real-ip plugin already populates X-Forwarded-For upstream; this
 	// line tells Gin to TRUST that header from the configured proxy
@@ -87,7 +99,11 @@ func registerRoutes(handlers *Handlers, services *Services, repos *Repositories,
 		authMiddleware.SetDPoPMiddleware(dpopMW)
 		handlers.Auth.SetDPoPMiddleware(dpopMW)
 	}
-	applyGlobalMiddleware(router, handlers, cfg, authMiddleware, mw.IPFilter, mw.RateLimit, mw.APIKey)
+	var dataPlanePool *pgxpool.Pool
+	if infra.DB != nil {
+		dataPlanePool = infra.DB.Pool
+	}
+	applyGlobalMiddleware(router, handlers, cfg, authMiddleware, mw.IPFilter, mw.RateLimit, mw.APIKey, dataPlanePool, services.OriginRegistry)
 
 	isNonProd := cfg.Environment != "production" && cfg.Environment != "staging"
 	if isNonProd {
@@ -104,7 +120,7 @@ func registerRoutes(handlers *Handlers, services *Services, repos *Repositories,
 		AuthRateLimiter: authRateLimiter,
 		ServiceAuth:     mw.ServiceAuth,
 	})
-	registerOAuthRoutes(router, handlers, authMiddleware, dpopMW)
+	registerOAuthRoutes(router, handlers, authMiddleware, dpopMW, cfg.OAuthTokenPerUserClientIDs, authRateLimiter)
 	registerSAMLRoutes(router, handlers, authMiddleware)
 	registerSAMLSPRoutes(router, handlers, authMiddleware)
 	registerSCIMRoutes(router, handlers, mw.SCIM)
@@ -138,6 +154,9 @@ func buildMiddlewares(services *Services, infra *Infrastructure, repos *Reposito
 ) {
 	authMiddleware := middleware.NewAuthMiddleware(services.Token, cfg)
 	authMiddleware.SetAuthorizationEngine(services.AuthzEngine)
+	if services.TenantStatusGate != nil {
+		authMiddleware.SetTenantSuspensionChecker(services.TenantStatusGate)
+	}
 	if infra.SessionCache != nil {
 		authMiddleware.SetSessionCache(infra.SessionCache)
 	}
@@ -149,6 +168,13 @@ func buildMiddlewares(services *Services, infra *Infrastructure, repos *Reposito
 	// See middleware/auth.go::RequireFreshAuth doc for the full rationale.
 	if repos.Session != nil {
 		authMiddleware.SetSessionRepository(repos.Session)
+	}
+	// SSO-cookie path re-checks account status (disabled/deleted/locked users).
+	if repos.User != nil {
+		authMiddleware.SetIdpUserLookup(repos.User)
+	}
+	if repos.Session != nil {
+		authMiddleware.SetIdpSessionReader(repos.Session)
 	}
 	// 2026-05-26 — wire iam_step_up_verifications repo so
 	// RequireFreshAuthForAction can pass when an in-place step-up
@@ -232,7 +258,8 @@ func buildServiceAuthMiddleware(services *Services, cfg *config.Config) *middlew
 		return sp.PublicKeyPEM, sp.Slug, nil
 	})
 	oauthKeyID, oauthPubKey := services.OAuthProvider.SigningKeyInfo()
-	compositeLookup := middleware.NewCompositeKeyLookup(oauthKeyID, oauthPubKey, spLookup)
+	compositeLookup := middleware.NewCompositeKeyLookup(oauthKeyID, oauthPubKey, spLookup).
+		WithOAuthKeyResolver(services.OAuthProvider.LookupSigningPublicKey)
 	return middleware.NewServiceAuthMiddleware(compositeLookup, cfg.InternalAPIKey)
 }
 
@@ -262,6 +289,8 @@ func applyGlobalMiddleware(
 	ipFilter *middleware.IPFilterMiddleware,
 	rateLimitMW *middleware.RateLimitMiddleware,
 	apiKeyMW *middleware.APIKeyAuthMiddleware,
+	dataPlanePool *pgxpool.Pool,
+	originRegistry *middleware.DynamicOriginRegistry,
 ) {
 	router.Use(middleware.CorrelationID())
 	if cfg.OTLPEndpoint != "" {
@@ -274,8 +303,25 @@ func applyGlobalMiddleware(
 	router.Use(sharedmiddleware.Recovery())
 	router.Use(sharedmiddleware.ErrorHandler())
 	router.Use(sharedmiddleware.APISecurityHeaders(cfg.Environment == "development"))
-	router.Use(middleware.CORS())
+	// Stage 3: originRegistry adds tenant-registry-derived origins on top
+	// of DefaultCORSConfig()'s static list and the existing wildcard-
+	// subdomain patterns. A nil/never-refreshed registry contributes
+	// nothing — see DynamicOriginRegistry's fail-closed doc comment.
+	router.Use(middleware.CORSWithRegistry(middleware.DefaultCORSConfig(), originRegistry))
 	router.Use(middleware.ExtractTenant())
+	router.Use(middleware.PresentIdpSession())
+	// RealmMiddleware.ExtractRealm resolves realm_id BEFORE auth so it is
+	// available (a) to RLSMiddleware below for authenticated requests whose
+	// JWT claims don't carry a realm (legacy/v0 tokens), and (b) to the
+	// pre-auth session-blacklist DB-fallback bootstrap path
+	// (TokenService.checkSessionActiveInDB), which needs realm context to
+	// satisfy iam_sessions' realm-only RLS policy without any tenant
+	// context. Previously constructed (cmd/handlers.go) but never
+	// registered — same "wired but never mounted" gap RLSMiddleware had.
+	// Nil-safe: realm architecture is opt-in via RealmEnabled.
+	if handlers.RealmMiddleware != nil {
+		router.Use(handlers.RealmMiddleware.ExtractRealm())
+	}
 	router.Use(ipFilter.IPFilter())
 	router.Use(rateLimitMW.RateLimit())
 	router.Use(apiKeyMW.APIKeyAuth())
@@ -296,6 +342,23 @@ func applyGlobalMiddleware(
 	router.Use(authMiddleware.OptionalAuth())
 	if handlers.CSRFMiddleware != nil {
 		router.Use(handlers.CSRFMiddleware.CSRF())
+	}
+	// RLSMiddleware MUST run after both ExtractTenant/OptionalAuth (which
+	// populate "tenant_id") and RealmMiddleware.ExtractRealm (which
+	// populates "realm_id"), and before any handler runs. It opens the
+	// request-scoped transaction, sets+verifies the RLS GUCs via SET LOCAL,
+	// and stores the *pgx.Tx in gin context under "pgx_tx".
+	//
+	// SCOPE AS OF THIS COMMIT: registering this middleware makes the GUCs
+	// genuinely set (and read-back-verified) on the request's transaction.
+	// It does NOT, by itself, make every repository query run inside that
+	// transaction — repositories query their own injected *pgxpool.Pool
+	// directly unless explicitly converted to consume "pgx_tx" via
+	// WithDB(tx). See internal/repositories/withdb.go and the repositories
+	// enumerated in the RLS enforcement report for exactly which
+	// repositories were converted alongside this change.
+	if dataPlanePool != nil {
+		router.Use(database.RLSMiddleware(dataPlanePool))
 	}
 }
 
@@ -385,6 +448,12 @@ func registerHealthRoutes(router *gin.Engine, infra *Infrastructure) {
 	// http://falcon-id-falcon-id.falcon-id.svc/ready returned 404 in
 	// 4ms; /health/ready returned 200 with full dependency JSON.
 	readyHandler := func(c *gin.Context) {
+		// Draining (SIGTERM received): fail readiness without touching
+		// dependencies so the Service/gateway stop routing here.
+		if draining.Load() {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "draining"})
+			return
+		}
 		status := gin.H{"status": "ready"}
 		healthy := true
 
@@ -503,11 +572,13 @@ func registerAPIRoutes(router *gin.Engine, handlers *Handlers, mw APIRouteMiddle
 // Used for both the versioned /api/v1 prefix and the deprecated /api prefix.
 func registerVersionedRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware, authRateLimiter *middleware.AuthRateLimiter) {
 	registerAuthRoutes(api, handlers, authMiddleware, authRateLimiter)
-	registerTenantRoutes(api, handlers, authMiddleware)
+	registerTenantRoutes(api, handlers, authMiddleware, authRateLimiter)
+	registerDeveloperRoutes(api, handlers, authMiddleware)
 	registerRealmRoutes(api, handlers, authMiddleware)
 	registerUserRoutes(api, handlers, authMiddleware)
 	registerRoleRoutes(api, handlers, authMiddleware)
 	registerPermissionRoutes(api, handlers, authMiddleware)
+	registerRoleTemplateRoutes(api, handlers, authMiddleware)
 	registerAuthorizationRoutes(api, handlers, authMiddleware)
 	registerSocialAuthRoutes(api, handlers)
 	registerAdminRoutes(api, handlers, authMiddleware)
@@ -605,7 +676,7 @@ func registerPublicAuthRoutes(auth *gin.RouterGroup, handlers *Handlers, authRL 
 	// authRL — the handler's fallback short-circuits to local-auth-only
 	// when state is unavailable, and the data exposed is the same set
 	// already reachable via /discover for any email + the tenant slug.
-	// Memory: internal engineering notes
+	// operational notes
 	// (same forgot-to-wire pattern that bit /platform/security/threats).
 	auth.GET("/login-methods", handlers.Auth.GetLoginMethods)
 	if handlers.AvatarUpload != nil {
@@ -628,9 +699,16 @@ func registerPublicAuthRoutes(auth *gin.RouterGroup, handlers *Handlers, authRL 
 	auth.POST("/signup", authRL, handlers.Signup.InitiateSignup)
 	auth.GET("/signup/check-username", authRL, handlers.Signup.CheckUsername)
 	auth.GET("/signup/check-slug", authRL, handlers.Signup.CheckSlug)
+	auth.GET("/signup/suggest-slug", authRL, handlers.Signup.SuggestSlug)
 	auth.GET("/signup/password-policy", authRL, handlers.Signup.PasswordPolicy)
 	auth.POST("/signup/verify-email", authRL, handlers.Signup.VerifySignupEmail)
 	auth.POST("/signup/complete", authRL, handlers.Signup.CompleteSignup)
+	// Team invitation onboarding: token-scoped, no session. The invitation
+	// token is the credential; both routes sit behind the auth rate limiter.
+	if handlers.TeamInvitation != nil {
+		auth.GET("/invitations/preview", authRL, handlers.TeamInvitation.PreviewInvitation)
+		auth.POST("/invitations/register", authRL, handlers.TeamInvitation.RegisterFromInvitation)
+	}
 	if handlers.WebAuthn != nil {
 		auth.POST("/webauthn/login/begin", authRL, handlers.WebAuthn.BeginAuthentication)
 		auth.POST("/webauthn/login/finish", authRL, handlers.WebAuthn.FinishAuthentication)
@@ -684,7 +762,7 @@ func registerProtectedAuthRoutes(authProtected *gin.RouterGroup, handlers *Handl
 	authProtected.DELETE("/sessions/:id", freshAuth, handlers.Auth.RevokeSession)
 	authProtected.GET("/login-history", handlers.Auth.GetLoginHistory)
 	// Tier-1 risk-event audit feed for the user's own account. Powers
-	// accounts.hexxlock.com's "Sign-in security events" section — Google-
+	// accounts.example.com's "Sign-in security events" section — Google-
 	// style visibility into MFA-challenged + blocked logins.
 	if handlers.Risk != nil {
 		authProtected.GET("/me/risk-events", handlers.Risk.GetMyLoginEvents)
@@ -711,6 +789,7 @@ func registerProtectedAuthRoutes(authProtected *gin.RouterGroup, handlers *Handl
 	if handlers.WebAuthn != nil {
 		registerWebAuthnProtectedRoutes(authProtected, handlers, freshAuth)
 	}
+	registerWitnessRoutes(authProtected, handlers, authMiddleware.RequirePlatformAdmin())
 	if handlers.Delegation != nil {
 		registerDelegationRoutes(authProtected, handlers)
 	}
@@ -813,7 +892,7 @@ func registerMFARoutes(authProtected *gin.RouterGroup, handlers *Handlers, authR
 
 		// Push-notification MFA endpoints. Defined in internal/handlers/
 		// push_mfa_handler.go since 2026-04-XX but never wired up here.
-		// The accounts.hexxlock.com Security page calls GET .../mfa/push/
+		// The accounts.example.com Security page calls GET .../mfa/push/
 		// devices on load — without these routes registered, every
 		// security-page visit gets a global 404 banner. Fix landed
 		// 2026-05-12 alongside the trusted-proxies SetTrustedProxies()
@@ -838,7 +917,7 @@ func registerMFARoutes(authProtected *gin.RouterGroup, handlers *Handlers, authR
 	}
 }
 
-// registerOnboardingVerifyRoutes registers the Mearax onboarding wizard's
+// registerOnboardingVerifyRoutes registers the AcmeWeb onboarding wizard's
 // contact-verification endpoints ("Add your mobile number" / "Confirm
 // your mobile number" steps in the Brevo-mirrored flow). SECURITY: rate
 // limited via the same authRL envelope as the MFA send-code/verify
@@ -1016,7 +1095,7 @@ func registerImpersonationRoutes(authProtected *gin.RouterGroup, handlers *Handl
 }
 
 // registerTenantRoutes registers tenant routes.
-func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
+func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware, authRateLimiter *middleware.AuthRateLimiter) {
 	tenant := api.Group("/tenant")
 	tenant.Use(authMiddleware.RequireAuth())
 	{
@@ -1029,6 +1108,13 @@ func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewa
 		tenant.GET("/feature-flags/overrides", handlers.Tenant.GetTenantFeatureFlagOverrides)
 		tenant.GET("/connection-info", handlers.Tenant.GetTenantConnectionInfo)
 		tenant.GET("/provisioning/status", handlers.ProductInstance.GetProvisioningStatus)
+
+		// Fail-closed tenant module entitlements (the product roadmap §4.1).
+		// Tenant is derived exclusively from the session/JWT via
+		// authMiddleware.RequireAuth() above -- never from a header.
+		if handlers.Entitlement != nil {
+			tenant.GET("/entitlements", handlers.Entitlement.GetTenantEntitlements)
+		}
 	}
 
 	// Phase 2: General settings page (MR 1) + Team page (MR 2)
@@ -1039,10 +1125,47 @@ func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewa
 		tenants.GET("/me/settings", handlers.TenantSettings.GetSettings)
 		tenants.PATCH("/me/settings", handlers.TenantSettings.PatchSettings)
 
-		// GET /api/v1/tenants/me/users — paginated tenant user list with roles
+		// Authoritative seat ledger for the authenticated tenant.
+		if handlers.SeatLimit != nil {
+			tenants.GET("/me/seats", handlers.SeatLimit.GetTenantSeats)
+		}
+		// GET /api/v1/tenants/me/users — paginated human inventory with roles;
+		// status=active filters before pagination, all (default) permits recovery.
 		tenants.GET("/me/users", authMiddleware.RequirePermission(permIAMUsersRead), handlers.TeamInvitation.ListTenantUsers)
+		// Tenant-admin CRUD over teams (organizations with org_type=team).
+		if handlers.TenantTeam != nil {
+			tenants.GET("/me/teams", authMiddleware.RequirePermission(permIAMUsersRead), handlers.TenantTeam.List)
+			tenants.POST("/me/teams", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.Create)
+			tenants.GET("/me/teams/:id", authMiddleware.RequirePermission(permIAMUsersRead), handlers.TenantTeam.Get)
+			tenants.PATCH("/me/teams/:id", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.Update)
+			tenants.DELETE("/me/teams/:id", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.Delete)
+			tenants.GET("/me/teams/:id/members", authMiddleware.RequirePermission(permIAMUsersRead), handlers.TenantTeam.ListMembers)
+			tenants.POST("/me/teams/:id/members", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.AddMember)
+			tenants.PATCH("/me/teams/:id/members/:user_id", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.UpdateMember)
+			tenants.DELETE("/me/teams/:id/members/:user_id", authMiddleware.RequirePermission(permIAMUsersUpdate), handlers.TenantTeam.RemoveMember)
+		}
 		tenants.GET("/me/service-accounts", authMiddleware.RequirePermission("iam:service_accounts:read"), handlers.TeamInvitation.ListTenantServiceAccounts)
 		tenants.GET("/me/service-principals", authMiddleware.RequirePermission("iam:service_principals:read"), handlers.TeamInvitation.ListTenantServicePrincipals)
+		// GET /api/v1/tenants/me/external-members — seat-free accountants
+		// invited from their own partner tenant (seat_class=external).
+		tenants.GET("/me/external-members", authMiddleware.RequirePermission(permIAMUsersRead), handlers.TeamInvitation.ListExternalMembers)
+		// R6 WP-23: seat-free shop-floor kiosk users (seat_class=kiosk), counted against the kiosk_users quota.
+		tenants.POST("/me/kiosk-users", authMiddleware.RequirePermission(permIAMUsersCreate), handlers.TeamInvitation.ProvisionKioskUser)
+		tenants.DELETE("/me/kiosk-users/:id", authMiddleware.RequirePermission(permIAMUsersDelete), handlers.TeamInvitation.RevokeKioskUser)
+	}
+
+	// ADR-A10 SoD rule matrix + violation report (BFF surface,
+	// 23-authorization-rbac-abac-rebac.md §8.3, 17-module-account.md
+	// §5.1/§5.2). Tenant-admin gated; tenant is sourced from the session
+	// JWT by authMiddleware.RequireAuth() (never a client-supplied value)
+	// exactly like the /tenants/me/* group above.
+	account := api.Group("/account")
+	account.Use(authMiddleware.RequireAuth())
+	{
+		account.GET("/sod-rules", authMiddleware.RequirePermission(permAccountSoDManage), handlers.SoD.ListRules)
+		account.POST("/sod-rules", authMiddleware.RequirePermission(permAccountSoDManage), handlers.SoD.CreateRule)
+		account.PATCH("/sod-rules/:id", authMiddleware.RequirePermission(permAccountSoDManage), handlers.SoD.UpdateRule)
+		account.GET("/sod-violations", authMiddleware.RequirePermission(permAccountSoDManage), handlers.SoD.ListViolations)
 	}
 
 	// Phase 2: Team invitations
@@ -1053,7 +1176,20 @@ func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewa
 		invitations.POST("", authMiddleware.RequirePermission(permIAMInvitationsCreate), inviteStepUp, handlers.TeamInvitation.CreateInvitation)
 		invitations.GET("", authMiddleware.RequirePermission(permIAMInvitationsRead), handlers.TeamInvitation.ListInvitations)
 		invitations.DELETE("/:id", authMiddleware.RequirePermission(permIAMInvitationsDelete), authMiddleware.RequireFreshAuthForAction(5*time.Minute, "tenant.team_invitations"), handlers.TeamInvitation.RevokeInvitation)
+		invitations.POST("/:id/actions/resend", authMiddleware.RequirePermission(permIAMInvitationsCreate), inviteStepUp, handlers.TeamInvitation.ResendInvitation)
 		invitations.POST("/accept", handlers.TeamInvitation.AcceptInvitation)
+		invitations.POST("/decline", handlers.TeamInvitation.DeclineInvitation)
+		// Signed-in invitee flow: pending invitations addressed to the caller's
+		// verified email, accepted or declined by id without the emailed token.
+		// Auth-only like accept/decline above (the invitee has no permission in
+		// the inviting company yet); the mutating calls are rate-limited.
+		inviteeRL := authRateLimiter.Middleware()
+		// GET /mine carries no per-user key and acmeweb calls it through the BFF (one
+		// shared IP), so a per-IP limit would throttle every user at once; it is a
+		// cheap indexed read behind RequireAuth and stays unlimited here.
+		invitations.GET("/mine", handlers.TeamInvitation.ListMyInvitations)
+		invitations.POST("/mine/:id/accept", inviteeRL, handlers.TeamInvitation.AcceptMyInvitation)
+		invitations.POST("/mine/:id/decline", inviteeRL, handlers.TeamInvitation.DeclineMyInvitation)
 	}
 
 	// Phase 2: user role management + deactivation (team admin surface)
@@ -1067,6 +1203,30 @@ func registerTenantRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewa
 		teamUsers.POST("/:id/roles", authMiddleware.RequirePermission(permIAMUsersUpdate), roleStepUp, handlers.TeamInvitation.SetUserRoles)
 		teamUsers.DELETE("/:id", authMiddleware.RequirePermission(permIAMUsersDelete), membershipStepUp, handlers.TeamInvitation.DeactivateUser)
 		teamUsers.POST("/:id/reactivate", authMiddleware.RequirePermission(permIAMUsersDelete), membershipStepUp, handlers.TeamInvitation.ReactivateUser)
+		// External (seat-free) member revocation: deletes the membership,
+		// this tenant's role grants and the SpiceDB edges in one call.
+		api.DELETE("/team/external-members/:id", authMiddleware.RequireAuth(), authMiddleware.RequirePermission(permIAMUsersDelete), membershipStepUp, handlers.TeamInvitation.RevokeExternalMember)
+	}
+}
+
+// registerDeveloperRoutes registers the tenant API key management routes
+// (WO#20). Reads need iam:api_keys:read; every mutation needs
+// iam:api_keys:manage plus a fresh step-up. The handler answers 404 while
+// DEVELOPER_KEYS_ENABLED / the tenant allowlist is off.
+func registerDeveloperRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
+	if handlers.TenantAPIKey == nil {
+		return
+	}
+	stepUp := authMiddleware.RequireFreshAuthForAction(5*time.Minute, "tenant.developer_access")
+	keys := api.Group("/developer/api-keys")
+	keys.Use(authMiddleware.RequireAuth())
+	{
+		keys.GET("", authMiddleware.RequirePermission(permIAMAPIKeysRead), handlers.TenantAPIKey.List)
+		keys.GET("/:id", authMiddleware.RequirePermission(permIAMAPIKeysRead), handlers.TenantAPIKey.Get)
+		keys.POST("", authMiddleware.RequirePermission(permIAMAPIKeysManage), stepUp, handlers.TenantAPIKey.Create)
+		keys.POST("/:id/rotate", authMiddleware.RequirePermission(permIAMAPIKeysManage), stepUp, handlers.TenantAPIKey.Rotate)
+		keys.POST("/:id/revoke", authMiddleware.RequirePermission(permIAMAPIKeysManage), stepUp, handlers.TenantAPIKey.Revoke)
+		keys.DELETE("/:id", authMiddleware.RequirePermission(permIAMAPIKeysManage), stepUp, handlers.TenantAPIKey.Delete)
 	}
 }
 
@@ -1092,7 +1252,7 @@ func registerUserRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware
 		// migration 0003 + Keystone bundle v0.232.254). Identity-anchored
 		// per the 2026-06-02 Option C onboarding architecture: each user
 		// reads/writes their own bag, tenant-id never appears in the URL
-		// path. Future product BFFs (Mearax welcome dialog, Hexx-Forge
+		// path. Future product BFFs (AcmeWeb welcome dialog, Hexx-Forge
 		// tour, etc.) PATCH /products/{slug} to mark progress without
 		// touching siblings' state. The aggregator endpoint
 		// /users/me/onboarding/{product} (PR #2, v0.232.255) layers
@@ -1207,6 +1367,25 @@ func registerRoleRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware
 	}
 }
 
+// registerRoleTemplateRoutes registers the role-templates routes
+// (the product roadmap §4.1). GET is gated the same as GET /roles
+// (permCoreRolesRead) — listing the catalog is a read of role-configuration
+// data. POST /:key/instantiate creates a real tenant role, so it gates on
+// the same "core:roles:create" + step-up pair as POST /roles, i.e. it is a
+// tenant-admin operation via the existing RequirePermission middleware
+// (RequireTenantScopedAdmin doesn't fit here — there is no :tenant_id path
+// param on this route; tenant comes solely from middleware.GetTenantID,
+// enforced in RoleTemplateHandler.Instantiate).
+func registerRoleTemplateRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
+	roleTemplates := api.Group("/role-templates")
+	roleTemplates.Use(authMiddleware.RequireAuth())
+	{
+		stepUp := handlers.StepUpMiddleware.RequireStepUp("role_mutation", 5*time.Minute)
+		roleTemplates.GET("", authMiddleware.RequirePermission(permCoreRolesRead), handlers.RoleTemplate.List)
+		roleTemplates.POST("/:key/instantiate", authMiddleware.RequirePermission("core:roles:create"), stepUp, handlers.RoleTemplate.Instantiate)
+	}
+}
+
 // registerPermissionRoutes registers permission routes.
 //
 // Read endpoints (List / ListModules / ListGroupedByModule /
@@ -1249,6 +1428,12 @@ func registerAuthorizationRoutes(api *gin.RouterGroup, handlers *Handlers, authM
 	{
 		authorize.POST("", handlers.Authorization.Authorize)
 		authorize.POST("/batch", handlers.Authorization.AuthorizeBatch)
+
+		// Policy simulator + effective-permissions export (spec 23 §7). Tenant
+		// admins only; the handler additionally pins the target user to the
+		// caller's own tenant and audits every simulation.
+		authorize.POST("/simulate", authMiddleware.RequireTenantAdmin(), handlers.Authorization.Simulate)
+		authorize.GET("/effective-permissions", authMiddleware.RequireTenantAdmin(), handlers.Authorization.GetEffectivePermissionsByQuery)
 	}
 }
 
@@ -1284,17 +1469,31 @@ func registerWebAuthnProtectedRoutes(authProtected *gin.RouterGroup, handlers *H
 		// at least one passkey enrolled (Phase 2 of tier-1 step-up MFA).
 		webauthn.POST("/step-up/begin", handlers.WebAuthn.BeginStepUp)
 		webauthn.POST("/step-up/finish", handlers.WebAuthn.FinishStepUp)
-		// ZTNA Path B operator enrollment witness (ADR 0043 §3.c.0).
-		// An authenticated operator performs a passkey assertion; on
-		// success Falcon-ID mints a compact JWS signed by the existing
-		// RS256 issuer key. The jess controller presents this JWS during
-		// TPM device enrollment to prove the operator witnessed the
-		// device's EK public-key hash. Both endpoints require
-		// RequireAuth (inherited from authProtected group).
-		// /witness/finish also gates on the same wa_session_id + assertion
-		// that /step-up/finish uses — no additional middleware needed.
-		webauthn.POST("/witness/begin", handlers.WebAuthn.BeginWitnessEnroll)
-		webauthn.POST("/witness/finish", handlers.WebAuthn.FinishWitnessEnroll)
+	}
+}
+
+// registerWitnessRoutes registers the ZTNA Path B operator enrollment witness
+// endpoints (ADR 0043 §3.c.0). An operator proves they witnessed the device's
+// EK public-key hash with a passkey assertion, or — for platform admins with no
+// passkey — an authenticator-app code; on success Falcon-ID mints a compact JWS
+// signed by the RS256 issuer key that jess verifies during TPM enrollment.
+//
+// All of these live behind RequireAuth (inherited from authProtected) AND
+// RequirePlatformAdmin: the witness page already refused non-admins, but the
+// API routes did not, so any logged-in user could mint a witness for an
+// arbitrary device_uuid. Handlers re-check as defense in depth.
+func registerWitnessRoutes(authProtected *gin.RouterGroup, handlers *Handlers, platformAdmin gin.HandlerFunc) {
+	if handlers.WebAuthn != nil {
+		wa := authProtected.Group("/webauthn")
+		wa.POST("/witness/begin", platformAdmin, handlers.WebAuthn.BeginWitnessEnroll)
+		wa.POST("/witness/finish", platformAdmin, handlers.WebAuthn.FinishWitnessEnroll)
+	}
+	if handlers.WitnessTOTP != nil {
+		// Authenticator-app fallback (users with NO passkey). Further gated
+		// in the service by realm policy + FALCON_WITNESS_TOTP_ENABLED.
+		wt := authProtected.Group("/witness/totp")
+		wt.POST("/begin", platformAdmin, handlers.WitnessTOTP.Begin)
+		wt.POST("/finish", platformAdmin, handlers.WitnessTOTP.Finish)
 	}
 }
 

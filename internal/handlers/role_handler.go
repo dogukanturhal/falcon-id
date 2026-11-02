@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -195,6 +196,9 @@ func (h *RoleHandler) Update(c *gin.Context) {
 
 	role, err := h.roleService.Update(c.Request.Context(), id, &req, currentUserID)
 	if err != nil {
+		if writeRoleUsedByAPIKeysError(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -268,12 +272,23 @@ func (h *RoleHandler) List(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
-	// This endpoint has shipped behind core:roles:read. Keep that concrete
-	// contract instead of requiring a newly self-registered IAM permission.
-	if !currentUser.HasPermission("core:roles:read") {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-		return
-	}
+	// GET /api/v1/roles is registered in cmd/routes.go behind
+	// authMiddleware.RequirePermission(permCoreRolesRead) — that SpiceDB-backed
+	// middleware check (including its platform-admin bypass) is the sole,
+	// authoritative enforcement of core:roles:read for this route and has
+	// already run by the time this handler executes.
+	//
+	// SECURITY HISTORY: this used to also call
+	// currentUser.HasPermission("core:roles:read") and return 403
+	// "forbidden" on failure. CurrentUser.Permissions is intentionally left
+	// nil for v2 (SpiceDB) tokens (see token_service.go/GenerateAccessTokenV2
+	// and token_service_validation.go/extractSpiceDBClaims — both commented
+	// "Permissions: nil, // Resolved via SpiceDB"), so that stale local
+	// re-check denied every v2-token caller unconditionally — including
+	// platform admins the middleware had already authorized via its SpiceDB
+	// bypass. Removed 2026-09-18; do not reintroduce a permission re-check
+	// here without wiring it through the authorization engine instead of
+	// the static claim.
 
 	// SECURITY: Use GetPagination to enforce max page size of 100
 	page, pageSize, _ := GetPagination(c)
@@ -383,6 +398,12 @@ func (h *RoleHandler) AssignPermissions(c *gin.Context) {
 
 	err = h.roleService.AssignPermissions(c.Request.Context(), id, req.PermissionIDs, currentUserID)
 	if err != nil {
+		if writeRoleUsedByAPIKeysError(c, err) {
+			return
+		}
+		if writePermissionGrantBoundaryError(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -483,3 +504,147 @@ func (h *RoleHandler) ListRoleMembers(c *gin.Context) {
 // registerPermissionRoutes — the @Router annotations on these duplicated
 // the same paths, surfacing repeatedly as false-positive unregistered
 // handlers in docs/audits/2026-05-21-unregistered-handlers.md.
+
+// writePermissionGrantBoundaryError checks whether err is (or wraps) an
+// ADR-A10 *services.PermissionGrantBoundaryError and, if so, writes the
+// canonical 403 problem body with the machine-readable `code`
+// ("entitlement_missing_for_module" or
+// "platform_role_requires_internal_tenant") the BFF/UI rely on. Returns
+// true when it handled the response, so callers can `return` immediately.
+func writePermissionGrantBoundaryError(c *gin.Context, err error) bool {
+	var boundaryErr *services.PermissionGrantBoundaryError
+	if !errors.As(err, &boundaryErr) {
+		return false
+	}
+	c.JSON(http.StatusForbidden, gin.H{
+		"error": boundaryErr.Message,
+		"code":  string(boundaryErr.Code),
+	})
+	return true
+}
+
+// grantPermissionRequest is the body for
+// POST /internal/v1/roles/{id}/actions/grant-permission.
+type grantPermissionRequest struct {
+	PermissionID uuid.UUID `json:"permission_id" binding:"required"`
+}
+
+// GrantPermission handles POST /internal/v1/roles/{id}/actions/grant-permission.
+//
+// Service-to-service only (mounted under the ServiceAuth-gated /internal/v1
+// group — see cmd/routes_admin.go). Additively grants a single permission
+// to a role, enforcing the ADR-A10 permission boundary
+// (17-module-account.md §12.2, 23-authorization-rbac-abac-rebac.md §3.2):
+//   - 403 entitlement_missing_for_module when the permission's module is
+//     not entitled for the role's tenant.
+//   - 403 platform_role_requires_internal_tenant when granting a
+//     platform-scoped permission to a role outside the exampletenant
+//     tenant (00000000-0000-0000-0000-000000000002).
+//
+// @Summary Grant a single permission to a role (internal)
+// @Description Additively grants one permission to a role, subject to the ADR-A10 entitlement/platform boundary.
+// @Tags Internal
+// @Accept json
+// @Produce json
+// @Param id path string true "Role ID"
+// @Param body body grantPermissionRequest true "Permission to grant"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 403 {object} map[string]string
+// @Failure 404 {object} map[string]string
+// @Router /internal/v1/roles/{id}/actions/grant-permission [post]
+func (h *RoleHandler) GrantPermission(c *gin.Context) {
+	roleID, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgRoleInvalidRoleID})
+		return
+	}
+
+	var req grantPermissionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// The role's tenant must be the caller's own tenant, unless the service
+	// token carries tenant:act-as (same model as the approval directory).
+	// The legacy shared key has no tenant and is not accepted here.
+	if c.GetString(middleware.CtxKeyAuthMethod) != "service_jwt" {
+		c.JSON(http.StatusUnauthorized, gin.H{"code": "service_authentication_required"})
+		return
+	}
+	svcTenant := middleware.GetServiceTenantID(c)
+	if svcTenant == uuid.Nil {
+		c.JSON(http.StatusForbidden, gin.H{"code": "service_tenant_required"})
+		return
+	}
+	roleTenant, err := h.roleService.TenantOf(c.Request.Context(), roleID)
+	if err != nil {
+		if errors.Is(err, services.ErrRoleNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": msgRoleNotFound})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	if svcTenant != roleTenant {
+		if _, ok := middleware.GetServiceScopes(c)["tenant:act-as"]; !ok {
+			c.JSON(http.StatusForbidden, gin.H{"code": "tenant_act_as_required"})
+			return
+		}
+	}
+
+	// This is a service-to-service action endpoint (ServiceAuth, not a
+	// user session), so there is no authenticated end-user to attribute
+	// the grant to unless the caller forwards one explicitly.
+	var grantedBy *uuid.UUID
+	if actor := c.GetHeader("X-Acting-User-ID"); actor != "" {
+		if id, err := uuid.Parse(actor); err == nil {
+			grantedBy = &id
+		}
+	}
+
+	permission, err := h.roleService.GrantPermission(c.Request.Context(), roleID, req.PermissionID, grantedBy)
+	if err != nil {
+		if writeRoleUsedByAPIKeysError(c, err) {
+			return
+		}
+		if writePermissionGrantBoundaryError(c, err) {
+			return
+		}
+		if err.Error() == "GrantPermission: role not found" || err.Error() == "GrantPermission: permission not found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": msgRoleNotFound})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	logger.SecurityAudit.Info("Security audit: role permission granted (internal)",
+		zap.String("event", "auth.permission.role_permission_granted"),
+		zap.String("role_id", roleID.String()),
+		zap.String("permission_id", req.PermissionID.String()),
+		zap.String("permission_name", permission.Name),
+		zap.String("ip", GetClientIP(c)),
+		zap.Time("timestamp", time.Now().UTC()),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "permission granted",
+		"permission": permission,
+	})
+}
+
+// writeRoleUsedByAPIKeysError maps *services.RoleUsedByAPIKeysError to 409.
+func writeRoleUsedByAPIKeysError(c *gin.Context, err error) bool {
+	var keyErr *services.RoleUsedByAPIKeysError
+	if !errors.As(err, &keyErr) {
+		return false
+	}
+	c.JSON(http.StatusConflict, gin.H{
+		"error":     keyErr.Error(),
+		"code":      "role_used_by_api_keys",
+		"key_count": keyErr.KeyCount,
+	})
+	return true
+}

@@ -88,6 +88,36 @@ func (r *ProductSubscriptionResolver) Resolve(ctx context.Context, tenantID uuid
 	return claims, nil
 }
 
+// toProductSubscriptionClaims converts resolver output into the JWT claim
+// shape (models.ProductSubscriptionClaim — json pid/slug/plan?/state?).
+//
+// This is the SINGLE conversion point shared by every token mint path:
+// token_service.generateMinimalToken (v1), token_service's v2 SpiceDB mint,
+// and OAuthProviderService.generateTokens (/oauth/token: authorization_code,
+// refresh_token, token-exchange). Before it existed the OAuth path built the
+// claim entries by hand as map[string]any and silently omitted `state`, so
+// the falcon-id-client provisioning interstitial never fired for any
+// OAuth-issued token (a provisioning tenant got the hard 403 instead).
+// Routing all paths through one typed conversion means a new claim field
+// cannot drift between them again.
+//
+// Returns nil for an empty input so callers can keep omitting the claim.
+func toProductSubscriptionClaims(resolved []ProductClaim) []models.ProductSubscriptionClaim {
+	if len(resolved) == 0 {
+		return nil
+	}
+	out := make([]models.ProductSubscriptionClaim, 0, len(resolved))
+	for _, pc := range resolved {
+		out = append(out, models.ProductSubscriptionClaim{
+			ProductID:   pc.ProductID,
+			ProductSlug: pc.ProductSlug,
+			PlanID:      pc.PlanID,
+			State:       pc.State,
+		})
+	}
+	return out
+}
+
 // claimStateForProvisioningState collapses the full ProvisioningState
 // lifecycle down to the three values the JWT claim (and the downstream
 // Next.js product gate) understand. See models.ProductSubscriptionClaim.State.

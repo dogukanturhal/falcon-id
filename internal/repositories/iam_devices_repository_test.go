@@ -39,7 +39,7 @@ func sampleDeviceRow(t *testing.T) IAMDeviceRow {
 	tpmMfr := "Infineon"
 	tpmKind := "discrete"
 	witnessAdmin := "sub-admin-00000000"
-	hostname := "dev-box-01.corp.hexxlock.com"
+	hostname := "dev-box-01.corp.example.com"
 	platformUUID := "deadbeef-0000-4000-8000-000000000001"
 	ekHash := make([]byte, 32)
 	for i := range ekHash {
@@ -77,7 +77,7 @@ func iamDeviceSelectCols() []string {
 		"last_attestation_fingerprint",
 		"enrolled_at", "last_seen_at",
 		"revoked_at", "revoked_reason", "revoked_by_sub",
-		"serial_number", "model", "manufacturer",
+		"serial_number", "model", "manufacturer", "witness_method",
 	}
 }
 
@@ -110,6 +110,7 @@ func addDeviceRow(rows *pgxmock.Rows, id uuid.UUID, row IAMDeviceRow) *pgxmock.R
 		row.SerialNumber,
 		row.Model,
 		row.Manufacturer,
+		row.WitnessMethod,
 	)
 }
 
@@ -123,7 +124,7 @@ func TestIAMDevicesRepository_RegisterDevice_Success(t *testing.T) {
 
 	row := sampleDeviceRow(t)
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	err := repo.RegisterDevice(context.Background(), row)
@@ -140,7 +141,7 @@ func TestIAMDevicesRepository_RegisterDevice_EnrolledAtDefaultsToNow(t *testing.
 	row.LastSeenAt = time.Time{}
 
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	err := repo.RegisterDevice(context.Background(), row)
@@ -153,7 +154,7 @@ func TestIAMDevicesRepository_RegisterDevice_EKConflict(t *testing.T) {
 
 	row := sampleDeviceRow(t)
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnError(&pgconn.PgError{
 			Code:           "23505",
 			Message:        "duplicate key value violates unique constraint",
@@ -172,7 +173,7 @@ func TestIAMDevicesRepository_RegisterDevice_UUIDConflict(t *testing.T) {
 
 	row := sampleDeviceRow(t)
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnError(&pgconn.PgError{
 			Code:           "23505",
 			Message:        "duplicate key value violates unique constraint",
@@ -249,7 +250,7 @@ func TestIAMDevicesRepository_RegisterDevice_AllPlatforms(t *testing.T) {
 			row := sampleDeviceRow(t)
 			row.Platform = platform
 			mock.ExpectExec("INSERT INTO iam_devices").
-				WithArgs(anyArgs(19)...).
+				WithArgs(anyArgs(20)...).
 				WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 			err := repo.RegisterDevice(context.Background(), row)
@@ -271,12 +272,12 @@ func TestIAMDevicesRepository_RegisterDevice_Concurrent(t *testing.T) {
 
 	// First INSERT succeeds.
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	// Second INSERT returns UNIQUE violation on ek_pubkey_hash.
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnError(&pgconn.PgError{
 			Code:           "23505",
 			ConstraintName: "iam_devices_ek_pubkey_hash_key",
@@ -867,7 +868,7 @@ func TestIAMDevicesRepository_RegisterDevice_PathBFields(t *testing.T) {
 	// WitnessAdminSub and WitnessSignedAt are already set in sampleDeviceRow.
 
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	err := repo.RegisterDevice(context.Background(), row)
@@ -888,7 +889,7 @@ func TestIAMDevicesRepository_RegisterDevice_PathAFields(t *testing.T) {
 	row.WitnessSignedAt = nil
 
 	mock.ExpectExec("INSERT INTO iam_devices").
-		WithArgs(anyArgs(19)...).
+		WithArgs(anyArgs(20)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	err := repo.RegisterDevice(context.Background(), row)

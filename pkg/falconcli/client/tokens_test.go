@@ -17,7 +17,7 @@ func TestGenerateToken_Success(t *testing.T) {
 	tokenResp := TokenResponse{
 		ID:        "tok-id-123",
 		Name:      "my-api-key",
-		Key:       "sk_live_abcdefghijklmnop", // gitleaks:allow — test fixture, not a real credential
+		Key:       "sk_live_abcdefghijklmnop",
 		ExpiresAt: "2027-01-01T00:00:00Z",
 	}
 
@@ -45,7 +45,7 @@ func TestGenerateToken_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "tok-id-123", resp.ID)
 	assert.Equal(t, "my-api-key", resp.Name)
-	assert.Equal(t, "sk_live_abcdefghijklmnop", resp.Key) // gitleaks:allow — test fixture, not a real credential
+	assert.Equal(t, "sk_live_abcdefghijklmnop", resp.Key)
 	assert.Equal(t, "2027-01-01T00:00:00Z", resp.ExpiresAt)
 }
 

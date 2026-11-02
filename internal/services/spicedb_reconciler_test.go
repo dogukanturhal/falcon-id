@@ -172,20 +172,6 @@ func TestParsePermissionName_AccessGrantPattern(t *testing.T) {
 			wantRelation: "granted_to_role",
 		},
 		{
-			name:         "dot format: invoice.view (passthrough, no colons)",
-			permName:     "invoice.view",
-			wantObjType:  "access_grant",
-			wantObjID:    "invoice.view",
-			wantRelation: "granted_to_role",
-		},
-		{
-			name:         "dot format: user.manage",
-			permName:     "user.manage",
-			wantObjType:  "access_grant",
-			wantObjID:    "user.manage",
-			wantRelation: "granted_to_role",
-		},
-		{
 			name:         "no separator: billing",
 			permName:     "billing",
 			wantObjType:  "access_grant",
@@ -203,6 +189,16 @@ func TestParsePermissionName_AccessGrantPattern(t *testing.T) {
 			assert.Equal(t, tc.wantObjID, objID)
 			assert.Equal(t, tc.wantRelation, relation)
 		})
+	}
+}
+
+// Names that cannot be SpiceDB object ids (dots, unexpanded wildcards) must be
+// rejected rather than sent to SpiceDB as an InvalidArgument write.
+func TestParsePermissionName_InvalidObjectID_ReturnsError(t *testing.T) {
+	roleID := uuid.New()
+	for _, name := range []string{"invoice.view", "user.manage", "core:parties:*"} {
+		_, _, _, err := parsePermissionName(name, roleID)
+		assert.Error(t, err, name)
 	}
 }
 

@@ -21,7 +21,7 @@ func TestValidateRedirectURI(t *testing.T) {
 	}{
 		// Production-tier accepts: https with any non-loopback host.
 		{name: "prod_https_apex_ok", tenantType: models.TenantTypeCustomer, uri: "https://app.example.com/auth/callback"},
-		{name: "prod_https_subdomain_ok", tenantType: models.TenantTypeCustomer, uri: "https://accounts.hexxlock.com/api/auth/oidc-callback"},
+		{name: "prod_https_subdomain_ok", tenantType: models.TenantTypeCustomer, uri: "https://accounts.example.com/api/auth/oidc-callback"},
 		{name: "prod_https_with_port_ok", tenantType: models.TenantTypeInternal, uri: "https://app.example.com:8443/auth/callback"},
 		{name: "prod_https_with_query_ok", tenantType: models.TenantTypePartner, uri: "https://app.example.com/auth/callback?app=widget"},
 
@@ -64,7 +64,7 @@ func TestValidateRedirectURI(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := validateRedirectURI(tc.tenantType, tc.uri, false)
+			err := validateRedirectURI(tc.tenantType, tc.uri, false, nil)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("validateRedirectURI(%q, %q) = nil, want error containing %q", tc.tenantType, tc.uri, tc.errSubstr)
@@ -86,7 +86,7 @@ func TestValidateRedirectURIs_ListSemantics(t *testing.T) {
 
 	t.Run("empty_list_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURIs(models.TenantTypeCustomer, nil, false); err != nil {
+		if err := validateRedirectURIs(models.TenantTypeCustomer, nil, false, nil); err != nil {
 			t.Fatalf("validateRedirectURIs(nil) = %v, want nil", err)
 		}
 	})
@@ -97,7 +97,7 @@ func TestValidateRedirectURIs_ListSemantics(t *testing.T) {
 			"https://app.example.com/auth/callback",
 			"https://app.example.com/api/auth/oidc-callback",
 		}
-		if err := validateRedirectURIs(models.TenantTypeCustomer, uris, false); err != nil {
+		if err := validateRedirectURIs(models.TenantTypeCustomer, uris, false, nil); err != nil {
 			t.Fatalf("validateRedirectURIs(valid prod set) = %v, want nil", err)
 		}
 	})
@@ -108,7 +108,7 @@ func TestValidateRedirectURIs_ListSemantics(t *testing.T) {
 			"http://example.com/cb",
 			"https://app.example.com/cb",
 		}
-		err := validateRedirectURIs(models.TenantTypeCustomer, uris, false)
+		err := validateRedirectURIs(models.TenantTypeCustomer, uris, false, nil)
 		if err == nil {
 			t.Fatalf("validateRedirectURIs(mixed) = nil, want error on first http entry")
 		}
@@ -120,7 +120,7 @@ func TestValidateRedirectURIs_ListSemantics(t *testing.T) {
 			"http://localhost:3002/auth/callback",
 			"http://localhost:3002/api/auth/oidc-callback",
 		}
-		if err := validateRedirectURIs(models.TenantTypeDemo, uris, false); err != nil {
+		if err := validateRedirectURIs(models.TenantTypeDemo, uris, false, nil); err != nil {
 			t.Fatalf("validateRedirectURIs(sandbox localhost set) = %v, want nil", err)
 		}
 	})
@@ -135,37 +135,37 @@ func TestValidateRedirectURI_NativeApp(t *testing.T) {
 
 	t.Run("native_loopback_127_0_0_1_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "http://127.0.0.1/oidc-callback", true); err != nil {
+		if err := validateRedirectURI(prodTenant, "http://127.0.0.1/oidc-callback", true, nil); err != nil {
 			t.Fatalf("native loopback rejected: %v", err)
 		}
 	})
 	t.Run("native_loopback_localhost_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "http://localhost/oidc-callback", true); err != nil {
+		if err := validateRedirectURI(prodTenant, "http://localhost/oidc-callback", true, nil); err != nil {
 			t.Fatalf("native loopback rejected: %v", err)
 		}
 	})
 	t.Run("native_loopback_ipv6_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "http://[::1]/oidc-callback", true); err != nil {
+		if err := validateRedirectURI(prodTenant, "http://[::1]/oidc-callback", true, nil); err != nil {
 			t.Fatalf("native loopback rejected: %v", err)
 		}
 	})
 	t.Run("native_loopback_with_port_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "http://127.0.0.1:45829/oidc-callback", true); err != nil {
+		if err := validateRedirectURI(prodTenant, "http://127.0.0.1:45829/oidc-callback", true, nil); err != nil {
 			t.Fatalf("native loopback with port rejected: %v", err)
 		}
 	})
 	t.Run("non_native_loopback_still_rejected", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "http://127.0.0.1/oidc-callback", false); err == nil {
+		if err := validateRedirectURI(prodTenant, "http://127.0.0.1/oidc-callback", false, nil); err == nil {
 			t.Fatal("non-native loopback should be rejected on prod tenant")
 		}
 	})
 	t.Run("native_https_remote_still_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := validateRedirectURI(prodTenant, "https://accounts.hexxlock.com/cb", true); err != nil {
+		if err := validateRedirectURI(prodTenant, "https://accounts.example.com/cb", true, nil); err != nil {
 			t.Fatalf("native https remote rejected: %v", err)
 		}
 	})
@@ -184,20 +184,20 @@ func TestMatchRedirectURI(t *testing.T) {
 	}{
 		{
 			name:       "exact non-loopback hit",
-			registered: []string{"https://accounts.hexxlock.com/cb"},
-			requested:  "https://accounts.hexxlock.com/cb",
+			registered: []string{"https://accounts.example.com/cb"},
+			requested:  "https://accounts.example.com/cb",
 			want:       true,
 		},
 		{
 			name:       "non-loopback wrong path",
-			registered: []string{"https://accounts.hexxlock.com/cb"},
-			requested:  "https://accounts.hexxlock.com/other",
+			registered: []string{"https://accounts.example.com/cb"},
+			requested:  "https://accounts.example.com/other",
 			want:       false,
 		},
 		{
 			name:       "non-loopback port mismatch is rejected",
-			registered: []string{"https://accounts.hexxlock.com/cb"},
-			requested:  "https://accounts.hexxlock.com:8443/cb",
+			registered: []string{"https://accounts.example.com/cb"},
+			requested:  "https://accounts.example.com:8443/cb",
 			want:       false,
 		},
 		{
@@ -245,7 +245,7 @@ func TestMatchRedirectURI(t *testing.T) {
 		{
 			name: "multi-registered — first non-loopback exact, second loopback",
 			registered: []string{
-				"https://accounts.hexxlock.com/cb",
+				"https://accounts.example.com/cb",
 				"http://127.0.0.1/cb",
 			},
 			requested: "http://127.0.0.1:45829/cb",
@@ -262,5 +262,57 @@ func TestMatchRedirectURI(t *testing.T) {
 					tc.registered, tc.requested, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateRedirectURI_PrivateUseScheme(t *testing.T) {
+	allow := []string{"example.com"}
+	cases := []struct {
+		name   string
+		uri    string
+		native bool
+		allow  []string
+		ok     bool
+	}{
+		{"single slash", "com.example.app:/oauth/callback", true, allow, true},
+		{"with host", "com.example.app://auth/oauth/callback", true, allow, true},
+		{"subdomain of allowed", "com.example.beta.app:/cb", true, allow, true},
+		{"javascript", "javascript:alert(1)", true, allow, false},
+		{"no dot", "myapp:/x", true, allow, false},
+		{"foreign domain", "com.evil.app:/x", true, allow, false},
+		{"non-native client", "com.example.app:/oauth/callback", false, allow, false},
+		{"fragment", "com.example.app:/x#f", true, allow, false},
+		{"port", "com.example.app://host:80/x", true, allow, false},
+		{"userinfo", "com.example.app://u@host/x", true, allow, false},
+		{"wildcard", "com.example.app:/x*", true, allow, false},
+		{"uppercase scheme", "COM.acmeapp.app:/x", true, allow, false},
+		{"allowlist empty", "com.example.app:/oauth/callback", true, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRedirectURI(models.TenantTypeCustomer, tc.uri, tc.native, tc.allow)
+			if tc.ok && err != nil {
+				t.Fatalf("want nil, got %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("want error for %q", tc.uri)
+			}
+		})
+	}
+}
+
+func TestValidatePostLogoutRedirectURIs_Scheme(t *testing.T) {
+	allow := []string{"example.com"}
+	if err := validatePostLogoutRedirectURIs([]string{"https://example.com/x", "com.example.app:/oauth/logout"}, true, allow); err != nil {
+		t.Fatalf("want nil, got %v", err)
+	}
+	if err := validatePostLogoutRedirectURIs([]string{"com.evil.app:/x"}, true, allow); err == nil {
+		t.Fatal("foreign scheme accepted")
+	}
+	if err := validatePostLogoutRedirectURIs([]string{"com.example.app:/x"}, false, allow); err == nil {
+		t.Fatal("non-native accepted")
+	}
+	if err := validatePostLogoutRedirectURIs([]string{"com.example.app:/x"}, true, nil); err == nil {
+		t.Fatal("empty allowlist accepted")
 	}
 }

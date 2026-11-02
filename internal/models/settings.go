@@ -26,7 +26,7 @@ type IAMSettings struct {
 	HRLDAPGroupFilter  string `json:"hr_ldap_group_filter" db:"hr_ldap_group_filter"`
 
 	// ABAC/OPA Configuration
-	ABACEnabled           bool `json:"abac_enabled" db:"abac_enabled"`
+	ABACEnabled           bool `json:"abac_enabled" db:"abac_enabled"` // Deprecated: read-only, ignored by authorization; never written
 	ABACFallbackRBAC      bool `json:"abac_fallback_rbac" db:"abac_fallback_rbac"`
 	RoleExpirationEnabled bool `json:"role_expiration_enabled" db:"role_expiration_enabled"`
 
@@ -54,7 +54,7 @@ type GetIAMSettingsResponse struct {
 	HasBindPassword   bool   `json:"has_bind_password"` // Indicates if password is set
 
 	// ABAC/OPA Configuration
-	ABACEnabled           bool `json:"abac_enabled"`
+	ABACEnabled           bool `json:"abac_enabled"` // Deprecated: read-only, ignored
 	ABACFallbackRBAC      bool `json:"abac_fallback_rbac"`
 	RoleExpirationEnabled bool `json:"role_expiration_enabled"`
 
@@ -77,7 +77,7 @@ type UpdateIAMSettingsRequest struct {
 	HRLDAPGroupFilter  *string `json:"hr_ldap_group_filter,omitempty"`
 
 	// ABAC/OPA Configuration
-	ABACEnabled           *bool `json:"abac_enabled,omitempty"`
+	ABACEnabled           *bool `json:"abac_enabled,omitempty"` // Deprecated: ignored
 	ABACFallbackRBAC      *bool `json:"abac_fallback_rbac,omitempty"`
 	RoleExpirationEnabled *bool `json:"role_expiration_enabled,omitempty"`
 }

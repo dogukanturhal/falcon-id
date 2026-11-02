@@ -13,6 +13,7 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/internal/services"
 )
 
@@ -33,6 +34,19 @@ type PlatformManagementHandler struct {
 	tenantService     *services.TenantService
 	auditService      *services.AuditService
 	logger            *zap.Logger
+	// acmeappRoleProvisioner is optional (nil in older tests / any wiring
+	// path that doesn't construct it): the role-backfill endpoint 503s rather
+	// than nil-panicking when unset.
+	acmeappRoleProvisioner *services.AcmeAppRoleProvisioner
+	// moduleAccess is optional: the module-access reconcile endpoints 503
+	// when unset. See platform_management_handler_module_access.go.
+	moduleAccess moduleAccessReconciler
+}
+
+// SetModuleAccessReconciler wires the module-access provisioner used by the
+// module-access reconcile endpoints.
+func (h *PlatformManagementHandler) SetModuleAccessReconciler(r moduleAccessReconciler) {
+	h.moduleAccess = r
 }
 
 // NewPlatformManagementHandler creates a new platform management handler
@@ -43,14 +57,16 @@ func NewPlatformManagementHandler(
 	tenantService *services.TenantService,
 	auditService *services.AuditService,
 	logger *zap.Logger,
+	acmeappRoleProvisioner *services.AcmeAppRoleProvisioner,
 ) *PlatformManagementHandler {
 	return &PlatformManagementHandler{
-		userService:       userService,
-		roleService:       roleService,
-		permissionService: permissionService,
-		tenantService:     tenantService,
-		auditService:      auditService,
-		logger:            logger,
+		userService:            userService,
+		roleService:            roleService,
+		permissionService:      permissionService,
+		tenantService:          tenantService,
+		auditService:           auditService,
+		logger:                 logger,
+		acmeappRoleProvisioner: acmeappRoleProvisioner,
 	}
 }
 
@@ -361,6 +377,17 @@ func (h *PlatformManagementHandler) GetTenantUser(c *gin.Context) {
 		return
 	}
 
+	// Soft-deleted users (self-service pending_deletion or
+	// admin-triggered admin_deleted) must not resolve through the
+	// ordinary "get user" read path — only the dedicated admin lifecycle
+	// endpoints (GET .../users/:user_id/lifecycle, restore, hard-delete)
+	// can see them. userService.List already excludes these; this is the
+	// matching guard for the single-user read.
+	if user.ActivationStatus == "pending_deletion" || user.ActivationStatus == "admin_deleted" {
+		c.JSON(http.StatusNotFound, gin.H{"error": msgPlatMgmtUserNotFound})
+		return
+	}
+
 	c.JSON(http.StatusOK, user)
 }
 
@@ -469,6 +496,10 @@ func (h *PlatformManagementHandler) UpdateTenantUser(c *gin.Context) {
 
 	user, err := h.userService.Update(c.Request.Context(), userID, &req, &currentUser.ID)
 	if err != nil {
+		if errors.Is(err, repositories.ErrSeatLimitReached) {
+			c.JSON(http.StatusConflict, gin.H{"error": "seat limit reached", "code": errCodeSeatLimitReached})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": msgPlatMgmtInternalError})
 		return
 	}

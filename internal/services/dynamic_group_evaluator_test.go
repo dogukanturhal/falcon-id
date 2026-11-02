@@ -226,7 +226,7 @@ func TestDynamicGroupEvaluator_ContainsOperator(t *testing.T) {
 				GroupID:  groupID,
 				IsActive: true,
 				Conditions: mustMarshalConditions([]models.RuleCondition{
-					{Attribute: "email", Operator: models.OperatorContains, Value: "@hexxlock.com"},
+					{Attribute: "email", Operator: models.OperatorContains, Value: "@example.com"},
 				}),
 			},
 		},
@@ -238,7 +238,7 @@ func TestDynamicGroupEvaluator_ContainsOperator(t *testing.T) {
 	user := &models.User{
 		ID:       uuid.New(),
 		TenantID: tenantID,
-		Email:    "john@hexxlock.com",
+		Email:    "john@example.com",
 	}
 
 	err := evaluator.EvaluateUser(context.Background(), user)

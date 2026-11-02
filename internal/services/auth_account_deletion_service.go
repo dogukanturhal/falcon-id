@@ -103,11 +103,18 @@ func (s *AuthService) ScheduleAccountDeletion(
 	user.ActivationStatus = "pending_deletion"
 	user.DeletionScheduledAt = &now
 	user.DeletionGracePeriodEndsAt = &gracePeriodEnd
+	var reasonPtr *string
 	if reason != "" {
 		user.DeletionReason = &reason
+		reasonPtr = &reason
 	}
 
-	if err := s.userRepo.Update(ctx, user); err != nil {
+	// NOTE: intentionally NOT s.userRepo.Update(ctx, user) — that method's
+	// write-all-columns SQL does not include activation_status /
+	// deletion_scheduled_at / deletion_grace_period_ends_at /
+	// deletion_reason, so it silently dropped this exact write. Use the
+	// narrow, dedicated SetDeletionState instead (see repository docstring).
+	if err := s.userRepo.SetDeletionState(ctx, userID, user.ActivationStatus, user.DeletionScheduledAt, user.DeletionGracePeriodEndsAt, reasonPtr); err != nil {
 		return nil, fmt.Errorf("ScheduleAccountDeletion: update user: %w", err)
 	}
 
@@ -117,6 +124,14 @@ func (s *AuthService) ScheduleAccountDeletion(
 	if err := s.sessionRepo.EndAllUserSessions(ctx, userID, "account_deletion_scheduled"); err != nil {
 		logger.Warn("ScheduleAccountDeletion: failed to end sessions",
 			zap.String("user_id", userID.String()), zap.Error(err))
+	}
+	// Same for refresh tokens: a scheduled deletion signs out every device
+	// for good, bound or legacy.
+	if s.tokenService != nil {
+		if err := s.tokenService.RevokeAllUserOAuthTokens(ctx, userID, "account_deletion_scheduled"); err != nil {
+			logger.Warn("ScheduleAccountDeletion: failed to revoke OAuth tokens",
+				zap.String("user_id", userID.String()), zap.Error(err))
+		}
 	}
 
 	logger.SecurityAudit.Info("Security audit: account deletion scheduled",
@@ -161,7 +176,9 @@ func (s *AuthService) CancelAccountDeletion(ctx context.Context, userID uuid.UUI
 	user.DeletionGracePeriodEndsAt = nil
 	user.DeletionReason = nil
 
-	if err := s.userRepo.Update(ctx, user); err != nil {
+	// See ScheduleAccountDeletion: Update() drops these columns, so use
+	// the dedicated SetDeletionState write path instead.
+	if err := s.userRepo.SetDeletionState(ctx, userID, "active", nil, nil, nil); err != nil {
 		return nil, fmt.Errorf("CancelAccountDeletion: update user: %w", err)
 	}
 

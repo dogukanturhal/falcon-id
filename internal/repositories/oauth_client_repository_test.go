@@ -525,10 +525,11 @@ func TestOAuthClientRepository_CreateOAuthToken(t *testing.T) {
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
 
-		// 17 args for INSERT (14 original + auth_methods_used + idp_session_id
-		// from migration 220 + token_family_id from migration 0009)
+		// 18 args for INSERT (14 original + auth_methods_used + idp_session_id
+		// from migration 220 + token_family_id from migration 0009 +
+		// session_id from migration 0028)
 		mock.ExpectExec(`INSERT INTO iam_oauth_tokens`).
-			WithArgs(anyArgs(17)...).
+			WithArgs(anyArgs(18)...).
 			WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 		err := repo.CreateOAuthToken(context.Background(), token)
@@ -543,7 +544,7 @@ var oauthTokenCols = []string{
 	"id", "tenant_id", "client_id", "user_id", "token_type", "token", "scopes",
 	"refresh_token", "ip_address", "user_agent", "is_revoked", "revoked_at",
 	"expires_at", "created_at", "updated_at",
-	"auth_methods_used", "idp_session_id", "token_family_id",
+	"auth_methods_used", "idp_session_id", "token_family_id", "session_id", "replaced_by", "revoke_reason", "recovery_count",
 }
 
 func TestOAuthClientRepository_GetOAuthTokenByHash(t *testing.T) {
@@ -558,7 +559,7 @@ func TestOAuthClientRepository_GetOAuthTokenByHash(t *testing.T) {
 			"access_token", "hashed-token", []string{"openid"},
 			nil, nil, nil, false, nil,
 			now.Add(time.Hour), now, now,
-			[]string{}, nil, nil,
+			[]string{}, nil, nil, nil, nil, nil, int16(0),
 		)
 		mock.ExpectQuery(`SELECT`).WithArgs("hashed-token").WillReturnRows(rows)
 
@@ -597,6 +598,37 @@ func TestOAuthClientRepository_RevokeOAuthToken(t *testing.T) {
 		err := repo.RevokeOAuthToken(context.Background(), "token-hash")
 		assert.NoError(t, err)
 		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// ─── RevokeTokensBySession ───────────────────────────────────────────────────
+
+func TestOAuthClientRepository_RevokeTokensBySession(t *testing.T) {
+	t.Run("revokes bound tokens and their families", func(t *testing.T) {
+		mock, repo := newOAuthClientMock(t)
+		defer mock.Close()
+
+		sid, uid := uuid.New(), uuid.New()
+		mock.ExpectExec(`(?s)UPDATE iam_oauth_tokens\s+SET is_revoked = true.*user_id = \$3.*session_id = \$2 OR idp_session_id = \$2.*token_family_id IN`).
+			WithArgs(pgxmock.AnyArg(), sid, uid).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 3))
+
+		n, err := repo.RevokeTokensBySession(context.Background(), sid, uid)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(3), n)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("propagates database error", func(t *testing.T) {
+		mock, repo := newOAuthClientMock(t)
+		defer mock.Close()
+
+		mock.ExpectExec(`UPDATE iam_oauth_tokens`).
+			WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			WillReturnError(assert.AnError)
+
+		_, err := repo.RevokeTokensBySession(context.Background(), uuid.New(), uuid.New())
+		assert.Error(t, err)
 	})
 }
 

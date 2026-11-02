@@ -1,0 +1,2072 @@
+/**
+ * Cluster SpiceDB schema — single source of record (t-582).
+ *
+ * OWNERSHIP (read this before editing)
+ * =====================================
+ * This file is applied by the `spicedb-schema` Argo CD Application
+ * (<gitops-bootstrap-repo>: clusters/prod-eu-west-1-hub/addons/spicedb-schema.yaml,
+ * chart: deploy/helm/spicedb-schema), which is independently synced and is
+ * the ONLY writer of SpiceDB's schema in this cluster. It lives in this repo
+ * for now (co-located with the ERP definitions it primarily serves) but is
+ * NOT part of the falcon-id Helm release — falcon-id no longer ships a
+ * schema-write hook of its own.
+ *
+ * SpiceDB's `WriteSchema` RPC has REPLACE, not merge, semantics: whatever
+ * definition set is written here becomes the ENTIRE live schema, dropping
+ * anything omitted. Prior to t-582 that was violated by three independent
+ * writers hitting the same global SpiceDB instance (falcon-id's own PostSync
+ * hook, Talon's PreSync hook, AND Talon's `EnsureSchema()` call at every pod
+ * startup baked in via `//go:embed`), each REPLACING whatever the others had
+ * written. Root-caused 2026-09-07/08: a Talon HPA scale-up event's fresh
+ * pods called `EnsureSchema()` with Talon's own stale 3-definition embedded
+ * copy at 19:55:08 UTC, silently reverting a full 45-definition schema write
+ * that had landed 1h29m45s earlier. See board row t-582 for the full
+ * incident writeup. Talon's own copy (talon/internal/spicedb/schema.zed) and
+ * both PreSync/PostSync hooks (talon and falcon-id) have been deleted; Talon
+ * now only READS the live schema at startup to verify its required
+ * definitions (`user`, `group`, `talon_route`) are present — it never calls
+ * `WriteSchema` again. This file MUST remain the union of every definition
+ * any consumer needs (Talon's IAP routing + every business ERP resource
+ * type) — never split it back across multiple writers.
+ *
+ * ExampleSuite IAM SpiceDB Schema
+ *
+ * This schema defines the authorization model for the ExampleSuite multi-tenant SaaS platform.
+ * Based on Google Zanzibar's Relationship-Based Access Control (ReBAC) model.
+ *
+ * Key Concepts:
+ * - Tenant isolation: All resources are scoped to a tenant
+ * - Role-based: Users have roles, roles have permissions
+ * - Hierarchical: Groups and organizations can inherit permissions
+ * - Fine-grained: Support for resource-level permissions
+ *
+ * Object ID Format: {tenant_id}:{resource_id}
+ * Example: "00000000-0000-0000-0000-000000000002:user123"
+ *
+ * t-582 scope note: every business-module definition in this file was
+ * authored against a source-verified survey of business's real
+ * ISpiceDbClient writers and [RequirePermission]/[RequireResourcePermission]
+ * checks (see tools/t582-shapes.tsv and t-582 research notes in the
+ * business repo), not invented. Checked resourceTypes with NO confirmed
+ * writer anywhere in the codebase (allocation, capacity, capacity_plan,
+ * all cmms_*, all plm_*, all qms_*, segment -- ~36 of the 44 checked
+ * types) are deliberately NOT defined here; they are a business-process
+ * gap (no code path populates them), not a schema-authoring omission,
+ * and must not be modelled speculatively. crm_contact/crm_company/
+ * crm_opportunity/invoice/payment/ecommerce_* predate t-582, have no
+ * confirmed writer either, and are left as-is rather than removed.
+ */
+
+definition user {}
+
+/**
+ * hxl_platform - Hexxlock operator plane (platform plane, R1 JIT elevation +
+ * break-glass; the product specification §12.3,
+ * 23-authorization-rbac-abac-rebac.md §4.2).
+ *
+ * Named `hxl_platform`, NOT `platform`, to avoid colliding with the existing
+ * `platform_product`/`platform_product_instance` multi-product catalog
+ * objects defined below (different concept - product catalog, not operator
+ * authority). There is exactly ONE hxl_platform object in the system,
+ * `hxl_platform:hexxlock`, related to every `tenant` via the `platform`
+ * relation added below; only relationships against THAT object ID are
+ * meaningful (falcon-id's platform-role/JIT code never writes any other
+ * hxl_platform object).
+ *
+ * Relation names mirror the iam_platform_roles.role_key enum values 1:1
+ * (platform_admin -> admin, platform_support -> support, platform_billing
+ * -> billing, platform_security -> security, platform_viewer -> viewer) so
+ * the standing/JIT write path derives the SpiceDB relation straight from
+ * the DB role_key with a fixed lookup table.
+ */
+definition hxl_platform {
+    relation admin: user | user with active_elevation
+    relation support: user | user with active_elevation
+    relation billing: user | user with active_elevation
+    relation security: user | user with active_elevation
+    relation viewer: user | user with active_elevation
+    // Console P0 (platform-admin console): two more JIT-only roles.
+    relation compliance: user | user with active_elevation
+    relation sre: user | user with active_elevation
+
+    permission manage_identity = admin + security
+    permission manage_billing_catalog = admin + billing
+    permission support_diagnose = admin + support
+    permission view = admin + support + billing + security + viewer + compliance + sre
+
+    // Operator-console permissions (platform-admin console, P0). SpiceDB
+    // permission names cannot contain ':', so ops_<domain>_<verb> here is
+    // surfaced on the wire as ops:<domain>:<verb> (falcon-id's operator
+    // token exchange maps one onto the other and emits them as the
+    // `ops_perms` claim). Enforced by platform-shared/operatorauth in each
+    // service; falcon-id is the only decision point.
+    //
+    // Reads (masked data only) - the standing viewer role carries these.
+    permission ops_tenants_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_users_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_billing_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_quota_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_edoc_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_system_read = admin + sre + viewer + support + billing + security + compliance
+    permission ops_flags_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_notify_read = admin + support + billing + security + viewer + compliance + sre
+    permission ops_audit_read = admin + security + compliance
+    // Writes (JIT-only roles).
+    permission ops_tenants_write = admin + support
+    permission ops_tenants_lifecycle = admin + sre
+    permission ops_tenants_purge = admin
+    permission ops_users_write = admin + support + security
+    permission ops_pii_reveal = admin + support + security + compliance
+    permission ops_billing_write = admin + billing
+    permission ops_billing_refund = admin + billing
+    // Payment-gateway settings (stored-card cap, per-tenant checkout settings): T2/T3, admin only.
+    permission ops_payments_config = admin
+    permission ops_catalog_write = admin + billing
+    permission ops_quota_write = admin + billing
+    // Quota tiers above the per-tenant T1 write: plan limits / registry
+    // patches (every tenant on the plan) and the periodic reset (all tenants).
+    // Both are T2 (step-up) in quota-service.
+    permission ops_quota_plan = admin + billing
+    permission ops_quota_reset = admin + billing
+    permission ops_edoc_write = admin + billing
+    permission ops_flags_write = admin + sre
+    permission ops_notify_write = admin + sre
+    permission ops_staff_manage = admin
+    permission ops_audit_export = admin + security + compliance
+}
+
+/**
+ * Tenant - Top-level isolation boundary
+ * Every resource belongs to exactly one tenant
+ */
+definition tenant {
+    // Direct relationships
+    relation owner: user
+    relation admin: user
+    relation member: user
+
+    // NEW (R3 guest; 23-authorization-rbac-abac-rebac.md section 4.2,
+    // 17-module-account.md section 3.2) - external, seat-free member: an
+    // accountant (SMMM) invited from their own partner tenant with
+    // seat_class=external. Written by falcon-id's team invitation accept and
+    // removed by external-member revoke (TenantBootstrapService.
+    // SyncExternalAccess); the SpiceDB reconciler converges the member's
+    // role edges from PostgreSQL but never this marker. Referenced by NO
+    // permission (not view, not manage), so holding it grants nothing and a
+    // stale edge is harmless. Everything the accountant can do comes from
+    // tenant-scoped role grants assigned at accept: roles whose permissions
+    // are all reads, plus the one write-like exception falcon-id admits for
+    // external roles, preaccounting accountant-export create/retry
+    // (LD-R3-GUEST-1; an export never changes the books). Removing those
+    // role edges, not this marker, is what ends access.
+    relation guest: user
+
+    // NEW (R1 platform plane) - every tenant relates to the single
+    // hxl_platform:hexxlock object. Lets any check answer "is this the
+    // Platform-internal tenant" without a special-cased UUID comparison in
+    // application code.
+    relation platform: hxl_platform
+
+    // NEW (R1 entitlements; 23-authorization-rbac-abac-rebac.md section 4.2) -
+    // one relation per module the tenant is entitled to (status active /
+    // trialing / grace in iam_tenant_module_entitlements). The permission
+    // boundary (spec 23 section 5.1) reads
+    // `tenant:<T>#entitled_module@module:<T>/<module_code>`; absence = not
+    // entitled. Written/removed by falcon-id's entitlement sync
+    // (pkg/spicedb/entitlement.go), never by hand. Tuples that carry an
+    // end date (trial end, grace end, period end) use the
+    // `entitlement_window` caveat so an entitlement stops passing checks the
+    // instant it lapses even if the sync write is delayed.
+    relation entitled_module: module | module with entitlement_window
+
+    // Computed permissions
+    permission manage = owner + admin
+    permission view = owner + admin + member
+    permission delete = owner
+
+    // NEW (R1 platform plane) - true ONLY for the Platform-internal tenant
+    // (00000000-0000-0000-0000-000000000002), i.e. only for the tenant
+    // whose `platform: hxl_platform` relationship target holds
+    // manage_identity. Backs the iam_platform_roles membership
+    // CHECK/trigger's SpiceDB-side counterpart.
+    permission is_platform_internal = platform->manage_identity
+}
+
+/**
+ * role_assignment - a user's assignment of module-scoped roles inside one
+ * tenant (23-authorization-rbac-abac-rebac.md section 4.2). Names the module
+ * the permissions belong to so the write-time permission boundary (spec 23
+ * section 5.1) has an enforcement point: falcon-id reads
+ * `tenant#entitled_module@module` before writing `assigned`. Object id is
+ * `<tenant_id>/<module_code>/<user_id>` (one object per user+module).
+ */
+definition role_assignment {
+    relation tenant: tenant
+    relation module: module
+    relation assigned: user
+
+    permission use = assigned
+}
+
+/**
+ * company - legal entity (23-authorization-rbac-abac-rebac.md section 4.2;
+ * core.legal_entities in 03-database.md). Resolves through the existing
+ * `tenant` definition: `tenant->owner` manages/views every company of the
+ * tenant; admin/member/guest are per-company grants (guest = per-company
+ * accountant grant). ADDITIVE (R2 WP-02): no existing permission references
+ * company yet - see the `company` relations added on the finance resources
+ * below. Object id is `<tenant_id>/<company_id>` like every tenant-scoped
+ * object.
+ *
+ * LD-B63-FLOWMEM-1 (legal-entity access model): there is no per-user
+ * legal-entity assignment table anywhere (iam_invitations.company_scope is
+ * spec-only), so access is tenant-wide: every owner/admin/member of the
+ * tenant may operate in every company of that tenant. That is expressed by
+ * `tenant->view` (owner + admin + member), NOT by per-company `member`
+ * tuples: nothing writes company#member, and fanning out one tuple per
+ * (user, company) would need falcon-id to know companies and business to
+ * know membership. Deriving it through the `tenant` edge written at company
+ * creation (+ the business LegalEntityAuthzBackfillJob for older rows) makes
+ * a joining member, a removed member and a company created later converge
+ * with no extra writes. External seat-free members (tenant#guest) are NOT
+ * covered: they only ever reach a company through company#guest.
+ */
+definition company {
+    relation tenant: tenant
+    relation admin: user
+    relation member: user
+    relation guest: user
+
+    permission manage = admin + tenant->owner
+    permission view = admin + member + guest + tenant->view
+}
+
+/**
+ * branch - sub-unit of a company (23 section 4.2). Inherits both permissions
+ * from its company.
+ */
+definition branch {
+    relation company: company
+
+    permission view = company->view
+    permission manage = company->manage
+}
+
+/**
+ * Role - Named collection of permissions
+ * Roles are tenant-scoped
+ */
+definition role {
+    // Which tenant this role belongs to
+    relation tenant: tenant
+
+    // Users who have this role. `user with active_elevation` is a JIT grant
+    // (falcon-id JITAccessService): it passes only while check-time `now` <
+    // expires_at; falcon-id supplies `now` on every check (pkg/spicedb
+    // check_context.go).
+    relation member: user | group#member | user with active_elevation
+
+    // Permissions
+    permission view = member + tenant->admin
+    permission assign = tenant->admin
+}
+
+/**
+ * Group - Collection of users for easier permission management
+ * Groups can be nested (hierarchical)
+ */
+definition group {
+    // Which tenant this group belongs to
+    relation tenant: tenant
+
+    // Direct members
+    relation member: user | group#member
+
+    // Group administrators
+    relation admin: user
+
+    // Parent group for hierarchy
+    relation parent: group
+
+    // Computed permissions
+    permission view = member + admin + tenant->admin
+    permission manage = admin + tenant->admin
+
+    // Effective membership includes parent group members
+    permission effective_member = member + parent->effective_member
+}
+
+/**
+ * Organization - Business unit within a tenant
+ * Supports hierarchical org structures (departments, teams, etc.)
+ */
+definition organization {
+    // Which tenant this org belongs to
+    relation tenant: tenant
+
+    // Organization members with different roles
+    relation owner: user
+    relation manager: user
+    relation member: user
+
+    // Parent org for hierarchy
+    relation parent: organization
+
+    // Computed permissions
+    permission admin = owner + manager + tenant->admin
+    permission view = owner + manager + member + parent->view
+    permission manage = owner + manager + parent->manage
+}
+
+/**
+ * Module - ERP business module (CRM, HR, Finance, etc.)
+ * Module-level permissions for coarse-grained access control
+ */
+definition module {
+    // Which tenant this module belongs to
+    relation tenant: tenant
+
+    // Roles that can access this module
+    relation viewer: role#member | user
+    relation editor: role#member | user
+    relation admin: role#member | user
+    // Seat-free ESS/kiosk intake: never implies module view/edit or work-order access.
+    relation maintenance_request_creator: role#member
+    relation maintenance_request_reader: role#member
+    // Company selection is reference-only; it never implies general Core view/edit.
+    relation legal_entity_reader: role#member
+
+    // Computed permissions
+    permission view = viewer + editor + admin + tenant->admin
+    permission edit = editor + admin + tenant->admin
+    permission manage = admin + tenant->admin
+    permission delete = admin + tenant->admin
+    permission legal_entities_read = view + legal_entity_reader
+
+    // Marketing granular resource:action permissions (D-71 schema-drift gate,
+    // the product roadmap §4.5/§4.9 "S2 enforced for Marketing"). Each aliases the
+    // module-level permission [RequirePermissionAttribute].MapActionToModulePermission
+    // would fall back to for the same action (read->view, create/update/delete/
+    // publish/use->edit, admin->manage), so flipping Authorization:marketing:EnforceS2
+    // to true is a strictness change, not a behaviour change, once granted the
+    // same way real per-resource relations would be modelled. Business repo
+    // spec: the product specification §8.
+    permission leads_admin = manage
+    permission workflows_admin = manage
+    permission forms_read = view
+    permission forms_create = edit
+    permission forms_update = edit
+    permission forms_delete = edit
+    permission landing_pages_read = view
+    permission landing_pages_create = edit
+    permission landing_pages_update = edit
+    permission landing_pages_delete = edit
+    permission landing_pages_publish = edit
+    permission ads_read = view
+    permission ads_create = edit
+    permission ads_update = edit
+    permission ads_delete = edit
+    permission ads_admin = manage
+    permission social_read = view
+    permission social_create = edit
+    permission social_update = edit
+    permission social_delete = edit
+    permission social_admin = manage
+    permission domains_read = view
+    permission domains_create = edit
+    permission domains_update = edit
+    permission domains_delete = edit
+    permission domains_admin = manage
+    permission consent_create = edit
+    permission consent_delete = edit
+    permission consent_admin = manage
+    permission suppressions_read = view
+    permission scoring_admin = manage
+    permission channels_create = edit
+    permission channels_delete = edit
+    permission channels_admin = manage
+    permission ab_tests_admin = manage
+    permission analytics_create = edit
+    permission settings_create = edit
+    permission webhooks_admin = manage
+    permission manual_mail_create = edit
+    permission manual_mail_read = view
+    permission ai_read = view
+    permission ai_create = edit
+    permission ai_use = edit
+
+    // CRM granular resource:action permissions for OpportunityEstimate
+    // (business OpportunityEstimatesController; the product roadmap §4.4 --
+    // lightweight, non-fiscal estimate replacing CRM Quotes, whose fiscal
+    // lifecycle moved to SD). Each aliases the module-level permission
+    // [RequirePermissionAttribute].MapActionToModulePermission already falls
+    // back to for the same action (read->view, create/update/delete->edit),
+    // so this only makes the granular SpiceDB check resolvable; it does not
+    // change what gets granted while Authorization:crm:EnforceS2 stays false.
+    permission opportunity_estimates_read = view
+    permission opportunity_estimates_create = edit
+    permission opportunity_estimates_update = edit
+    permission opportunity_estimates_delete = edit
+
+    // R-HR (RHR-B3) granular resource:action permissions: business HrModule
+    // registers the "payroll" manifest (runs:*, lines:adjust, settings:manage;
+    // WP-16) and hr sgk_notifications:read/export (WP-12). Same aliasing rule as
+    // the blocks above (read->view, every other action->edit), so defining them
+    // is strictness-neutral while Authorization:{hr,payroll}:EnforceS2 is false.
+    // The real payroll segregation of duties (calculator != approver) is enforced
+    // by the business service + ck_payroll_runs_sod today; a payroll_run
+    // definition with per-run relations is R-HR WP-20: payroll_run below, with
+    // no business tuple writes yet (LD-B42-RHRB6-8: the handler and the DB CHECK stay
+    // authoritative until Authorization:payroll:EnforceS2 flips).
+    permission runs_read = view
+    permission runs_create = edit
+    permission runs_calculate = edit
+    permission runs_submit = edit
+    permission runs_approve = edit
+    permission runs_reject = edit
+    permission runs_post = edit
+    permission runs_pay = edit
+    permission runs_distribute = edit
+    permission runs_export_compliance = edit
+    permission lines_adjust = edit
+    // R-HR RHR-B6 / WP-20: icra / nafaka orders and BES enrolments of a payroll run.
+    permission deductions_read = view
+    permission deductions_manage = edit
+    permission sgk_notifications_read = view
+    permission sgk_notifications_export = edit
+
+    // PreAccounting granular resource:action permissions (R2, B20 follow-up;
+    // business PreAccounting permission manifest, dump-permission-manifest.py).
+    // Same aliasing rule as the blocks above: each resolves to the module-level
+    // permission MapActionToModulePermission already falls back to (read->view,
+    // manage->manage, every other action->edit), so defining them is a
+    // strictness-neutral change until Authorization:preaccounting:EnforceS2 flips.
+    // Hyphenated resources are defined further down in underscore form
+    // (LD-B20-5). Service-only scopes are not user permissions and are
+    // intentionally absent (LD-B19-2).
+    permission audit_create = edit
+    permission audit_delete = edit
+    permission audit_read = view
+    permission audit_update = edit
+    permission reports_unlock = edit
+    permission cari_archive = edit
+    permission cari_create = edit
+    permission cari_delete = edit
+    permission cari_read = view
+    permission cari_update = edit
+    permission cheques_create = edit
+    permission cheques_delete = edit
+    permission cheques_read = view
+    permission cheques_update = edit
+    permission cheques_void = edit
+    permission dashboard_create = edit
+    permission dashboard_delete = edit
+    permission dashboard_read = view
+    permission dashboard_update = edit
+    permission expenses_approve = edit
+    permission expenses_create = edit
+    permission expenses_delete = edit
+    permission expenses_pay = edit
+    permission expenses_read = view
+    permission expenses_update = edit
+    permission import_commit = edit
+    permission import_create = edit
+    permission import_delete = edit
+    permission import_harvest = edit
+    permission import_read = view
+    permission import_update = edit
+    permission inbox_create = edit
+    permission inbox_delete = edit
+    permission inbox_read = view
+    permission inbox_respond = edit
+    permission inbox_update = edit
+    permission invoices_cancel = edit
+    permission invoices_create = edit
+    permission invoices_delete = edit
+    permission invoices_issue = edit
+    permission invoices_read = view
+    permission invoices_requeue = edit
+    permission invoices_send = edit
+    permission invoices_update = edit
+    permission payments_allocate = edit
+    permission payments_create = edit
+    permission payments_delete = edit
+    permission payments_read = view
+    permission payments_update = edit
+    permission recurring_create = edit
+    permission recurring_delete = edit
+    permission recurring_read = view
+    permission recurring_update = edit
+    permission reports_create = edit
+    permission reports_delete = edit
+    permission reports_lock = edit
+    permission reports_read = view
+    permission reports_update = edit
+    permission settings_delete = edit
+    permission settings_edit = manage
+    permission settings_read = view
+    // PPSCM per-company production settings (R6 WP-09).
+    permission settings_manage = manage
+    // Bulk-job undo (b79 gapbe2): requester reverses their own finished import inside its undo window (jobs:jobs:undo).
+    permission jobs_undo = edit
+    permission settings_update = edit
+    // e-SMM / e-MM vouchers (EDOC-X X2).
+    permission vouchers_cancel = edit
+    permission vouchers_create = edit
+    permission vouchers_delete = edit
+    permission vouchers_issue = edit
+    permission vouchers_read = view
+    permission vouchers_update = edit
+    // Invoice objections / itiraz (LD-B37-IT).
+    permission objections_create = edit
+    permission objections_delete = edit
+    permission objections_read = view
+    permission objections_update = edit
+
+    // Hyphenated-resource permissions of ALL business modules (LD-B20-5, B21).
+    // Business permission strings keep their hyphens (role grants, JWT perms,
+    // manifests); RequirePermissionAttribute and the drift dump map '-' -> '_'
+    // for the SpiceDB name (Hexxlock.Shared SpiceDbPermissionName), so the
+    // underscore forms are what is defined here. Same aliasing rule as above
+    // (read->view, manage/admin->manage, anything else->edit; the odd action
+    // manage-integrator falls to edit like MapActionToModulePermission does).
+    permission accountant_export_create = edit
+    permission accountant_export_delete = edit
+    permission accountant_export_read = view
+    permission accountant_export_retry = edit
+    permission accountant_export_update = edit
+    permission bank_accounts_create = edit
+    permission bank_accounts_read = view
+    permission bank_accounts_update = edit
+    permission bank_import_create = edit
+    permission bank_import_delete = edit
+    permission bank_import_read = view
+    permission bank_import_update = edit
+    permission cash_bank_archive = edit
+    permission cash_bank_create = edit
+    permission cash_bank_delete = edit
+    permission cash_bank_read = view
+    permission cash_bank_update = edit
+    permission chart_of_accounts_create = edit
+    permission chart_of_accounts_delete = edit
+    permission chart_of_accounts_read = view
+    permission chart_of_accounts_update = edit
+    permission credit_debit_notes_create = edit
+    permission credit_debit_notes_delete = edit
+    permission credit_debit_notes_read = view
+    permission credit_debit_notes_update = edit
+    permission edoc_credits_create = edit
+    permission edoc_credits_delete = edit
+    permission edoc_credits_manage = manage
+    permission edoc_credits_read = view
+    permission edoc_credits_update = edit
+    permission edoc_despatches_read = view
+    permission edoc_despatches_retry = edit
+    permission engineering_changes_create = edit
+    permission engineering_changes_read = view
+    permission engineering_changes_update = edit
+    permission inspection_plans_create = edit
+    permission inspection_plans_read = view
+    permission inspection_plans_update = edit
+    permission kur_farki_create = edit
+    permission kur_farki_delete = edit
+    permission kur_farki_read = view
+    permission kur_farki_update = edit
+    permission period_close_read = view
+    permission period_close_update = edit
+    permission preventive_maintenance_create = edit
+    permission preventive_maintenance_read = view
+    permission preventive_maintenance_update = edit
+    permission purchase_invoices_cancel = edit
+    permission purchase_invoices_create = edit
+    permission purchase_invoices_delete = edit
+    permission purchase_invoices_pay = edit
+    permission purchase_invoices_read = view
+    permission purchase_invoices_update = edit
+    permission saved_views_create = edit
+    permission saved_views_delete = edit
+    permission saved_views_read = view
+    permission saved_views_update = edit
+    permission settings_manage_integrator = edit
+    // FLOW-8 (b62): HR offer approval is its own grant (was gated by offers_create); aliases manage like the other approve actions.
+    permission offers_approve = manage
+    // FLOW-3 (b61): park / retry / dismiss source events (SD, MM, PM, payroll, inventory hand-offs) the pre-accounting rules refused.
+    permission source_events_manage = manage
+    permission source_events_read = view
+
+    // R4 commerce: granular resource_action permissions of Inventory, MM
+    // (purchasing) and SD (sales) (B24 LD-B24-3). Same aliasing rule as above,
+    // with the R4 stance that destructive/approval actions are manage-level:
+    // read/view->view; create/update/submit/post/receive and similar->edit;
+    // approve/reject/cancel/override/reverse/block/unblock/delete/terminate,
+    // payment, recalculate and admin-style manage_* ->manage (SoD-relevant
+    // approvals stay manage). Business permission strings are unchanged.
+    permission abc_classification_read = view
+    permission abc_classification_recalculate = edit
+    permission abc_classification_update = edit
+    permission ai_insights_read = view
+    permission alerts_read = view
+    permission analytics_delete = manage
+    permission analytics_read = view
+    permission approvals_create = edit
+    permission approvals_delete = manage
+    permission approvals_read = view
+    permission approvals_update = edit
+    permission batches_create = edit
+    permission batches_delete = manage
+    permission batches_read = view
+    permission batches_update = edit
+    permission billing_create = edit
+    permission billing_delete = manage
+    permission billing_post = edit
+    permission billing_read = view
+    permission billing_update = edit
+    permission bom_assemble = edit
+    permission bom_create = edit
+    permission bom_delete = manage
+    permission bom_read = view
+    permission bom_update = edit
+    // PPSCM standard costing (R6 WP-09). Release is manage-level and distinct from production settlement (D15 SoD).
+    permission costing_read = view
+    permission costing_run = edit
+    permission costing_release = manage
+    // PPSCM production settlement (R6 WP-18). Run is edit-level (D15): distinct from releasing standard costs (costing_release, manage).
+    permission settlement_read = view
+    permission settlement_run = edit
+    // Reversing a completed settlement is manage-level (D15): a planner holding only settlement_run cannot undo a posted month.
+    permission settlement_reverse = manage
+    // D10: the material price / quantity variance split is read-level on top of settlement_read (the Buyume+ plan flag gates it separately).
+    permission settlement_variance_analysis = view
+    // PPSCM production orders: issue components beyond the over-issue tolerance (R6 WP-13; manage-level, reason recorded).
+    permission production_orders_override_issue = manage
+    // R6 WP-22 (spec 16 §8): canonical ppscm:* permission names. Same aliasing rule as the blocks above: read -> view, delete -> manage,
+    // everything else -> edit. Shop-floor confirmations are additionally scoped per work center through definition work_center below
+    // (the Operator / kiosk template holds shop_floor_update but not shop_floor_confirm_any). The SoD pair stays split: costing_release and
+    // settlement_run / settlement_reverse are never in one non-admin role template (R6 D15, enforced by the business PpscmPermissionTests).
+    permission demand_planning_read = view
+    permission demand_planning_create = edit
+    permission demand_planning_update = edit
+    permission mrp_create = edit
+    permission mrp_update = edit
+    permission mrp_convert_planned_order = edit
+    permission production_orders_read = view
+    permission production_orders_create = edit
+    permission production_orders_update = edit
+    permission production_orders_delete = manage
+    permission production_orders_issue_material = edit
+    permission production_orders_receive_production = edit
+    permission production_orders_close = edit
+    permission production_orders_report_scrap = edit
+    permission production_orders_pass_quality_gate = edit
+    permission production_orders_view_genealogy = view
+    permission production_orders_manage_genealogy = edit
+    permission routings_read = view
+    permission routings_create = edit
+    permission routings_update = edit
+    permission routings_delete = manage
+    permission routings_manage_formulas = edit
+    permission work_centers_read = view
+    permission work_centers_create = edit
+    permission work_centers_update = edit
+    permission work_centers_delete = manage
+    permission work_centers_manage_capacity = edit
+    permission work_centers_manage_calendar = edit
+    permission shop_floor_read = view
+    permission shop_floor_update = edit
+    permission shop_floor_confirm_any = edit
+    permission subcontracting_read = view
+    permission subcontracting_create = edit
+    permission subcontracting_update = edit
+    permission categories_create = edit
+    permission categories_delete = manage
+    permission categories_read = view
+    permission categories_update = edit
+    permission commissions_create = edit
+    permission commissions_delete = manage
+    permission commissions_read = view
+    permission commissions_update = edit
+    permission consignment_create = edit
+    permission consignment_delete = manage
+    permission consignment_read = view
+    permission consignment_update = edit
+    permission contracts_activate = edit
+    permission contracts_create = edit
+    permission contracts_delete = manage
+    permission contracts_read = view
+    permission contracts_terminate = manage
+    permission contracts_update = edit
+    permission cross_dock_create = edit
+    permission cross_dock_delete = manage
+    permission cross_dock_read = view
+    permission cross_dock_update = edit
+    permission currency_create = edit
+    permission currency_delete = manage
+    permission currency_read = view
+    permission currency_update = edit
+    permission customers_create = edit
+    permission customers_delete = manage
+    permission customers_read = view
+    permission customers_update = edit
+    permission cycle_counts_approve = manage
+    permission cycle_counts_create = edit
+    permission cycle_counts_delete = manage
+    permission cycle_counts_execute_physical_inventory = edit
+    permission cycle_counts_read = view
+    permission cycle_counts_update = edit
+    permission deliveries_cancel = manage
+    permission deliveries_create = edit
+    permission deliveries_delete = manage
+    permission deliveries_goods_issue = edit
+    permission deliveries_pack = edit
+    permission deliveries_pick = edit
+    permission deliveries_read = view
+    permission deliveries_reverse_goods_issue = manage
+    permission deliveries_select_warehouse = edit
+    permission deliveries_ship = edit
+    permission deliveries_update = edit
+    permission document_flow_read = view
+    permission edi_create = edit
+    permission edi_delete = manage
+    permission edi_read = view
+    permission edi_update = edit
+    permission forecasts_read = view
+    permission freight_create = edit
+    permission freight_delete = manage
+    permission freight_read = view
+    permission freight_update = edit
+    permission goods_receipts_cancel = manage
+    permission goods_receipts_create = edit
+    permission goods_receipts_delete = manage
+    permission goods_receipts_inspect = edit
+    permission goods_receipts_post = edit
+    permission goods_receipts_read = view
+    permission goods_receipts_return = manage
+    // R5 WP-15 (spec 15 §8.1): QMS calibration result (the only writer of cmms calibration results / gauge status)
+    // and calibration standards reference data.
+    permission calibration_record_result = edit
+    permission calibration_standards_read = view
+    permission calibration_standards_create = edit
+    permission calibration_standards_update = edit
+    // R5 WP-16 (spec 15 §6.2): calibration out-of-tolerance impact assessments (read side; the CMMS event consumer opens them).
+    permission impact_assessment_read = view
+    // R5 b7 (WP-18): assess / open NCRs for suspect lots / close an impact assessment (Kalite Müdürü = editor).
+    permission impact_assessment_update = edit
+    // R5 b7 (WP-18): repair a controlled-document version whose approval callback never arrived (admin only; the engine decides, this only re-syncs).
+    permission documents_resync_approval = manage
+
+    // R5 WP-22 (spec 15 §8.1): canonical qms:* permission names. read -> view, approve -> manage, everything else -> edit
+    // (RequirePermissionAttribute fallback rule). Quality Manager / Maintenance Manager role templates grant these per key.
+    permission audits_read = view
+    permission audits_create = edit
+    permission audits_update = edit
+    permission calibration_read = view
+    permission calibration_create = edit
+    permission calibration_update = edit
+    permission capa_read = view
+    permission capa_create = edit
+    permission capa_update = edit
+    permission capa_approve = manage
+    permission certificates_read = view
+    permission certificates_create = edit
+    permission certificates_update = edit
+    permission certificates_delete = edit
+    permission change_control_read = view
+    permission change_control_create = edit
+    permission change_control_update = edit
+    permission change_control_delete = edit
+    permission change_control_approve = manage
+    permission complaints_read = view
+    permission complaints_create = edit
+    permission complaints_update = edit
+    permission compliance_read = view
+    permission compliance_update = edit
+    permission control_plans_read = view
+    permission control_plans_create = edit
+    permission control_plans_update = edit
+    permission control_plans_delete = edit
+    permission control_plans_approve = manage
+    permission cost_of_quality_read = view
+    permission cost_of_quality_create = edit
+    permission cost_of_quality_update = edit
+    permission cost_of_quality_delete = edit
+    permission deviations_read = view
+    permission deviations_create = edit
+    permission deviations_update = edit
+    permission deviations_delete = edit
+    permission deviations_approve = manage
+    permission documents_read = view
+    permission documents_create = edit
+    permission documents_update = edit
+    permission documents_delete = edit
+    permission documents_approve = manage
+    permission eight_d_read = view
+    permission eight_d_create = edit
+    permission eight_d_update = edit
+    permission eight_d_delete = edit
+    permission eight_d_approve = manage
+    permission equipment_read = view
+    permission equipment_create = edit
+    permission inspection_orders_read = view
+    permission inspection_orders_create = edit
+    permission inspection_orders_update = edit
+    permission inspection_orders_delete = edit
+    permission inspection_plans_delete = edit
+    permission inspection_plans_approve = manage
+    permission inspections_read = view
+    permission inspections_create = edit
+    permission inspections_update = edit
+    permission msa_read = view
+    permission msa_create = edit
+    permission msa_update = edit
+    permission ncr_read = view
+    permission ncr_create = edit
+    permission ncr_update = edit
+    permission ncr_delete = edit
+    permission notifications_read = view
+    permission notifications_create = edit
+    permission notifications_update = edit
+    permission qms_audit_trail_read = view
+    permission risk_assessment_read = view
+    permission risk_assessment_create = edit
+    permission risk_assessment_update = edit
+    permission sampling_plans_read = view
+    permission spc_read = view
+    permission spc_create = edit
+    permission spc_update = edit
+    permission supplier_quality_read = view
+    permission supplier_quality_create = edit
+    permission supplier_quality_update = edit
+    permission supplier_quality_approve = manage
+    permission training_read = view
+    permission training_create = edit
+    permission training_update = edit
+    permission training_delete = edit
+
+    // feat1: HR certificates and tenant-scoped PLM (no resource tuples).
+    permission certifications_read = view
+    permission certifications_create = edit
+    permission certifications_update = edit
+    permission certifications_delete = edit
+    permission ecr_read = view
+    permission ecr_create = edit
+    permission ecr_update = edit
+    permission ecr_approve = manage
+    permission eco_read = view
+    permission eco_create = edit
+    permission eco_update = edit
+    permission eco_approve = manage
+    permission eco_implement = edit
+    permission cad_read = view
+    permission cad_create = edit
+    permission cad_update = edit
+    permission cad_delete = edit
+    permission revisions_approve = manage
+    permission revisions_release = manage
+
+    // R5 WP-22 (spec 15 §8.1): canonical cmms:* permission names (same aliasing rule; decommission and approve -> manage).
+    permission assets_read = view
+    permission assets_create = edit
+    permission assets_update = edit
+    permission assets_delete = edit
+    permission assets_decommission = manage
+    permission condition_monitoring_read = view
+    permission condition_monitoring_create = edit
+    permission condition_monitoring_update = edit
+    permission condition_monitoring_delete = edit
+    permission contractors_read = view
+    permission contractors_create = edit
+    permission contractors_update = edit
+    permission contractors_delete = edit
+    permission crafts_read = view
+    permission crafts_create = edit
+    permission crafts_update = edit
+    permission crafts_delete = edit
+    permission crews_read = view
+    permission crews_create = edit
+    permission crews_update = edit
+    permission crews_delete = edit
+    permission downtime_read = view
+    permission downtime_create = edit
+    permission downtime_update = edit
+    permission downtime_delete = edit
+    permission energy_read = view
+    permission energy_create = edit
+    permission energy_update = edit
+    permission energy_delete = edit
+    permission failures_read = view
+    permission failures_create = edit
+    permission fmea_read = view
+    permission fmea_create = edit
+    permission fmea_update = edit
+    permission fmea_delete = edit
+    permission job_plans_read = view
+    permission kpis_read = view
+    permission loto_read = view
+    permission maintenance_budgets_read = view
+    permission maintenance_budgets_create = edit
+    permission maintenance_budgets_update = edit
+    permission maintenance_budgets_delete = edit
+    permission maintenance_documents_read = view
+    permission maintenance_documents_create = edit
+    permission maintenance_documents_update = edit
+    permission maintenance_documents_delete = edit
+    permission maintenance_plans_read = view
+    permission maintenance_plans_create = edit
+    permission maintenance_plans_update = edit
+    permission maintenance_plans_delete = edit
+    permission maintenance_requests_read = view
+    permission maintenance_requests_create = edit
+    permission maintenance_requests_create_own = maintenance_request_creator
+    permission maintenance_requests_read_own = maintenance_request_reader
+    permission maintenance_requests_update = edit
+    permission maintenance_requests_delete = edit
+    permission rca_read = view
+    permission rca_create = edit
+    permission rca_update = edit
+    permission rca_delete = edit
+    permission reliability_read = view
+    permission reliability_create = edit
+    permission reliability_update = edit
+    permission reliability_delete = edit
+    permission safety_incidents_read = view
+    permission safety_inspections_read = view
+    permission safety_read = view
+    permission safety_manage = manage
+    permission safety_write = edit
+    permission spare_parts_read = view
+    permission spare_parts_create = edit
+    permission spare_parts_update = edit
+    permission spare_parts_admin = manage
+    permission technicians_read = view
+    permission technicians_create = edit
+    permission technicians_update = edit
+    permission technicians_delete = edit
+    permission vendor_performance_read = view
+    permission vendor_performance_create = edit
+    permission vendor_performance_update = edit
+    permission vendor_performance_delete = edit
+    permission warranties_read = view
+    permission warranties_create = edit
+    permission warranties_update = edit
+    permission warranties_delete = edit
+    permission work_order_comments_read = view
+    permission work_order_sla_read = view
+    permission work_orders_read = view
+    permission work_orders_create = edit
+    permission work_orders_update = edit
+    permission work_orders_delete = edit
+    permission work_orders_approve = manage
+    permission work_orders_reject = edit
+    permission work_permits_read = view
+    permission work_permits_create = edit
+    permission work_permits_update = edit
+    permission work_permits_approve = manage
+    permission work_shifts_read = view
+    permission work_shifts_create = edit
+    permission work_shifts_update = edit
+    permission work_shifts_delete = edit
+    permission goods_receipts_reverse = manage
+    permission goods_receipts_update = edit
+    permission invoice_match_override = manage
+    permission items_create = edit
+    permission items_delete = manage
+    permission items_manage_serial_numbers = edit
+    permission items_manage_uom = edit
+    permission items_read = view
+    permission items_update = edit
+    permission materials_create = edit
+    permission materials_delete = manage
+    permission materials_read = view
+    permission materials_update = edit
+    permission movement_types_create = edit
+    permission movement_types_delete = manage
+    permission movement_types_read = view
+    permission movement_types_update = edit
+    permission mrp_delete = manage
+    permission mrp_read = view
+    permission mrp_run = edit
+    permission output_create = edit
+    permission output_delete = manage
+    permission output_read = view
+    permission output_update = edit
+    permission packing_create = edit
+    permission packing_delete = manage
+    permission packing_read = view
+    permission packing_update = edit
+    permission picking_create = edit
+    permission picking_delete = manage
+    permission picking_pack = edit
+    permission picking_read = view
+    permission picking_update = edit
+    permission pricing_create = edit
+    permission pricing_delete = manage
+    permission pricing_read = view
+    permission pricing_update = edit
+    permission promotions_create = edit
+    permission promotions_delete = manage
+    permission promotions_read = view
+    permission promotions_update = edit
+    permission purchase_info_records_create = edit
+    permission purchase_info_records_delete = manage
+    permission purchase_info_records_read = view
+    permission purchase_info_records_set_preferred = edit
+    permission purchase_info_records_update = edit
+    permission purchase_orders_approve = manage
+    permission purchase_orders_cancel = manage
+    permission purchase_orders_close = edit
+    permission purchase_orders_confirm_delivery = edit
+    permission purchase_orders_create = edit
+    permission purchase_orders_delete = manage
+    permission purchase_orders_manage_items = edit
+    permission purchase_orders_read = view
+    permission purchase_orders_receive_callback = edit
+    permission purchase_orders_reject = manage
+    permission purchase_orders_send = edit
+    permission purchase_orders_submit = edit
+    permission purchase_orders_update = edit
+    permission purchase_requisitions_approve = manage
+    permission purchase_requisitions_cancel = manage
+    permission purchase_requisitions_convert_to_po = edit
+    permission purchase_requisitions_create = edit
+    permission purchase_requisitions_delete = manage
+    permission purchase_requisitions_read = view
+    permission purchase_requisitions_reject = manage
+    permission purchase_requisitions_submit = edit
+    permission purchase_requisitions_update = edit
+    permission quotations_accept = edit
+    permission quotations_cancel = manage
+    permission quotations_convert = edit
+    permission quotations_create = edit
+    permission quotations_delete = manage
+    permission quotations_read = view
+    permission quotations_reject = edit
+    permission quotations_send = edit
+    permission quotations_update = edit
+    permission rebates_create = edit
+    permission rebates_delete = manage
+    permission rebates_read = view
+    permission rebates_update = edit
+    permission reservations_create = edit
+    permission reservations_delete = manage
+    permission reservations_read = view
+    permission reservations_update = edit
+    permission returns_approve = manage
+    permission returns_create = edit
+    permission returns_delete = manage
+    permission returns_read = view
+    permission returns_reject = manage
+    permission returns_update = edit
+    permission revenue_read = view
+    permission revenue_update = edit
+    permission sales_orders_allocate_batch = edit
+    permission sales_orders_approve = manage
+    permission sales_orders_cancel = manage
+    permission sales_orders_check_atp = view
+    permission sales_orders_create = edit
+    permission sales_orders_delete = manage
+    permission sales_orders_override_credit = manage
+    permission sales_orders_read = view
+    permission sales_orders_release = manage
+    permission sales_orders_submit = edit
+    permission sales_orders_update = edit
+    permission shipment_tracking_read = view
+    permission shipment_tracking_update = edit
+    permission shipments_create = edit
+    permission shipments_delete = manage
+    permission shipments_manage_landed_cost = manage
+    permission shipments_read = view
+    permission shipments_update = edit
+    permission stock_movements_adjust = edit
+    permission stock_movements_create = edit
+    permission stock_movements_delete = manage
+    permission stock_movements_read = view
+    permission stock_movements_update = edit
+    permission tax_read = view
+    permission tax_update = edit
+    permission territory_read = view
+    permission territory_update = edit
+    permission transfers_cancel = manage
+    permission transfers_create = edit
+    permission transfers_delete = manage
+    permission transfers_dispatch = edit
+    permission transfers_intercompany_transfer = manage
+    permission transfers_read = view
+    permission transfers_receive = edit
+    permission transfers_update = edit
+    permission valuation_post = manage
+    permission valuation_read = view
+    permission valuation_recalculate = manage
+    permission valuation_run = edit
+    permission valuation_update = edit
+    permission vendor_invoices_block = manage
+    permission vendor_invoices_create = edit
+    permission vendor_invoices_delete = manage
+    permission vendor_invoices_payment = manage
+    permission vendor_invoices_post = edit
+    permission vendor_invoices_read = view
+    permission vendor_invoices_reject = manage
+    permission vendor_invoices_submit = edit
+    permission vendor_invoices_three_way_match = edit
+    permission vendor_invoices_unblock = manage
+    permission vendor_invoices_update = edit
+    permission vendor_invoices_verify = edit
+    permission vendors_block = manage
+    permission vendors_create = edit
+    permission vendors_delete = manage
+    permission vendors_manage_scorecards = manage
+    permission vendors_read = view
+    permission vendors_set_rating = manage
+    permission vendors_unblock = manage
+    permission vendors_update = edit
+    permission vendors_view_scorecards = view
+    permission warehouses_create = edit
+    permission warehouses_delete = manage
+    permission warehouses_manage_permissions = manage
+    permission warehouses_manage_strategy = manage
+    permission warehouses_read = view
+    permission warehouses_update = edit
+
+    // Accounting (general ledger / e-Defter) granular resource:action permissions
+    // (R3 WP-06; business AccountingModule.BuildPermissionManifest, spec 12 s8 + s13.18).
+    // Same aliasing rule as the blocks above: read->view, create/update->edit, and the
+    // workflow/close/approve/run actions->manage (SoD: a plain editor can draft but never
+    // approve, reverse, close or generate). `settings_update` and `reports_read` are
+    // already defined above. Ledger rows are never deleted, so no *_delete is declared
+    // (accounts use `archive`). periods_reopen is deliberately NOT a module relation
+    // grant: only the tenant admin/owner system roles pass it (spec 12 s8), a module
+    // `admin` (the accounting manager) does not.
+    permission accounts_read = view
+    permission accounts_create = edit
+    permission accounts_update = edit
+    permission accounts_archive = manage
+    permission journal_entries_read = view
+    permission journal_entries_create = edit
+    permission journal_entries_update = edit
+    permission journal_entries_approve = manage
+    permission journal_entries_reverse = manage
+    permission periods_read = view
+    permission periods_close = manage
+    permission periods_reopen = tenant->admin + tenant->owner
+    // core:legal_entities:set_default (R3 fu1): tenant admin/owner only, mirrors periods_reopen
+    permission legal_entities_set_default = tenant->admin + tenant->owner
+    // core:legal_entities:set_tax_identity: tenant admin/owner only (one-time tax identity of a tax-pending company)
+    permission legal_entities_set_tax_identity = tenant->admin + tenant->owner
+    // core:edoc:activate / core:edoc:deactivate: e-Donusum (e-Fatura/e-Arsiv) opt-in per company. Activate: tenant admin/owner; deactivation request: tenant owner only.
+    permission edoc_activate = tenant->admin + tenant->owner
+    permission edoc_deactivate = tenant->owner
+    permission cost_centers_read = view
+    permission cost_centers_create = edit
+    permission cost_centers_update = edit
+    permission reports_approve = manage
+    permission fx_run = manage
+    permission edefter_generate = manage
+    permission edefter_submit = manage
+    // edocs:credits:* (edocument-gateway credit ledger, EDOC-X X5): read balance/usage,
+    // manage the low-balance threshold. credits_admin (dealer onboarding, pack grants,
+    // dealer-pool top-ups, reconcile report) is additionally gated to the internal ops
+    // tenant by the gateway (EDOC_OPS_TENANT_ID); never customer-facing.
+    permission credits_read = view
+    permission credits_manage = manage
+    permission credits_admin = manage
+    permission consolidation_run = manage
+    permission posting_rules_read = view
+    permission fixed_assets_read = view
+    permission fixed_assets_create = edit
+    permission fixed_assets_update = edit
+    permission fixed_assets_dispose = manage
+    permission fixed_assets_run_depreciation = manage
+    permission fixed_assets_assign = edit
+    permission budgets_read = view
+    permission budgets_create = edit
+    permission budgets_update = edit
+    permission budgets_approve = manage
+    permission tax_codes_read = view
+    permission tax_codes_update = edit
+
+    // Proje Yönetimi (pm) rates (R-PM WP-12): pm:rates:manage gates resource-rate writes AND whether hourly cost/bill
+    // amounts are returned at all (business SpiceDbRateVisibility checks this name with no module-level fallback, so
+    // without it every caller gets amounts stripped). Manage-level: rates are salary-adjacent, members/externals never see them.
+    permission rates_manage = manage
+
+    // Proje Yönetimi (pm) RPM-B3: pm:billing:approve releases a fixed-price billing milestone before its deliverable is done;
+    // pm:time_tracking:approve decides other people's weekly timesheets (never one's own, enforced in business); pm:risks:* is the
+    // project risk/issue register (WP-20). Approvals are manage-level, the register follows the usual view/edit/manage split.
+    permission billing_approve = manage
+    permission time_tracking_approve = manage
+    permission risks_read = view
+    permission risks_create = edit
+    permission risks_update = edit
+    permission risks_delete = manage
+    // Proje Yönetimi (pm) R-PM WP-15: pm:material:* stock issued to a project. Issuing/reversing moves stock and books project
+    // cost (edit-level, like an Inventory goods issue); the register itself follows the usual view/edit/manage split.
+    permission material_read = view
+    permission material_create = edit
+    permission material_update = edit
+    permission material_delete = manage
+    permission material_issue = edit
+
+    // Projeler (RPM WP-22, spec 22 §8): the PM permission module key moved pm -> projects, so these are the checks on module:<tenant>/projects.
+    // Only names that no other module uses are aliased here; the shared names (workflows_/templates_ read/create/update/delete, billing_read,
+    // reports_read, dashboard_read, import_*) stay as they are. Read -> view, work on tasks/sprints/resources -> edit; money (budget/cost/rates/
+    // billing), approvals, timesheet decisions, archive and settings -> manage, so a module editor never sees amounts or approves. The business
+    // PM controllers additionally set FallbackToModuleLevel=false on the SoD-critical checks.
+    permission projects_read = view
+    permission tasks_read = view
+    permission sprints_read = view
+    permission resources_read = view
+    permission resources_view_workload = view
+    permission wiki_read = view
+    permission boards_read = view
+    permission portfolios_read = view
+    permission comments_read = view
+    permission time_tracking_read = view
+
+    permission projects_create = edit
+    permission projects_update = edit
+    permission projects_plan = edit
+    permission projects_export = edit
+    permission tasks_create = edit
+    permission tasks_update = edit
+    permission tasks_delete = edit
+    permission tasks_manage_assignees = edit
+    permission tasks_manage_relations = edit
+    permission tasks_manage_attachments = edit
+    permission tasks_manage_reminders = edit
+    permission sprints_create = edit
+    permission sprints_update = edit
+    permission sprints_delete = edit
+    permission sprints_start = edit
+    permission sprints_complete = edit
+    permission sprints_manage_retrospective = edit
+    permission sprints_refine_backlog = edit
+    permission resources_allocate = edit
+    permission resources_bulk_allocate = edit
+    permission wiki_create = edit
+    permission wiki_update = edit
+    permission wiki_delete = edit
+    permission boards_manage_columns = edit
+    permission portfolios_create = edit
+    permission portfolios_update = edit
+    permission portfolios_delete = edit
+    permission portfolios_manage_initiatives = edit
+    permission portfolios_manage_milestones = edit
+    permission portfolios_manage_releases = edit
+    permission comments_react = edit
+    permission templates_instantiate = edit
+    permission templates_save_as = edit
+    permission templates_manage_saved_views = edit
+    permission analytics_export = edit
+    permission analytics_manage_dashboards = edit
+    permission timesheet_own = edit
+    permission change_request_create = edit
+
+    permission projects_manage = manage
+    permission projects_archive = manage
+    permission resources_manage_capacity = manage
+    permission resources_bulk_manage_capacity = manage
+    permission resources_manage_teams = manage
+    permission analytics_manage_reports = manage
+    permission workflows_manage_states = manage
+    permission workflows_manage_transitions = manage
+    permission workflows_toggle = manage
+    permission workflows_manage_automations = manage
+    permission workflows_toggle_automation = manage
+    permission templates_manage_custom_fields = manage
+    permission templates_manage_labels = manage
+    permission timesheet_approve = manage
+    permission timesheet_reopen = manage
+    permission budget_read = manage
+    permission budget_manage = manage
+    permission budget_approve = manage
+    permission cost_read = manage
+    permission billing_manage = manage
+    permission change_request_approve = manage
+    permission rates_read = manage
+    permission rd_read = manage
+    permission rd_manage = manage
+}
+
+/**
+ * AccessGrant - Fine-grained permission/grant definition
+ * Format: module:resource:action (e.g., crm:contacts:create)
+ * Note: Named "access_grant" because "permission" is a reserved keyword in SpiceDB
+ */
+definition access_grant {
+    // Which tenant this grant belongs to
+    relation tenant: tenant
+
+    // Roles that have this grant
+    relation granted_to: role#member | user
+    relation granted_to_role: role
+
+    // Check if user has this grant
+    permission check = granted_to + granted_to_role->member + tenant->admin
+}
+
+/**
+ * Document - Generic resource for fine-grained access control
+ * Can represent invoices, contracts, reports, etc.
+ */
+definition document {
+    // Which tenant this document belongs to
+    relation tenant: tenant
+
+    // Document ownership and access
+    relation owner: user
+    relation editor: user | group#member | role#member
+    relation viewer: user | group#member | role#member
+    relation approver: user | role#member
+
+    // Parent folder/container for inheritance
+    relation parent: folder
+
+    // Computed permissions
+    permission view = owner + editor + viewer + approver + tenant->admin + parent->view
+    permission edit = owner + editor + tenant->admin + parent->edit
+    permission delete = owner + tenant->admin + parent->delete
+    permission approve = owner + approver + tenant->admin
+    permission share = owner + tenant->admin
+}
+
+/**
+ * Folder - Container for documents with inherited permissions
+ */
+definition folder {
+    // Which tenant this folder belongs to
+    relation tenant: tenant
+
+    // Folder access
+    relation owner: user
+    relation editor: user | group#member | role#member
+    relation viewer: user | group#member | role#member
+
+    // Parent folder for hierarchy
+    relation parent: folder
+
+    // Computed permissions
+    permission view = owner + editor + viewer + tenant->admin + parent->view
+    permission edit = owner + editor + tenant->admin + parent->edit
+    permission delete = owner + tenant->admin + parent->delete
+    permission create_document = owner + editor + tenant->admin + parent->create_document
+}
+
+/**
+ * API Key - Service account or API key authorization
+ */
+definition api_key {
+    // Which tenant this API key belongs to
+    relation tenant: tenant
+
+    // Owner of the API key
+    relation owner: user
+
+    // Scoped permissions (what the API key can do)
+    relation scope: access_grant
+
+    // Computed permissions
+    permission use = owner
+    permission revoke = owner + tenant->admin
+    permission view = owner + tenant->admin
+}
+
+/**
+ * Session - User session for session-based authorization
+ */
+definition session {
+    // Which tenant this session belongs to
+    relation tenant: tenant
+
+    // Session owner
+    relation owner: user
+
+    // Impersonator (if session is impersonated)
+    relation impersonator: user
+
+    // Computed permissions
+    permission use = owner + impersonator
+    permission revoke = owner + impersonator + tenant->admin
+}
+
+// ============================================================================
+// ERP Module-Specific Resources
+// ============================================================================
+
+/**
+ * CRM Resources
+ */
+definition crm_contact {
+    relation tenant: tenant
+    relation owner: user
+    relation assigned_to: user
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + assigned_to + viewer + tenant->admin
+    permission edit = owner + assigned_to + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+definition crm_company {
+    relation tenant: tenant
+    relation owner: user
+    relation account_manager: user
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + account_manager + viewer + tenant->admin
+    permission edit = owner + account_manager + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+definition crm_opportunity {
+    relation tenant: tenant
+    relation owner: user
+    relation sales_rep: user
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + sales_rep + viewer + tenant->admin
+    permission edit = owner + sales_rep + tenant->admin
+    permission delete = owner + tenant->admin
+    permission close = owner + sales_rep + tenant->admin
+}
+
+/**
+ * Finance Resources
+ */
+definition invoice {
+    relation tenant: tenant
+    relation creator: user
+    relation approver: user | role#member | user with approval_limit
+    relation viewer: user | group#member | role#member
+    relation company: company
+    relation record_open: user:* with record_not_locked
+
+    permission view = creator + approver + viewer + tenant->admin
+    permission edit = creator + tenant->admin
+    permission delete = creator + tenant->admin
+    permission approve = approver + tenant->admin
+    permission void = tenant->admin
+
+    // NEW (R2 WP-02) - record-lock-gated variants (spec 23 section 4.3).
+    // `record_open` must hold a `user:*` tuple carrying the
+    // `record_not_locked` caveat for the record; callers pass
+    // `record_status` at Check time. No tuple, or a posted/locked status,
+    // denies; a missing `record_status` is CONDITIONAL (treated as denied).
+    permission edit_unlocked = edit & record_open
+    permission approve_unlocked = approve & record_open
+}
+
+definition payment {
+    relation tenant: tenant
+    relation creator: user
+    relation approver: user | role#member | user with approval_limit
+    relation company: company
+    relation record_open: user:* with record_not_locked
+
+    permission view = creator + approver + tenant->admin
+    permission edit = creator + tenant->admin
+    permission approve = approver + tenant->admin
+    permission process = approver + tenant->admin
+
+    // NEW (R2 WP-02) - see invoice.record_open.
+    permission edit_unlocked = edit & record_open
+    permission approve_unlocked = approve & record_open
+}
+
+/**
+ * HR Resources
+ */
+definition employee {
+    relation tenant: tenant
+    relation self: user
+    relation manager: user
+    relation hr_admin: user | role#member
+    // hr_admin_sensitive: separate grant for salary/PII-level HR data
+    // (EmployeeRelationshipService.GrantHRAdminAccessAsync writes this
+    // alongside hr_admin as a distinct, narrower relation -- t-582)
+    relation hr_admin_sensitive: user | role#member
+    // payroll_officer: bordro uzmanı / SMMM; reads payroll amounts without the
+    // broader PII grant of hr_admin_sensitive (R-HR WP-09)
+    relation payroll_officer: user | role#member
+
+    permission view_basic = self + manager + hr_admin + hr_admin_sensitive + tenant->admin
+    permission view_sensitive = self + hr_admin_sensitive + tenant->admin
+    permission view_payroll = self + payroll_officer + hr_admin_sensitive + tenant->admin
+    permission edit = hr_admin + hr_admin_sensitive + tenant->admin
+    permission terminate = tenant->admin
+    // line manager or HR approves leave (R-HR WP-10); self-approval is refused in the HR service
+    permission approve_leave = manager + hr_admin + hr_admin_sensitive + tenant->admin
+  // performance management (HR KPI plan WP-P0a): employee sees own released
+  // scorecard, line manager reviews, HR calibrates; mirrors approve_leave shape
+  permission view_performance = self + manager + hr_admin + hr_admin_sensitive + tenant->admin
+  permission review_performance = manager + hr_admin + hr_admin_sensitive + tenant->admin
+  permission calibrate_performance = hr_admin + hr_admin_sensitive + tenant->admin
+}
+
+/**
+ * Payroll run (R-HR WP-20): per-run segregation of duties. The calculator and
+ * the last adjuster are excluded by approve/reject. approve_any establishes
+ * permission before the business sole-approver guard applies compensating
+ * controls; it is not itself an authorization to bypass SoD.
+ */
+definition payroll_run {
+    relation tenant: tenant
+    relation calculator: user
+    relation last_adjuster: user
+    relation approver: user | role#member
+
+    permission view = approver + calculator + tenant->admin
+    permission approve_any = approver + tenant->admin
+    permission approve = approve_any - calculator - last_adjuster
+    permission reject = approve
+}
+
+/**
+ * Project Management Resources
+ */
+// project.manager/viewer/external_contributor relations are written by the business PM module's ProjectRelationMap
+// (ProjectMemberService, TeamMemberAddedEventHandler): Lead -> owner, Manager -> manager, Contributor/Reviewer -> member,
+// Observer -> viewer, ExternalContributor -> external_contributor (RPM WP-22). Only assignee + the project pointer are ever
+// written on task (t-582 audit: TaskAssignedEventHandler, TaskCreatedEventHandler). Business SpiceDB writes are no-ops in
+// shadow mode, so no live tuples exist until enforcement is switched on (the backfill must use ProjectRelationMap).
+definition project {
+    relation tenant: tenant
+    relation owner: user
+    relation manager: user
+    relation member: user
+    relation viewer: user
+    relation external_contributor: user
+
+    permission view = owner + manager + member + viewer + tenant->admin
+    permission edit = owner + manager + tenant->admin
+    permission delete = owner + tenant->admin
+    permission manage_members = owner + manager + tenant->admin
+    // Budget/cost/rate fields of this project: never member, viewer or external_contributor.
+    permission view_financials = owner + manager + tenant->admin
+    // Time may be booked by the people doing the work, including an external contributor (who cannot otherwise view the project).
+    permission log_time = owner + manager + member + external_contributor
+}
+
+definition task {
+    relation tenant: tenant
+    relation project: project
+    relation assignee: user
+
+    permission view = assignee + project->view
+    permission edit = assignee + project->edit
+    permission delete = project->edit
+    permission complete = assignee + project->edit
+}
+
+/**
+ * Inventory Resources
+ */
+// warehouse.manager/staff and product.editor/viewer narrowed to plain
+// `user` -- t-582 writer audit (WarehousePermissionService) confirmed
+// these are only ever written as bare user subjects; product.editor/
+// viewer are never written by any code path (product.owner is the only
+// real grant), so those two relations are dropped rather than left
+// declared-but-unpopulated.
+definition warehouse {
+    relation tenant: tenant
+    relation manager: user
+    relation staff: user
+
+    permission view = manager + staff + tenant->admin
+    permission manage_inventory = manager + tenant->admin
+    permission transfer = manager + staff + tenant->admin
+}
+
+definition product {
+    relation tenant: tenant
+    relation owner: user
+
+    permission view = owner + tenant->admin
+    permission edit = owner + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+/**
+ * E-Commerce Resources
+ */
+definition ecommerce_product {
+    relation tenant: tenant
+    relation owner: user
+    relation editor: user | role#member
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + editor + viewer + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+definition ecommerce_customer {
+    relation tenant: tenant
+    relation owner: user
+    relation editor: user | role#member
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + editor + viewer + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+definition ecommerce_order {
+    relation tenant: tenant
+    relation owner: user
+    relation editor: user | role#member
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + editor + viewer + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+definition ecommerce_category {
+    relation tenant: tenant
+    relation owner: user
+    relation editor: user | role#member
+    relation viewer: user | group#member | role#member
+
+    permission view = owner + editor + viewer + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+// ============================================================================
+// ERP Module-Specific Resources, part 2 (write-verified, t-582)
+//
+// Every relation below is scoped to a resourceType that has at least one
+// confirmed ISpiceDbClient.WriteRelationshipAsync / BulkWriteRelationshipsAsync
+// call site in src/Modules/**. Relations NOT written anywhere by real code
+// are intentionally omitted (see t-582 research notes) rather than invented.
+//
+// Subject-type note: role-sourced grants below (`approver`, vendor.viewer)
+// use bare `role` (not `role#member`). RelationshipUpdate.Create's optional
+// subjectRelation argument is never passed at any of these call sites, so
+// the tuples business actually writes are bare `role:<id>` object
+// references, not `role:<id>#member` usersets -- declaring `role#member`
+// here would make WriteRelationship reject every one of them as a type
+// mismatch. This differs from the module/document/folder/warehouse-style
+// relations elsewhere in this file, which use full `role#member` usersets
+// via a different, independently-verified call path.
+// ============================================================================
+
+/**
+ * MM (Materials Management) Resources
+ */
+definition purchase_order {
+    relation tenant: tenant
+    relation creator: user
+    relation approver: user | role
+    relation receiver: user
+
+    permission view = creator + receiver + approver + tenant->admin
+    permission edit = creator + tenant->admin
+    permission approve = approver + tenant->admin
+    permission receive = receiver + tenant->admin
+}
+
+definition material {
+    relation tenant: tenant
+    relation creator: user
+
+    permission view = creator + tenant->admin
+    permission edit = creator + tenant->admin
+}
+
+/**
+ * vendor is written from two independent modules: MM
+ * (SpiceDbRelationshipService, `creator`) and Finance
+ * (FinanceAuthorizationService, `creator` again + `viewer` role-scoped
+ * to "finance_user"). Both are unioned here rather than split.
+ */
+definition vendor {
+    relation tenant: tenant
+    relation creator: user
+    relation viewer: user | role
+
+    permission view = creator + viewer + tenant->admin
+    permission edit = creator + tenant->admin
+}
+
+/**
+ * Finance Resources (write-verified)
+ */
+definition bill {
+    relation tenant: tenant
+    relation creator: user
+    relation viewer: user
+    relation editor: user
+    relation approver: user | role | user with approval_limit
+    relation company: company
+    relation record_open: user:* with record_not_locked
+
+    permission view = creator + viewer + editor + approver + tenant->admin
+    permission edit = creator + editor + tenant->admin
+    permission approve = approver + tenant->admin
+
+    // NEW (R2 WP-02) - see invoice.record_open.
+    permission edit_unlocked = edit & record_open
+    permission approve_unlocked = approve & record_open
+}
+
+definition expense_report {
+    relation tenant: tenant
+    relation owner: user
+    relation viewer: user
+    relation editor: user
+    relation approver: user | role | user with approval_limit
+    relation company: company
+    relation record_open: user:* with record_not_locked
+
+    permission view = owner + viewer + editor + approver + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission approve = approver + tenant->admin
+
+    // NEW (R2 WP-02) - see invoice.record_open.
+    permission edit_unlocked = edit & record_open
+    permission approve_unlocked = approve & record_open
+}
+
+/**
+ * FICO (Financial Controlling) Resources
+ */
+definition cost_center {
+    relation tenant: tenant
+    relation manager: user
+    relation viewer: user
+    relation editor: user
+
+    permission view = manager + viewer + editor + tenant->admin
+    permission edit = manager + editor + tenant->admin
+    permission manage = manager + tenant->admin
+}
+
+definition budget {
+    relation tenant: tenant
+    relation approver: user | role
+
+    permission view = approver + tenant->admin
+    permission approve = approver + tenant->admin
+}
+
+definition fixed_asset {
+    relation tenant: tenant
+    relation custodian: user
+    // Pointer relation: assigned_to references the owning cost_center
+    // object directly (arrow traversal), not a usual per-user grant --
+    // written only when a cost center is assigned to the asset.
+    relation assigned_to: cost_center
+
+    permission view = custodian + assigned_to->view + tenant->admin
+    permission edit = custodian + tenant->admin
+}
+
+definition profit_center {
+    relation tenant: tenant
+    relation manager: user
+
+    permission view = manager + tenant->admin
+    permission edit = manager + tenant->admin
+}
+
+/**
+ * PPSCM (Production Planning & Supply Chain) Resources
+ */
+definition production_order {
+    relation tenant: tenant
+    relation operator: user
+    // R6 WP-22: the planner who owns the order (Üretim Planlamacı) edits it without being a shop-floor operator.
+    relation planner: user
+
+    permission view = operator + planner + tenant->admin
+    permission edit = operator + planner + tenant->admin
+}
+
+/**
+ * R6 WP-22 / D16: a work center and the users operating it. Kiosk (Operatör) confirmations are checked against the work center of the
+ * operation (the actual work center when the confirmation names one): `confirm = operator + tenant->admin`. Supervisors, engineers and
+ * legacy module editors confirm anywhere through the module-level shop_floor_confirm_any / edit grants, not through this relation.
+ */
+definition work_center {
+    relation tenant: tenant
+    relation operator: user
+
+    permission confirm = operator + tenant->admin
+}
+
+/**
+ * quality_gate and production_scrap are both checked
+ * ([RequireResourcePermission]) AND written, unlike the rest of this
+ * section -- permissions below mirror the exact checked-permission
+ * strings from QualityGatesController / ProductionScrapController.
+ */
+definition quality_gate {
+    relation tenant: tenant
+    relation creator: user
+    relation approver: user | role
+
+    permission view = creator + approver + tenant->admin
+    permission complete = creator + tenant->admin
+    permission approve = approver + tenant->admin
+}
+
+definition production_scrap {
+    relation tenant: tenant
+    relation creator: user
+    relation disposer: user | role
+
+    permission view = creator + disposer + tenant->admin
+    permission dispose = disposer + tenant->admin
+}
+
+/**
+ * SD (Sales & Distribution) Resources
+ */
+definition sales_order {
+    relation tenant: tenant
+    relation sales_rep: user
+    relation approver: user | role
+    relation approved_by: user
+
+    permission view = sales_rep + approver + approved_by + tenant->admin
+    permission edit = sales_rep + tenant->admin
+    permission approve = approver + tenant->admin
+    permission allocate = sales_rep + approved_by + tenant->admin
+}
+
+definition delivery {
+    relation tenant: tenant
+    relation assigned_to: user
+
+    permission view = assigned_to + tenant->admin
+    permission edit = assigned_to + tenant->admin
+}
+
+/**
+ * CRM Resources, part 2
+ *
+ * crm_pipeline is the ONLY domain entity in the codebase driven by the
+ * generic IAuthorizableEntity/SpiceDbSaveChangesInterceptor mechanism
+ * (Pipeline : IOwnedEntity, ICreatorTrackedEntity) in addition to its
+ * own explicit PipelinePermissionService writes -- it gets `owner` +
+ * `creator` from the interceptor, and `viewer`/`editor`/`owner` again
+ * from AccessLevelToRelation (view/edit/admin). Checked permissions
+ * confirmed via PipelinesController are "edit" and "delete"; "view" is
+ * inferred from the viewer relation's existence and is not itself a
+ * confirmed checked shape.
+ */
+definition crm_pipeline {
+    relation tenant: tenant
+    relation owner: user
+    relation creator: user
+    relation viewer: user | role
+    relation editor: user | role
+
+    permission view = owner + creator + viewer + editor + tenant->admin
+    permission edit = owner + editor + tenant->admin
+    permission delete = owner + tenant->admin
+}
+
+// ============================================================================
+// Application Object & Service Principal (Entra ID-inspired)
+// ============================================================================
+
+/**
+ * Application - Global application definition registered on the platform.
+ * Equivalent to Entra ID "Application Object" — a blueprint that can be
+ * instantiated per-tenant via a Service Principal.
+ */
+definition application {
+    // The tenant that owns / published this application
+    relation owner: tenant
+
+    // Tenants that have granted admin consent to install this application
+    relation consented_tenant: tenant
+
+    // Management: only admins of the owning tenant
+    permission manage = owner->admin
+
+    // Installation: consented tenant admins or owning tenant admins
+    permission install = consented_tenant->admin + owner->admin
+
+    // Viewing: members of consented tenants or the owning tenant
+    permission view = consented_tenant->member + owner->member
+}
+
+/**
+ * Service Principal - Per-tenant instantiation of an Application.
+ * Equivalent to Entra ID "Service Principal" — represents an app's identity
+ * and permissions within a specific tenant.
+ */
+definition service_principal {
+    // Which application this SP was instantiated from
+    relation application: application
+
+    // Which tenant this SP is installed in
+    relation tenant: tenant
+
+    // The user who provisioned / owns this SP
+    relation owner: user
+
+    // Use: tenant members who can also view the application
+    permission use = tenant->member & application->view
+
+    // Management: tenant admins
+    permission manage = tenant->admin
+
+    // View: any member of the tenant
+    permission view = tenant->member
+}
+
+// ============================================================================
+// Platform Product & Instance Resources (Multi-Product Architecture)
+// ============================================================================
+
+/**
+ * Platform Product - A product registered on the HexxLock platform
+ * (e.g., ExampleSuite, Example PMS, Car Rental, Travel Agency).
+ * Tracks which tenants are subscribed to which products.
+ */
+definition platform_product {
+    // The tenant that owns/published this product
+    relation owner: tenant
+
+    // Tenants that have an active subscription to this product
+    relation subscribed_tenant: tenant
+
+    // Access: subscribed tenants and the owning tenant
+    permission access = subscribed_tenant + owner
+
+    // Management: only admins of the owning tenant
+    permission manage = owner->admin
+}
+
+/**
+ * Product Instance - A provisioned instance of a product for a specific tenant.
+ * Tracks the provisioning lifecycle and authorization for product usage.
+ */
+definition platform_product_instance {
+    // Which product this instance belongs to
+    relation product: platform_product
+
+    // Which tenant this instance is provisioned for
+    relation tenant: tenant
+
+    // The user who triggered the provisioning
+    relation provisioner: user
+
+    // Use: tenant members who have product access
+    permission use = tenant->member & product->access
+    permission admin = tenant->admin & product->access
+    permission view = tenant->view & product->access
+}
+
+/**
+ * Talon IAP route — per-route ReBAC for *.internal.example.com admin tier.
+ *
+ * This is the cluster's single SoR for the schema (see the file header),
+ * applied by the dedicated `spicedb-schema` Argo CD Application — NOT by
+ * falcon-id's own chart, and NOT by Talon. Talon — the IAP at
+ * talon.svc.cluster.local, sole IAP for every *.internal.example.com host —
+ * owns and writes `talon_route` RELATIONSHIPS at runtime via the
+ * TalonRoute CRD reconciler (talon/internal/policy/spicedb.go); it only
+ * READS this schema at startup to verify the definition is live
+ * (talon/internal/spicedb/client.go EnsureSchema, since t-582 — Talon no
+ * longer calls WriteSchema itself). Because SpiceDB's `WriteSchema` API
+ * REPLACES the entire schema, omitting this definition would drop it on
+ * the next apply of this chart — SpiceDB then refuses the drop because
+ * Talon's live relationships still reference it, wedging this
+ * Application's schema-write hook (production trace 2026-04-28:
+ * schema-write Job crashlooped with "cannot delete object definition
+ * `talon_route`, as a relationship exists under it" until this
+ * definition was added to the union).
+ *
+ * Definition shape is byte-identical to Talon's own former copy
+ * (deleted from talon/internal/spicedb/schema.zed as part of t-582 —
+ * this file is now the ONLY copy). Talon writes the `viewer` / `editor`
+ * / `admin` relations from the TalonRoute reconciler.
+ */
+definition talon_route {
+    relation viewer: user | group#member
+    relation editor: user | group#member
+    relation admin:  user | group#member
+
+    permission access = viewer + editor + admin
+    permission write  = editor + admin
+    permission manage = admin
+}
+
+/**
+ * active_elevation - R1 platform-plane JIT elevation + break-glass caveat
+ * (the product specification §12.3/§12.4,
+ * 23-authorization-rbac-abac-rebac.md §4.3).
+ *
+ * Attached to every hxl_platform relationship written for a time-bound
+ * grant (JIT elevation activation and break-glass self-grant). `now` is
+ * supplied by the caller (falcon-id) at CHECK time via
+ * CheckPermissionRequest.Context, never trusted from the relationship
+ * write itself, so a grant that outlives its own expires_at stops passing
+ * checks the instant `now` crosses it - no separate delete is required
+ * for the permission check to fail-closed; the auto-revoke sweep
+ * (internal/services/platform_jit_service.go) still deletes the
+ * relationship afterwards so ListRelationships / audits don't show a
+ * phantom grant forever.
+ *
+ * Caveats in the schema: this one, entitlement_window, and (R2 WP-02)
+ * approval_limit + record_not_locked (end of file). The rest of the
+ * 23-authorization... §4.3 catalog - branch_scope,
+ * sensitive_access_window, mfa_fresh - has no confirmed writer yet per the
+ * t-582 survey discipline at the top of this file; deliberately NOT added
+ * until a real call site exists.
+ * authzed-go v1.8.0 (already vendored, see go.mod) supports
+ * ContextualizedCaveat/OptionalCaveat on WriteRelationships and Context on
+ * CheckPermission, so caveats are usable today despite the roadmap's
+ * "zero caveats live" baseline being written before this change.
+ */
+caveat active_elevation(now timestamp, expires_at timestamp) {
+  now < expires_at
+}
+
+/**
+ * entitlement_window - bounds an `entitled_module` tuple to the entitlement's
+ * end date (trial end, grace end, current period end). Same CEL shape as
+ * `active_elevation`; kept as a separate caveat so entitlement and elevation
+ * semantics can diverge. Callers pass `now` as check-time context; a check
+ * without `now` is CONDITIONAL, which falcon-id treats as not entitled.
+ */
+caveat entitlement_window(now timestamp, expires_at timestamp) {
+  now < expires_at
+}
+
+/**
+ * approval_limit - amount threshold on `approver: user with approval_limit`
+ * (invoice, payment, bill, expense_report; spec 23 section 4.3). `amount` /
+ * `currency` come from the document, `limit_amount` / `limit_currency` from
+ * the approver's Postgres approval-limit row, all supplied as Check context
+ * (never baked into the tuple), so changing a limit is a Postgres update.
+ *
+ * Currency mismatch is false (fail-closed, never a cross-currency
+ * comparison); amount == limit passes. Any missing parameter makes the
+ * check CONDITIONAL, which falcon-id treats as denied.
+ *
+ * DEVIATION from spec 23 section 4.3: the spec types amounts as `decimal`,
+ * which is not a SpiceDB caveat type (valid: bool, string, int, uint, double,
+ * bytes, duration, timestamp, list, map, ipaddress, any). `double` is used;
+ * callers should send the decimal amount as a JSON number.
+ */
+caveat approval_limit(amount double, currency string, limit_amount double, limit_currency string) {
+    currency == limit_currency && amount <= limit_amount
+}
+
+/**
+ * record_not_locked - record-state gate on `record_open: user:* with
+ * record_not_locked` (invoice, payment, bill, expense_report; spec 23
+ * section 4.3). Belt-and-suspenders in front of the DB-level
+ * `fn_forbid_mutate_posted` trigger. A missing `record_status` is
+ * CONDITIONAL (denied). NOTE: this is a denylist and case-sensitive - any
+ * status other than exactly "posted"/"locked" passes, so the PEP must send
+ * the canonical lowercase status (R2 WP-16 decides allowlist vs denylist).
+ */
+caveat record_not_locked(record_status string) {
+    record_status != "posted" && record_status != "locked"
+}

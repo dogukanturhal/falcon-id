@@ -42,7 +42,7 @@ import (
 //     them across operator vs. application would re-introduce the
 //     "schema is keystone-reconciled but data is not" gap that motivated
 //     bootstrapPlatformRealm + bootstrapAdminUser in the first place
-//     (memory: internal engineering notes).
+//     (operational notes).
 //
 //   - Idempotent on every restart, survives any future falcon-id-pg
 //     fresh-initdb without operator intervention. Same shape as

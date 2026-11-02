@@ -923,3 +923,79 @@ func TestTokenValidateAccessTokenWithSessionCheck_MinimalTokenNoCache(t *testing
 	assert.Nil(t, claims)
 }
 
+
+// TestGenerateMinimalToken_ResolverError_OmitsProductsClaim asserts the
+// fail-closed contract for the v1 minimal-token mint path
+// (generateMinimalToken, used by GenerateAccessTokenWithOptions with
+// UseMinimal): when the product subscription resolver errors, the token
+// must carry NO `products` claim at all — never an empty array (which some
+// gates could misread) and never "all products" (which would be a
+// privilege-escalation bug). This locks the behaviour documented at
+// token_service.go's resolver-error log.Warn call site.
+func TestGenerateMinimalToken_ResolverError_OmitsProductsClaim(t *testing.T) {
+	cfg := createTestConfig()
+	mockTokenRepo := new(MockTokenRepository)
+	mockUserRepo := new(MockTokenUserRepository)
+
+	svc := NewTokenService(cfg, mockTokenRepo, mockUserRepo)
+	failingResolver := NewProductSubscriptionResolver(
+		&mockSubscriptionInstanceRepo{err: errors.New("db unavailable")},
+		&mockSubscriptionProductRepo{products: map[uuid.UUID]*models.Product{}},
+	)
+	svc.SetProductSubscriptionResolver(failingResolver)
+
+	user := createTestUser()
+	sessionID := uuid.New()
+
+	tokenString, err := svc.GenerateAccessTokenWithOptions(context.Background(), user, sessionID,
+		[]string{"user"}, []string{"crm:contacts:read"}, TokenGenerationOptions{
+			RealmID:    models.DefaultRealmID,
+			UseMinimal: true,
+		})
+	require.NoError(t, err)
+	require.NotEmpty(t, tokenString)
+
+	parsed, err := jwt.Parse(tokenString, func(_ *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWTSecret), nil
+	})
+	require.NoError(t, err)
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+
+	_, present := claims["products"]
+	assert.False(t, present, "resolver error must fail closed: products claim must be entirely absent, not empty or all-products")
+}
+
+// TestGenerateAccessTokenV2_ResolverError_OmitsProductsClaim is the v2
+// (SpiceDB) mint-path counterpart of
+// TestGenerateMinimalToken_ResolverError_OmitsProductsClaim.
+func TestGenerateAccessTokenV2_ResolverError_OmitsProductsClaim(t *testing.T) {
+	cfg := createTestConfig()
+	mockTokenRepo := new(MockTokenRepository)
+	mockUserRepo := new(MockTokenUserRepository)
+
+	svc := NewTokenService(cfg, mockTokenRepo, mockUserRepo)
+	failingResolver := NewProductSubscriptionResolver(
+		&mockSubscriptionInstanceRepo{err: errors.New("db unavailable")},
+		&mockSubscriptionProductRepo{products: map[uuid.UUID]*models.Product{}},
+	)
+	svc.SetProductSubscriptionResolver(failingResolver)
+
+	user := createTestUser()
+	sessionID := uuid.New()
+
+	tokenString, err := svc.GenerateAccessTokenV2(context.Background(), user, sessionID,
+		[]string{"user"}, TokenGenerationOptions{RealmID: models.DefaultRealmID})
+	require.NoError(t, err)
+	require.NotEmpty(t, tokenString)
+
+	parsed, err := jwt.Parse(tokenString, func(_ *jwt.Token) (interface{}, error) {
+		return []byte(cfg.JWTSecret), nil
+	})
+	require.NoError(t, err)
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	require.True(t, ok)
+
+	_, present := claims["products"]
+	assert.False(t, present, "resolver error must fail closed: products claim must be entirely absent, not empty or all-products")
+}

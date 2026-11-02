@@ -48,6 +48,19 @@ const (
 	ACRValueAAL3 = "urn:hexxlock:aal3"
 )
 
+// IsPhishingResistantAMR reports whether an AMR snapshot proves a
+// phishing-resistant authenticator: a WebAuthn/passkey ceremony ("hwk"; the
+// server always requires user verification for it). pwd, otp, sms, email and
+// the "mfa" umbrella are NOT phishing-resistant.
+func IsPhishingResistantAMR(amr []string) bool {
+	for _, m := range amr {
+		if m == AMRValueHardwareKey {
+			return true
+		}
+	}
+	return false
+}
+
 // AMR values per RFC 8176 used by Falcon-ID. Other authenticator types
 // (e.g. "pwd", "otp", "mfa") are emitted by the auth_service path; this
 // const set is the WebAuthn-relevant subset.

@@ -83,6 +83,8 @@ func (r *rotationPolicyTestRepo) ConsumeRefreshToken(_ context.Context, tokenID 
 	tok.IsRevoked = true
 	now := time.Now()
 	tok.RevokedAt = &now // mirror the repo's `revoked_at = now` for grace-window checks
+	rsn := "rotated"     // mirror the repo's `revoke_reason = 'rotated'`
+	tok.RevokeReason = &rsn
 	r.consumedTokenIDs = append(r.consumedTokenIDs, tokenID)
 	return true, nil
 }

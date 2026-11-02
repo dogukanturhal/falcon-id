@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/testsupport"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -45,12 +46,14 @@ CREATE TABLE iam_users(id uuid primary key, tenant_id uuid not null, is_active b
 CREATE TABLE iam_roles(id uuid primary key, tenant_id uuid not null, name text not null, priority int not null, is_system bool not null default false);
 CREATE TABLE iam_user_roles(user_id uuid not null references iam_users(id), role_id uuid not null references iam_roles(id), assigned_by uuid, expires_at timestamptz, primary key(user_id,role_id));
 CREATE INDEX iam_user_roles_role_id_idx ON iam_user_roles(role_id);
-CREATE TABLE iam_sessions(user_id uuid not null references iam_users(id), is_active bool not null default true, ended_at timestamptz, end_reason text);
+CREATE TABLE iam_oauth_tokens(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid, user_id uuid, token_type text NOT NULL DEFAULT 'access_token', refresh_token text, is_revoked boolean NOT NULL DEFAULT false, revoked_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now(), idp_session_id uuid, token_family_id uuid, session_id uuid);
+CREATE TABLE iam_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid not null references iam_users(id), is_active bool not null default true, ended_at timestamptz, end_reason text);
 CREATE TABLE iam_audit_log(id uuid primary key default gen_random_uuid(), tenant_id uuid, user_id uuid, target_user_id uuid, action text, resource_type text, resource_id uuid, details jsonb, ip_address text, country_code text, user_agent text, success bool, error_message text, created_at timestamptz default now());`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	repo := NewUserRepository(pool)
+	require.NoError(t, execTest(pool, testsupport.PermissionOutboxDDL))
 	tenant, actor, target := uuid.New(), uuid.New(), uuid.New()
 	owner, member, orgAdmin, manager := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	for _, u := range []uuid.UUID{actor, target} {
@@ -132,7 +135,7 @@ func TestTeamInvitationPostgresUniqueContract(t *testing.T) {
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	require.NoError(t, err)
 	defer pool.Close()
-	_, err = pool.Exec(ctx, `CREATE TABLE iam_team_invitations(id uuid primary key, tenant_id uuid not null, email text not null, email_normalized text generated always as (lower(btrim(email))) stored, role_ids uuid[] not null, invited_by uuid not null, token text not null, status text not null, expires_at timestamptz not null, created_at timestamptz not null default now(), accepted_at timestamptz);
+	_, err = pool.Exec(ctx, `CREATE TABLE iam_team_invitations(id uuid primary key, tenant_id uuid not null, email text not null, email_normalized text generated always as (lower(btrim(email))) stored, role_ids uuid[] not null, invited_by uuid not null, token text not null, status text not null, seat_class text not null default 'member', last_resent_at timestamptz, expires_at timestamptz not null, created_at timestamptz not null default now(), accepted_at timestamptz);
 CREATE UNIQUE INDEX idx_iam_team_invitations_pending_tenant_email_normalized_unique ON iam_team_invitations (tenant_id, email_normalized) WHERE status='pending';`)
 	require.NoError(t, err)
 	repo := NewTeamInvitationRepository(pool)
@@ -150,7 +153,7 @@ CREATE UNIQUE INDEX idx_iam_team_invitations_pending_tenant_email_normalized_uni
 		if _, err := tx.Exec(ctx, `UPDATE iam_team_invitations SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1`, first.ID); err != nil {
 			return err
 		}
-		if err := txRepo.ExpirePendingForEmail(ctx, tenant, "MEMBER@example.test"); err != nil {
+		if _, err := txRepo.ExpirePendingForEmail(ctx, tenant, "MEMBER@example.test"); err != nil {
 			return err
 		}
 		return txRepo.Create(ctx, second)
@@ -240,7 +243,7 @@ func TestTeamInvitationPostgresTokenDigestAndLegacyLookup(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 	_, err = pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE TABLE iam_team_invitations(id uuid primary key, tenant_id uuid not null, email text not null, role_ids uuid[] not null, invited_by uuid not null, token text not null, status text not null, expires_at timestamptz not null, created_at timestamptz not null default now(), accepted_at timestamptz);`)
+CREATE TABLE iam_team_invitations(id uuid primary key, tenant_id uuid not null, email text not null, role_ids uuid[] not null, invited_by uuid not null, token text not null, status text not null, seat_class text not null default 'member', last_resent_at timestamptz, expires_at timestamptz not null, created_at timestamptz not null default now(), accepted_at timestamptz);`)
 	require.NoError(t, err)
 	invRepo := NewTeamInvitationRepository(pool)
 	tenant, actor, role := uuid.New(), uuid.New(), uuid.New()
@@ -294,6 +297,7 @@ CREATE INDEX iam_user_roles_role_id_idx ON iam_user_roles(role_id);
 CREATE TABLE iam_audit_log(id uuid primary key default gen_random_uuid(), tenant_id uuid, user_id uuid, target_user_id uuid, action text, resource_type text, resource_id uuid, details jsonb, ip_address text, country_code text, user_agent text, success bool, error_message text, created_at timestamptz default now());`)
 	require.NoError(t, err)
 	repo := NewUserRepository(pool)
+	require.NoError(t, execTest(pool, testsupport.PermissionOutboxDDL))
 	tenant, actor := uuid.New(), uuid.New()
 	owner, member, manager, org := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	for _, r := range []struct {
@@ -411,6 +415,7 @@ CREATE INDEX iam_user_roles_role_id_idx ON iam_user_roles(role_id);
 CREATE TABLE iam_audit_log(id uuid primary key default gen_random_uuid(), tenant_id uuid, user_id uuid, target_user_id uuid, action text, resource_type text, resource_id uuid, details jsonb, ip_address text, country_code text, user_agent text, success bool, error_message text, created_at timestamptz default now());`)
 	require.NoError(t, err)
 	repo := NewUserRepository(pool)
+	require.NoError(t, execTest(pool, testsupport.PermissionOutboxDDL))
 	tenant, actor, target := uuid.New(), uuid.New(), uuid.New()
 	manager, member, systemAdmin := uuid.New(), uuid.New(), uuid.New()
 	for _, id := range []uuid.UUID{actor, target} {
@@ -491,11 +496,14 @@ func TestSetTeamMemberActivePostgresCanonicalAdministratorRoles(t *testing.T) {
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	require.NoError(t, err)
 	defer pool.Close()
-	_, err = pool.Exec(ctx, `CREATE TABLE iam_users(id uuid primary key, tenant_id uuid not null, is_active bool not null, updated_at timestamptz not null default now());
+	_, err = pool.Exec(ctx, `CREATE TABLE iam_users(id uuid primary key, tenant_id uuid not null, username text NOT NULL DEFAULT 'person', is_active bool not null, updated_at timestamptz not null default now());
 CREATE TABLE iam_roles(id uuid primary key, tenant_id uuid not null, name text not null, priority int not null, is_system bool not null default false);
 CREATE TABLE iam_user_roles(user_id uuid not null references iam_users(id), role_id uuid not null references iam_roles(id), assigned_by uuid, expires_at timestamptz, primary key(user_id,role_id));
 CREATE INDEX iam_user_roles_role_id_idx ON iam_user_roles(role_id);
-CREATE TABLE iam_sessions(user_id uuid not null references iam_users(id), is_active bool not null default true, ended_at timestamptz, end_reason text);`)
+CREATE TABLE iam_oauth_tokens(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid, user_id uuid, token_type text NOT NULL DEFAULT 'access_token', refresh_token text, is_revoked boolean NOT NULL DEFAULT false, revoked_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now(), idp_session_id uuid, token_family_id uuid, session_id uuid);
+CREATE TABLE iam_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid not null references iam_users(id), is_active bool not null default true, ended_at timestamptz, end_reason text);
+CREATE TABLE iam_user_memberships(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid NOT NULL, user_id uuid NOT NULL, seat_class text NOT NULL DEFAULT 'member', status text NOT NULL DEFAULT 'active', invitation_id uuid, created_at timestamptz NOT NULL DEFAULT now(), deactivated_at timestamptz, access_expires_at timestamptz, UNIQUE(tenant_id,user_id));
+CREATE TABLE tenant_seat_counters(tenant_id uuid PRIMARY KEY, seats_used int NOT NULL DEFAULT 0, seats_pending int NOT NULL DEFAULT 0, seat_limit int, seat_limit_version bigint, seat_limit_computed_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now());`)
 	require.NoError(t, err)
 	repo := NewUserRepository(pool)
 	tenant, actor := uuid.New(), uuid.New()
@@ -551,6 +559,34 @@ CREATE TABLE iam_sessions(user_id uuid not null references iam_users(id), is_act
 			require.ErrorIs(t, repo.SetTeamMemberActive(ctx, tenant, actor, active, false), ErrTeamLastAdministrator)
 		})
 	}
+}
+
+func TestSetTeamMemberActivePostgres_LastOwnerWithOtherAdmin(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL required; use throwaway postgres")
+	}
+	pool, cleanup := newTeamPostgresFixture(t, dsn)
+	defer cleanup()
+	tenant, actor, owner, admin := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	for _, row := range []struct {
+		user     uuid.UUID
+		role     string
+		priority int
+	}{
+		{actor, "manager", 200}, {owner, "owner", 100}, {admin, "admin", 100},
+	} {
+		require.NoError(t, execTest(pool, `INSERT INTO iam_users(id,tenant_id,is_active) VALUES($1,$2,true)`, row.user, tenant))
+		roleID := uuid.New()
+		require.NoError(t, execTest(pool, `INSERT INTO iam_roles(id,tenant_id,name,priority) VALUES($1,$2,$3,$4)`, roleID, tenant, row.role, row.priority))
+		require.NoError(t, execTest(pool, `INSERT INTO iam_user_roles(user_id,role_id) VALUES($1,$2)`, row.user, roleID))
+	}
+	require.NoError(t, execTest(pool, `INSERT INTO iam_sessions(user_id) VALUES($1)`, owner))
+	before := teamMutationSnapshot(t, pool)
+	repo := NewUserRepository(pool)
+	require.ErrorIs(t, repo.SetTeamMemberActive(context.Background(), tenant, actor, owner, false), ErrTeamLastAdministrator)
+	require.Equal(t, before, teamMutationSnapshot(t, pool), "last owner rejection changes no users, grants, sessions or audits")
+	require.ErrorIs(t, repo.SetTeamMemberActive(context.Background(), tenant, actor, actor, false), ErrTeamSelfDeactivation)
 }
 
 // TestSetTeamMemberActivePostgresRejectionMatrix deliberately exercises only
@@ -781,11 +817,15 @@ func newTeamPostgresFixture(t *testing.T, dsn string) (*pgxpool.Pool, func()) {
 	p, err := pgxpool.NewWithConfig(ctx, cfg)
 	require.NoError(t, err)
 	require.NoError(t, execTest(p, `CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE TABLE iam_users(id uuid PRIMARY KEY, tenant_id uuid NOT NULL, is_active boolean NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE iam_users(id uuid PRIMARY KEY, tenant_id uuid NOT NULL, username text NOT NULL DEFAULT 'person', is_active boolean NOT NULL, updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE iam_roles(id uuid PRIMARY KEY, tenant_id uuid NOT NULL, name text NOT NULL, priority integer NOT NULL CHECK(priority >= 0), is_system boolean NOT NULL DEFAULT false);
 CREATE TABLE iam_user_roles(user_id uuid NOT NULL REFERENCES iam_users(id) ON DELETE RESTRICT, role_id uuid NOT NULL REFERENCES iam_roles(id) ON DELETE RESTRICT, assigned_by uuid, expires_at timestamptz, PRIMARY KEY(user_id,role_id)); CREATE INDEX iam_user_roles_role_id_idx ON iam_user_roles(role_id);
-CREATE TABLE iam_sessions(user_id uuid NOT NULL REFERENCES iam_users(id), is_active boolean NOT NULL DEFAULT true, ended_at timestamptz, end_reason text);
+CREATE TABLE iam_oauth_tokens(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid, user_id uuid, token_type text NOT NULL DEFAULT 'access_token', refresh_token text, is_revoked boolean NOT NULL DEFAULT false, revoked_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now(), idp_session_id uuid, token_family_id uuid, session_id uuid);
+CREATE TABLE iam_sessions(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), user_id uuid NOT NULL REFERENCES iam_users(id), is_active boolean NOT NULL DEFAULT true, ended_at timestamptz, end_reason text);
+CREATE TABLE iam_user_memberships(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid NOT NULL, user_id uuid NOT NULL, seat_class text NOT NULL DEFAULT 'member', status text NOT NULL DEFAULT 'active', invitation_id uuid, created_at timestamptz NOT NULL DEFAULT now(), deactivated_at timestamptz, access_expires_at timestamptz, UNIQUE(tenant_id,user_id));
+CREATE TABLE tenant_seat_counters(tenant_id uuid PRIMARY KEY, seats_used int NOT NULL DEFAULT 0, seats_pending int NOT NULL DEFAULT 0, seat_limit int, seat_limit_version bigint, seat_limit_computed_at timestamptz, updated_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE iam_audit_log(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid, user_id uuid, target_user_id uuid, action text, resource_type text, resource_id uuid, details jsonb, ip_address text, country_code text, user_agent text, success boolean, error_message text, created_at timestamptz DEFAULT now());`))
+	require.NoError(t, execTest(p, testsupport.PermissionOutboxDDL))
 	return p, func() {
 		p.Close()
 		_, _ = admin.Exec(ctx, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")

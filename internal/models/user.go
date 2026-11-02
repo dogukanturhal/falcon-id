@@ -139,6 +139,11 @@ type CreateUserRequest struct {
 
 	// Roles to assign
 	RoleIDs []uuid.UUID `json:"role_ids"`
+
+	// EmailVerified marks the mailbox as already proven (self-service signup
+	// completes only after the verification link was followed). Server-side
+	// only: never bound from a request body.
+	EmailVerified bool `json:"-"`
 }
 
 // UpdateUserRequest is an exported type.
@@ -281,4 +286,24 @@ func (u *User) GetFullName() string {
 	}
 
 	return u.Username
+}
+
+// EligibleForTokens reports whether the account may still be issued or keep
+// using tokens/SSO: active, not scheduled for or admin-deleted, and not under
+// an admin lock (locked with no expiry). Mirrors the login-time status gate.
+func (u *User) EligibleForTokens(now time.Time) bool {
+	if u == nil || !u.IsActive {
+		return false
+	}
+	switch u.ActivationStatus {
+	case "pending_deletion", "admin_deleted":
+		return false
+	}
+	// Only an admin lock (no expiry) revokes standing access. A time-limited
+	// lock is the failed-login throttle: honouring it here would let anyone
+	// kill a victim's sessions by guessing wrong passwords.
+	if u.IsLocked && u.LockedUntil == nil {
+		return false
+	}
+	return true
 }
