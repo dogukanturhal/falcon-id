@@ -7,6 +7,17 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Fixed
+
+- Invalid client metadata now returns 400 with an OAuth error instead of 500.
+- Kubernetes Lease leader election now uses the coordination API (#15).
+
+### Changed
+
+- Standalone mode accepts loopback redirect URIs (RFC 8252).
+
 ## [0.1.1]
 
 ### Fixed

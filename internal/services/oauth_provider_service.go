@@ -43,6 +43,26 @@ var ErrClientIDConflict = errors.New("client_id already registered")
 // Handlers map it to HTTP 404.
 var ErrTenantNotFound = errors.New("tenant not found")
 
+// Client-input validation sentinels. Their text is the RFC 7591 §3.2.2 error
+// code, so wrapped errors read "invalid_redirect_uri: <detail>". Handlers map
+// them to HTTP 400 via errors.Is; anything else stays a 500.
+var (
+	ErrInvalidRedirectURI    = errors.New("invalid_redirect_uri")
+	ErrInvalidClientMetadata = errors.New("invalid_client_metadata")
+)
+
+// ClientValidationDescription returns the RFC 7591 error code and the
+// human-readable detail for a client-input validation error, or ok=false when
+// err is not one.
+func ClientValidationDescription(err error) (code, description string, ok bool) {
+	for _, sentinel := range []error{ErrInvalidRedirectURI, ErrInvalidClientMetadata} {
+		if errors.Is(err, sentinel) {
+			return sentinel.Error(), strings.TrimPrefix(err.Error(), sentinel.Error()+": "), true
+		}
+	}
+	return "", "", false
+}
+
 // ErrDPoPRequired is returned when an OAuth grant resolves to a scope
 // set that requires a DPoP-bound token (RFC 9449 §6) but the token
 // request did not carry a valid DPoP proof. The token endpoint maps
@@ -493,6 +513,9 @@ type OAuthProviderService struct {
 	// for tests that don't construct a tenant repository). cmd/services.go
 	// wires the real repository via SetTenantTypeLookup at startup.
 	tenantTypeLookup tenantTypeLookup
+	// standaloneMode (STANDALONE_MODE) lets http(s) loopback redirect URIs
+	// through the tier policy for local quickstarts.
+	standaloneMode bool
 
 	// sessionContextSvc is optional. When wired, RefreshTokens compares
 	// the inbound request's user-agent and country to the linked
@@ -693,6 +716,10 @@ func (s *OAuthProviderService) resolveAuthTimeForToken(ctx context.Context, idpS
 // redirect-URI policy is silently skipped (matches legacy behaviour
 // for unit tests that mock the service). Production wiring is the
 // real TenantRepository, set in cmd/services.go.
+// SetStandaloneMode enables the loopback redirect_uri exception used by
+// standalone/quickstart deployments. Never set in production.
+func (s *OAuthProviderService) SetStandaloneMode(v bool) { s.standaloneMode = v }
+
 func (s *OAuthProviderService) SetTenantTypeLookup(t tenantTypeLookup) {
 	s.tenantTypeLookup = t
 }
@@ -971,9 +998,9 @@ func (s *OAuthProviderService) validateOAuth21GrantsAndResponses(grants, respons
 	for _, g := range grants {
 		switch g {
 		case "password":
-			return fmt.Errorf("invalid_client_metadata: grant_type 'password' (Resource Owner Password Credentials) is removed in OAuth 2.1 (BCP-225 / draft-ietf-oauth-v2-1 §10.1)")
+			return fmt.Errorf("%w: grant_type 'password' (Resource Owner Password Credentials) is removed in OAuth 2.1 (BCP-225 / draft-ietf-oauth-v2-1 §10.1)", ErrInvalidClientMetadata)
 		case "implicit":
-			return fmt.Errorf("invalid_client_metadata: grant_type 'implicit' is removed in OAuth 2.1 (BCP-225 / draft-ietf-oauth-v2-1 §10.2)")
+			return fmt.Errorf("%w: grant_type 'implicit' is removed in OAuth 2.1 (BCP-225 / draft-ietf-oauth-v2-1 §10.2)", ErrInvalidClientMetadata)
 		}
 	}
 	// OAuth 2.1 retains only `code` (with PKCE). The composite
@@ -985,7 +1012,7 @@ func (s *OAuthProviderService) validateOAuth21GrantsAndResponses(grants, respons
 		// space-separated per OIDC Core 1.0 §3.
 		for _, part := range strings.Fields(rt) {
 			if part == "token" || part == "id_token" {
-				return fmt.Errorf("invalid_client_metadata: response_type %q includes implicit-flow token return (only %q is conformant under OAuth 2.1)", rt, "code")
+				return fmt.Errorf("%w: response_type %q includes implicit-flow token return (only %q is conformant under OAuth 2.1)", ErrInvalidClientMetadata, rt, "code")
 			}
 		}
 	}
@@ -1022,7 +1049,7 @@ func validatePublicClientGrants(isPublic bool, grantTypes []string) error {
 	}
 	for _, g := range grantTypes {
 		if g == "client_credentials" {
-			return fmt.Errorf("invalid_client_metadata: public clients cannot use the client_credentials grant")
+			return fmt.Errorf("%w: public clients cannot use the client_credentials grant", ErrInvalidClientMetadata)
 		}
 	}
 	return nil
@@ -1041,7 +1068,7 @@ func (s *OAuthProviderService) CreateClient(ctx context.Context, tenantID uuid.U
 	// any DB write. Same set of checks for create + update keeps the
 	// invariant in one place.
 	if err := validateBrandingURIs(req.LogoURL, req.ClientURI, req.TosURL, req.PolicyURL); err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidClientMetadata, err)
 	}
 
 	// Tier-1 redirect_uri policy: production-tier tenants reject http://
@@ -1063,12 +1090,12 @@ func (s *OAuthProviderService) CreateClient(ctx context.Context, tenantID uuid.U
 		// kept on the strict OAuth 2.1 rails — they go through the
 		// normal sandbox-tenant path for any localhost dev work.
 		nativeApp := req.IsPublic && req.RequirePKCE && req.IsFirstParty
-		if err := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains()); err != nil {
-			return nil, "", fmt.Errorf("invalid_redirect_uri: %w", err)
+		if err := validateRedirectURIsMode(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains(), s.standaloneMode); err != nil {
+			return nil, "", fmt.Errorf("%w: %w", ErrInvalidRedirectURI, err)
 		}
 	}
 	if err := validatePostLogoutRedirectURIs(req.PostLogoutRedirectURIs, req.IsPublic && req.RequirePKCE && req.IsFirstParty, s.nativeAppSchemeDomains()); err != nil {
-		return nil, "", fmt.Errorf("invalid_redirect_uri: %w", err)
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidRedirectURI, err)
 	}
 
 	// Resolve the client_id: honor a caller-supplied value when present
@@ -1229,7 +1256,7 @@ func (s *OAuthProviderService) resolveClientID(ctx context.Context, requested *s
 	}
 	candidate := *requested
 	if !validClientID(candidate) {
-		return "", fmt.Errorf("invalid_client_metadata: client_id must be 1-128 chars matching [a-zA-Z0-9._-] and start with an alphanumeric")
+		return "", fmt.Errorf("%w: client_id must be 1-128 chars matching [a-zA-Z0-9._-] and start with an alphanumeric", ErrInvalidClientMetadata)
 	}
 	existing, err := s.clientRepo.GetByClientID(ctx, candidate)
 	if err == nil && existing != nil {
@@ -1305,7 +1332,7 @@ func (s *OAuthProviderService) UpdateClient(ctx context.Context, id uuid.UUID, r
 	// short-circuits on nil so unchanged fields don't trip on legacy
 	// rows that pre-date the validator.
 	if err := validateBrandingURIs(req.LogoURL, req.ClientURI, req.TosURL, req.PolicyURL); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrInvalidClientMetadata, err)
 	}
 
 	client, err := s.clientRepo.GetByID(ctx, id)
@@ -1342,12 +1369,12 @@ func (s *OAuthProviderService) UpdateClient(ctx context.Context, id uuid.UUID, r
 		}
 		// RFC 8252 native-app gate on the merged traits; same condition
 		// as CreateClient: public + PKCE + first-party.
-		if verr := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains()); verr != nil {
-			return nil, fmt.Errorf("invalid_redirect_uri: %w", verr)
+		if verr := validateRedirectURIsMode(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains(), s.standaloneMode); verr != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidRedirectURI, verr)
 		}
 	}
 	if verr := validatePostLogoutRedirectURIs(req.PostLogoutRedirectURIs, nativeApp, s.nativeAppSchemeDomains()); verr != nil {
-		return nil, fmt.Errorf("invalid_redirect_uri: %w", verr)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRedirectURI, verr)
 	}
 
 	// Apply updates

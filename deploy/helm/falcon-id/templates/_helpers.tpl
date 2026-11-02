@@ -107,6 +107,15 @@ template:
             protocol: TCP
           {{- end }}
         env:
+          # Downward API: leader-election identity (pkg/leaderelection k8s_lease).
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
           {{- if .Values.pprof.enabled }}
           - name: FALCON_PPROF_ENABLED
             value: "true"

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -14,11 +15,11 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/entitlementsync"
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
+	"github.com/dogukanturhal/falcon-id/internal/opsaudit"
 	svc "github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/internal/shared/retention"
 	"github.com/dogukanturhal/falcon-id/internal/signupgap"
 	"github.com/dogukanturhal/falcon-id/internal/tenantprojection"
-	"github.com/dogukanturhal/falcon-id/internal/opsaudit"
 	"github.com/dogukanturhal/falcon-id/internal/tenantstatus"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/keys"
@@ -716,6 +717,7 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 	subCtx, subCancel := context.WithCancel(context.Background())
 	if cfg.StandaloneMode || cfg.TenantManagementInternalURL == "" {
 		logger.Info("Tenant projection bootstrap skipped: tenant-management not configured (standalone mode)")
+		metrics.SetBootstrapComplete(true)
 	} else {
 		bootstrapClient := buildTenantBootstrapClient(cfg, sugar)
 		b := tenantprojection.NewBootstrap(bootstrapClient, cfg.TenantManagementInternalURL, repo, sugar)
@@ -730,8 +732,9 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 			// retrying the snapshot in the background.
 			logger.Warn("Tenant projection bootstrap failed, retrying in background",
 				zap.Error(err))
-			go retryTenantBootstrap(subCtx, b)
+			go retryTenantBootstrap(subCtx, b, metrics)
 		} else {
+			metrics.SetBootstrapComplete(true)
 			logger.Info("Tenant projection bootstrap complete",
 				zap.Int("tenants_processed", n))
 		}
@@ -769,29 +772,39 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 }
 
 // retryTenantBootstrap re-runs the tenant-management REST snapshot with
-// exponential backoff (30s doubling to a 5m cap) until it succeeds or ctx is
-// cancelled. Failures are logged at WARN only.
-func retryTenantBootstrap(ctx context.Context, b *tenantprojection.Bootstrap) {
-	const maxDelay = 5 * time.Minute
+// exponential backoff (30s doubling to a 5m cap, +/-20% jitter) until it
+// succeeds, ctx is cancelled or maxBootstrapAttempts is exhausted. Failures
+// are logged at WARN; giving up is logged at ERROR and leaves the
+// tenantprojection_bootstrap_complete gauge at 0.
+func retryTenantBootstrap(ctx context.Context, b *tenantprojection.Bootstrap, metrics *tenantprojection.Metrics) {
+	const (
+		maxDelay             = 5 * time.Minute
+		maxBootstrapAttempts = 12
+	)
 	delay := 30 * time.Second
-	for {
+	for attempt := 1; attempt <= maxBootstrapAttempts; attempt++ {
+		jittered := time.Duration(float64(delay) * (0.8 + 0.4*rand.Float64()))
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
+		case <-time.After(jittered):
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		n, err := b.RunOnce(attemptCtx)
 		cancel()
 		if err == nil {
+			metrics.SetBootstrapComplete(true)
 			logger.Info("Tenant projection bootstrap complete (after retry)",
-				zap.Int("tenants_processed", n))
+				zap.Int("tenants_processed", n), zap.Int("attempt", attempt))
 			return
 		}
 		logger.Warn("Tenant projection bootstrap retry failed",
-			zap.Error(err), zap.Duration("next_retry_in", min(delay*2, maxDelay)))
+			zap.Error(err), zap.Int("attempt", attempt),
+			zap.Duration("next_retry_in", min(delay*2, maxDelay)))
 		delay = min(delay*2, maxDelay)
 	}
+	logger.Error("Tenant projection bootstrap gave up after max attempts; tenants stay un-projected until restart",
+		zap.Int("attempts", maxBootstrapAttempts))
 }
 
 // startModuleAccessReconcile runs the module-access reconcile once, shortly

@@ -58,6 +58,10 @@ type Metrics struct {
 	// without label filtering on EventsTotal. The outcome=orphan label on
 	// EventsTotal is retained for dashboard filtering.
 	OrphanTotal *prometheus.CounterVec
+
+	// BootstrapComplete is 1 once the initial tenant-management REST snapshot
+	// has been applied (or intentionally skipped in standalone mode), else 0.
+	BootstrapComplete prometheus.Gauge
 }
 
 // NewMetrics registers the projection metrics on reg (pass
@@ -98,9 +102,15 @@ func NewMetrics(reg prometheus.Registerer, log *zap.SugaredLogger) *Metrics {
 			},
 			[]string{"subject"},
 		),
+		BootstrapComplete: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "tenantprojection_bootstrap_complete",
+				Help: "1 once the tenant projection bootstrap snapshot completed (or was skipped in standalone mode), 0 otherwise.",
+			},
+		),
 	}
 
-	for _, c := range []prometheus.Collector{m.LagSeconds, m.EventsTotal, m.OrphanTotal} {
+	for _, c := range []prometheus.Collector{m.LagSeconds, m.EventsTotal, m.OrphanTotal, m.BootstrapComplete} {
 		if err := reg.Register(c); err != nil {
 			if _, ok := err.(prometheus.AlreadyRegisteredError); !ok && log != nil {
 				log.Warnw("tenantprojection: metric registration failed", "error", err)
@@ -108,6 +118,18 @@ func NewMetrics(reg prometheus.Registerer, log *zap.SugaredLogger) *Metrics {
 		}
 	}
 	return m
+}
+
+// SetBootstrapComplete sets the bootstrap gauge to 1 (done) or 0.
+func (m *Metrics) SetBootstrapComplete(done bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if done {
+		v = 1
+	}
+	m.BootstrapComplete.Set(v)
 }
 
 // IncOK records a successfully applied event.

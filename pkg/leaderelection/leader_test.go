@@ -28,70 +28,6 @@ var (
 // K8sLeaseElector — unit tests (no external dependencies)
 // ----------------------------------------------------------------------------
 
-func TestK8sLeaseElector_TryAcquire_DevMode(t *testing.T) {
-	t.Parallel()
-
-	elec := leaderelection.NewK8sLeaseElector("test-lock", "default")
-
-	acquired, err := elec.TryAcquire(context.Background())
-	if err != nil {
-		t.Fatalf("TryAcquire returned unexpected error: %v", err)
-	}
-	if !acquired {
-		t.Fatal("K8sLeaseElector should always acquire in dev mode (placeholder)")
-	}
-	if !elec.IsLeader() {
-		t.Fatal("IsLeader() should return true after successful TryAcquire")
-	}
-}
-
-func TestK8sLeaseElector_Release(t *testing.T) {
-	t.Parallel()
-
-	elec := leaderelection.NewK8sLeaseElector("test-lock", "default")
-
-	if _, err := elec.TryAcquire(context.Background()); err != nil {
-		t.Fatalf("TryAcquire: %v", err)
-	}
-
-	if err := elec.Release(context.Background()); err != nil {
-		t.Fatalf("Release returned unexpected error: %v", err)
-	}
-	if elec.IsLeader() {
-		t.Fatal("IsLeader() should return false after Release")
-	}
-}
-
-func TestK8sLeaseElector_IsLeader_InitiallyFalse(t *testing.T) {
-	t.Parallel()
-
-	elec := leaderelection.NewK8sLeaseElector("test-lock", "default")
-	if elec.IsLeader() {
-		t.Fatal("IsLeader() should be false before TryAcquire is called")
-	}
-}
-
-func TestK8sLeaseElector_RunAsLeader_InvokesFn(t *testing.T) {
-	t.Parallel()
-
-	elec := leaderelection.NewK8sLeaseElector("test-lock", "default")
-
-	called := false
-	err := elec.RunAsLeader(context.Background(), func(_ context.Context) {
-		called = true
-	})
-	if err != nil {
-		t.Fatalf("RunAsLeader returned unexpected error: %v", err)
-	}
-	if !called {
-		t.Fatal("RunAsLeader should call fn when leadership is acquired")
-	}
-	// Leadership must be released after fn returns.
-	if elec.IsLeader() {
-		t.Fatal("IsLeader() should be false after RunAsLeader returns")
-	}
-}
-
 // ----------------------------------------------------------------------------
 // Factory — New()
 // ----------------------------------------------------------------------------
@@ -171,22 +107,17 @@ func TestNew_K8sLease_ImplementsInterface(t *testing.T) {
 	// Exercise all interface methods to confirm they behave correctly.
 	ctx := context.Background()
 
+	if elec.IsLeader() {
+		t.Fatal("IsLeader() should be false before TryAcquire")
+	}
+	// Outside a cluster the in-cluster config is unavailable: TryAcquire must
+	// report an error, never claim leadership.
 	acquired, err := elec.TryAcquire(ctx)
-	if err != nil {
-		t.Fatalf("TryAcquire: %v", err)
+	if err == nil || acquired {
+		t.Fatalf("TryAcquire outside a cluster: acquired=%v err=%v, want error", acquired, err)
 	}
-	if !acquired {
-		t.Fatal("k8s_lease placeholder should always acquire")
-	}
-	if !elec.IsLeader() {
-		t.Fatal("IsLeader() should be true after TryAcquire")
-	}
-
 	if err := elec.Release(ctx); err != nil {
 		t.Fatalf("Release: %v", err)
-	}
-	if elec.IsLeader() {
-		t.Fatal("IsLeader() should be false after Release")
 	}
 }
 

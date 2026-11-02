@@ -125,7 +125,7 @@ curl -s -u "$PROV_ID:$PROV_SECRET" \
 curl -s -X POST http://localhost:8010/api/v1/internal/oauth-clients \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],
-       "response_types":["code"],"redirect_uris":["https://app.example.com/callback"],
+       "response_types":["code"],"redirect_uris":["http://localhost:9999/callback"],
        "scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,
        "logo_url":"https://example.com/logo.png"}'
 ```
@@ -134,7 +134,7 @@ Once a client exists, the authorization-code exchange is:
 
 ```sh
 CLIENT_ID=...   # from the response above
-REDIRECT_URI=https://app.example.com/callback
+REDIRECT_URI=http://localhost:9999/callback
 VERIFIER=$(openssl rand -base64 48 | tr -d '=+/' | cut -c1-64)
 CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 

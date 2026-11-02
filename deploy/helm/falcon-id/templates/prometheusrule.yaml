@@ -483,4 +483,29 @@ spec:
               Check pod logs for: "CAEPOutboxDrainer.deliverRow" or
               "buildSET" Error lines. Cross-check the keys subsystem
               health via iam_oauth_* signer alerts.
+
+    - name: falcon-id.tenantprojection
+      interval: 30s
+      rules:
+        # The tenant projection snapshot (tenant-management REST) never
+        # completed on a pod: pre-existing tenants stay un-projected. The
+        # gauge is 1 on success or when intentionally skipped (standalone).
+        - alert: FalconIDTenantProjectionBootstrapIncomplete
+          expr: |
+            max by (pod) (tenantprojection_bootstrap_complete{
+              namespace="{{ .Release.Namespace }}"
+            }) == 0
+          for: 30m
+          labels:
+            severity: warning
+            service: falcon-id
+            tier: identity
+          annotations:
+            summary: "falcon-id tenant projection bootstrap incomplete on {{`{{ $labels.pod }}`}}"
+            description: |
+              Pod {{`{{ $labels.pod }}`}} has not completed the tenant-management
+              snapshot bootstrap for 30m+ (retries give up after 12 attempts).
+              Check tenant-management reachability, SERVICE_CLIENT_* credentials
+              and ERROR logs "Tenant projection bootstrap gave up"; restart the pod
+              to retry.
 {{- end }}

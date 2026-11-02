@@ -2531,10 +2531,8 @@ func (h *OAuthProviderHandler) CreateClient(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "tenant_not_found"})
 			return
 		}
-		// Format/validation failures from resolveClientID are surfaced
-		// as 400 (the message is operator-readable: "invalid_client_metadata: ...").
-		if strings.HasPrefix(err.Error(), "invalid_client_metadata") {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		// Client-input validation failures: RFC 7591 §3.2.2 400.
+		if respondClientValidationError(c, err) {
 			return
 		}
 		h.logger.Error("Failed to create OAuth client", zap.Error(err))
@@ -2544,6 +2542,18 @@ func (h *OAuthProviderHandler) CreateClient(c *gin.Context) {
 
 	response := client.ToResponseWithSecret(secret)
 	c.JSON(http.StatusCreated, response)
+}
+
+// respondClientValidationError writes a 400 {"error","error_description"}
+// (RFC 7591 §3.2.2) when err is a client-input validation error from the
+// service and reports whether it did.
+func respondClientValidationError(c *gin.Context, err error) bool {
+	code, desc, ok := services.ClientValidationDescription(err)
+	if !ok {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": code, "error_description": desc})
+	return true
 }
 
 // UpdateClient updates an OAuth client
@@ -2616,8 +2626,7 @@ func (h *OAuthProviderHandler) UpdateClient(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "tenant_not_found"})
 			return
 		}
-		if strings.HasPrefix(err.Error(), "invalid_client_metadata") {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		if respondClientValidationError(c, err) {
 			return
 		}
 		h.logger.Error("Failed to update OAuth client", zap.Error(err))

@@ -123,9 +123,19 @@ jobs:
           TOKEN=$(python3 -c 'import json; print(json.load(open("token.json"))["access_token"])')
           code=$(curl -sS -o client.json -w '%{http_code}' -X POST http://localhost:8010/api/v1/internal/oauth-clients \
             -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"redirect_uris":["https://app.example.com/callback"],"scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,"logo_url":"https://example.com/logo.png"}')
+            -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"redirect_uris":["http://localhost:9999/callback"],"scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,"logo_url":"https://example.com/logo.png"}')
           echo "create client: HTTP $code"; cat client.json; echo
           [ "$code" = 201 ] || [ "$code" = 200 ]
+
+      - name: Reject a non-loopback http redirect
+        run: |
+          TOKEN=$(python3 -c 'import json; print(json.load(open("token.json"))["access_token"])')
+          code=$(curl -sS -o bad.json -w '%{http_code}' -X POST http://localhost:8010/api/v1/internal/oauth-clients \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"name":"Bad redirect","grant_types":["authorization_code"],"response_types":["code"],"redirect_uris":["http://app.example.com/cb"],"scopes":["openid"],"is_public":true,"require_pkce":true,"logo_url":"https://example.com/logo.png"}')
+          echo "bad redirect: HTTP $code"; cat bad.json; echo
+          [ "$code" = 400 ]
+          grep -q '"invalid_redirect_uri"' bad.json
 
       - name: Logs on failure
         if: failure()

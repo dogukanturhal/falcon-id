@@ -77,6 +77,15 @@ serviceAccount:
   name: ""
   annotations: {}
 
+# leaderElection — Kubernetes Lease backend (pkg/leaderelection, method
+# "k8s_lease"). When enabled the chart grants the pod ServiceAccount
+# get/create/update/patch on coordination.k8s.io leases in the release
+# namespace. Off by default: the current services use PostgreSQL advisory
+# locks and do not call the k8s_lease backend.
+leaderElection:
+  k8s:
+    enabled: false
+
 # extraEnvFrom — additional secretRef entries injected into the container's
 # envFrom block after the chart-managed vault Secret. Use this to mount
 # operator-managed Secrets (e.g. Strimzi KafkaUser credentials, external
