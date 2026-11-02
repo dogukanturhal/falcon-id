@@ -102,21 +102,11 @@ The last command returns the discovery document. Settings come from
 resets everything. The Postgres schema is loaded only into an empty volume. The
 dev values are throwaways and must not be used anywhere real.
 
-### Create a client and run authorization code with PKCE (known issue)
+### Create a client and run authorization code with PKCE
 
-What works from a clean start: the stack boots, the discovery document is
-served, and a bootstrap service client can obtain a token. What does not work
-yet is creating a client through the internal API: `POST
-/api/v1/internal/oauth-clients` returns HTTP 500 on an empty database, so the
-authorization-code flow cannot be run end to end from a fresh checkout. The
-cause is in the code, not in your setup: `OAuthProviderService.CreateClient`
-looks up the calling tenant and dereferences the result without a nil check,
-and the lookup returns nothing because the internal tenant row is not seeded
-on a clean start. It is being fixed.
-
-The steps below show the intended path. CI runs them on every change as a
-non-blocking job (`quickstart smoke test`) and will be made blocking when the
-fix lands. To get a service token, add this to `.env` and run
+The stack runs in standalone mode (`STANDALONE_MODE=true` in `.env.example`),
+so no other services are needed. CI runs the steps below on every change
+(`quickstart smoke test`). To get a service token, add this to `.env` and run
 `docker compose up -d --force-recreate falcon-id`:
 
 ```sh
@@ -129,13 +119,13 @@ PROV_ID=quickstart-provisioner
 PROV_SECRET=choose-a-long-random-secret   # the value you put in .env
 curl -s -u "$PROV_ID:$PROV_SECRET" \
   -d grant_type=client_credentials -d scope=admin:oauth-clients \
-  http://localhost:8010/oauth/token          # works: returns an access token
+  http://localhost:8010/oauth/token          # returns an access token
 
-# a public client: PKCE is required, there is no secret (currently returns 500)
+# a public client: PKCE is required, there is no secret
 curl -s -X POST http://localhost:8010/api/v1/internal/oauth-clients \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],
-       "response_types":["code"],"redirect_uris":["http://localhost:9999/callback"],
+       "response_types":["code"],"redirect_uris":["https://app.example.com/callback"],
        "scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,
        "logo_url":"https://example.com/logo.png"}'
 ```
@@ -144,7 +134,7 @@ Once a client exists, the authorization-code exchange is:
 
 ```sh
 CLIENT_ID=...   # from the response above
-REDIRECT_URI=http://localhost:9999/callback
+REDIRECT_URI=https://app.example.com/callback
 VERIFIER=$(openssl rand -base64 48 | tr -d '=+/' | cut -c1-64)
 CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
 

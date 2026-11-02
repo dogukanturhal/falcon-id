@@ -45,7 +45,7 @@ func (h *DatabaseHostHandler) GetByID(c *gin.Context) {
 		return
 	}
 	host, err := h.repo.GetByID(c.Request.Context(), id)
-	if err != nil {
+	if err != nil || host == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}
@@ -118,7 +118,7 @@ func (h *DatabaseHostHandler) HealthCheck(c *gin.Context) {
 		return
 	}
 	host, err := h.repo.GetByID(c.Request.Context(), id)
-	if err != nil {
+	if err != nil || host == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "host not found"})
 		return
 	}

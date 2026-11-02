@@ -38,6 +38,11 @@ import (
 // instead of retrying create.
 var ErrClientIDConflict = errors.New("client_id already registered")
 
+// ErrTenantNotFound is returned when a client operation references a tenant
+// that has no iam_tenants row (TenantRepository.GetByID returns nil, nil).
+// Handlers map it to HTTP 404.
+var ErrTenantNotFound = errors.New("tenant not found")
+
 // ErrDPoPRequired is returned when an OAuth grant resolves to a scope
 // set that requires a DPoP-bound token (RFC 9449 §6) but the token
 // request did not carry a valid DPoP proof. The token endpoint maps
@@ -1049,6 +1054,9 @@ func (s *OAuthProviderService) CreateClient(ctx context.Context, tenantID uuid.U
 		if err != nil {
 			return nil, "", fmt.Errorf("CreateClient: tenant lookup: %w", err)
 		}
+		if tenant == nil {
+			return nil, "", fmt.Errorf("CreateClient: %w: %s", ErrTenantNotFound, tenantID)
+		}
 		// RFC 8252 native-app gate: a client qualifies for the loopback
 		// carve-out iff it is PUBLIC (no client_secret), PKCE-required,
 		// AND first-party (HexxLock-vouched). Third-party clients are
@@ -1328,6 +1336,9 @@ func (s *OAuthProviderService) UpdateClient(ctx context.Context, id uuid.UUID, r
 		tenant, terr := s.tenantTypeLookup.GetByID(ctx, client.TenantID)
 		if terr != nil {
 			return nil, fmt.Errorf("UpdateClient: tenant lookup: %w", terr)
+		}
+		if tenant == nil {
+			return nil, fmt.Errorf("UpdateClient: %w: %s", ErrTenantNotFound, client.TenantID)
 		}
 		// RFC 8252 native-app gate on the merged traits; same condition
 		// as CreateClient: public + PKCE + first-party.

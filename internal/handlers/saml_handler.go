@@ -579,6 +579,10 @@ func (h *SAMLHandler) generateAndPostResponse(c *gin.Context, _ uuid.UUID, sp *m
 		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user"})
 		return
 	}
+	if user == nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
 
 	// Generate SAML response
 	samlResponse, err := h.samlService.GenerateSAMLResponse(c.Request.Context(), sp, user, authnRequestID)

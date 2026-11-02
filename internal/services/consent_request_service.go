@@ -93,6 +93,9 @@ func (s *ConsentRequestService) ApproveRequest(
 	if err != nil {
 		return nil, fmt.Errorf("ConsentRequestService.ApproveRequest: reload: %w", err)
 	}
+	if cr == nil {
+		return nil, fmt.Errorf("ConsentRequestService.ApproveRequest: reload: consent request not found")
+	}
 
 	// Auto-grant admin consent when the granter is available.
 	if s.consentGranter != nil {
@@ -130,6 +133,9 @@ func (s *ConsentRequestService) DenyRequest(
 	cr, err = s.repo.GetByID(ctx, requestID)
 	if err != nil {
 		return nil, fmt.Errorf("ConsentRequestService.DenyRequest: reload: %w", err)
+	}
+	if cr == nil {
+		return nil, fmt.Errorf("ConsentRequestService.DenyRequest: reload: consent request not found")
 	}
 	return cr, nil
 }

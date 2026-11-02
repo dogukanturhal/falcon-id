@@ -337,7 +337,7 @@ func (s *SCIMService) ListUsers(ctx context.Context, tenantID uuid.UUID, startIn
 // ValidateUserTenant verifies that a user belongs to the specified tenant
 func (s *SCIMService) ValidateUserTenant(ctx context.Context, userID, tenantID uuid.UUID) error {
 	user, err := s.userRepo.GetByID(ctx, userID)
-	if err != nil {
+	if err != nil || user == nil {
 		return fmt.Errorf("user not found")
 	}
 	if user.TenantID != tenantID {
@@ -363,6 +363,9 @@ func (s *SCIMService) GetUser(ctx context.Context, userID uuid.UUID) (*models.SC
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("GetUser: %w", err)
+	}
+	if user == nil {
+		return nil, fmt.Errorf("GetUser: user not found")
 	}
 
 	return user.ToSCIMUser(s.getBaseURL()), nil
@@ -450,6 +453,9 @@ func (s *SCIMService) UpdateUser(ctx context.Context, userID uuid.UUID, scimUser
 	if err != nil {
 		return nil, fmt.Errorf("UpdateUser: %w", err)
 	}
+	if user == nil {
+		return nil, fmt.Errorf("UpdateUser: user not found")
+	}
 	wasActive := user.IsActive
 
 	// Update fields
@@ -519,6 +525,9 @@ func (s *SCIMService) PatchUser(ctx context.Context, userID uuid.UUID, patchOp *
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("PatchUser: %w", err)
+	}
+	if user == nil {
+		return nil, fmt.Errorf("PatchUser: user not found")
 	}
 	wasActive := user.IsActive
 
@@ -619,6 +628,9 @@ func (s *SCIMService) GetGroup(ctx context.Context, groupID uuid.UUID) (*models.
 	if err != nil {
 		return nil, fmt.Errorf("GetGroup: %w", err)
 	}
+	if role == nil {
+		return nil, fmt.Errorf("GetGroup: group not found")
+	}
 
 	group := role.ToSCIMGroup(s.getBaseURL())
 	// Note: Group members are not included in the basic response
@@ -655,6 +667,9 @@ func (s *SCIMService) UpdateGroup(ctx context.Context, groupID uuid.UUID, scimGr
 	if err != nil {
 		return nil, fmt.Errorf("UpdateGroup: %w", err)
 	}
+	if role == nil {
+		return nil, fmt.Errorf("UpdateGroup: group not found")
+	}
 
 	if scimGroup.DisplayName != "" {
 		role.DisplayName = scimGroup.DisplayName
@@ -674,6 +689,9 @@ func (s *SCIMService) PatchGroup(ctx context.Context, groupID uuid.UUID, patchOp
 	role, err := s.roleRepo.GetByID(ctx, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("PatchGroup: %w", err)
+	}
+	if role == nil {
+		return nil, fmt.Errorf("PatchGroup: group not found")
 	}
 
 	for _, op := range patchOp.Operations {

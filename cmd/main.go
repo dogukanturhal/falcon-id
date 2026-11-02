@@ -68,7 +68,8 @@ func main() {
 
 	services := initServices(repos, infra)
 
-	// Seed-data bootstrap order matters:
+	// Seed-data bootstrap order matters (0. bootstrapInternalTenant creates the
+	// exampletenant tenant row on a clean DB; no-op where it exists):
 	//   1. bootstrapPlatformRealm — ensures the WellKnownRealmPlatform row
 	//      exists in `realms`. Required because keystone manages the table
 	//      structure but not row data; the platform admin cannot be created
@@ -105,6 +106,7 @@ func main() {
 	//      after bootstrapProvisionerOAuthClient so the matrix can
 	//      assume the provisioner row already exists.
 	// All bootstrap steps are idempotent and safe to call on every restart.
+	bootstrapInternalTenant(repos)
 	bootstrapPlatformRealm(repos)
 	bootstrapPlatformRealmTenant(repos)
 	// The SHARED realm holds every self-service customer as a logical tenant

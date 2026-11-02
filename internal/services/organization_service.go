@@ -269,7 +269,7 @@ func (s *OrganizationService) AddMember(ctx context.Context, orgID uuid.UUID, re
 
 	// Verify user exists and belongs to same tenant
 	user, err := s.userRepo.GetByID(ctx, req.UserID)
-	if err != nil {
+	if err != nil || user == nil {
 		return fmt.Errorf("user not found")
 	}
 	if user.TenantID != org.TenantID {
@@ -305,7 +305,7 @@ func (s *OrganizationService) AddMembers(ctx context.Context, orgID uuid.UUID, r
 
 	for _, userID := range req.UserIDs {
 		user, err := s.userRepo.GetByID(ctx, userID)
-		if err != nil {
+		if err != nil || user == nil {
 			continue // Skip non-existent users
 		}
 		if user.TenantID != org.TenantID {

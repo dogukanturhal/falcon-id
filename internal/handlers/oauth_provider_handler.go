@@ -2527,6 +2527,10 @@ func (h *OAuthProviderHandler) CreateClient(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, services.ErrTenantNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "tenant_not_found"})
+			return
+		}
 		// Format/validation failures from resolveClientID are surfaced
 		// as 400 (the message is operator-readable: "invalid_client_metadata: ...").
 		if strings.HasPrefix(err.Error(), "invalid_client_metadata") {
@@ -2608,6 +2612,10 @@ func (h *OAuthProviderHandler) UpdateClient(c *gin.Context) {
 
 	client, err := h.service.UpdateClient(c.Request.Context(), id, &req, userID)
 	if err != nil {
+		if errors.Is(err, services.ErrTenantNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "tenant_not_found"})
+			return
+		}
 		if strings.HasPrefix(err.Error(), "invalid_client_metadata") {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return

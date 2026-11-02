@@ -456,6 +456,10 @@ type Config struct {
 	// disable at runtime without a code change (ops kill-switch).
 	// Default: "true" — must be enabled before Phase 1b flips authoritative writes.
 	TenantProjectionEnabled bool `mapstructure:"TENANT_PROJECTION_ENABLED"`
+	// StandaloneMode (STANDALONE_MODE, default false) marks a deployment that
+	// runs without the HexxLock platform services (docker compose quickstart).
+	// The tenant-management REST snapshot is skipped instead of attempted.
+	StandaloneMode bool `mapstructure:"STANDALONE_MODE"`
 
 	// EntitlementSyncEnabled gates the example.tenant.modules.sync
 	// consumer (the product roadmap §4.1, internal/entitlementsync). Set to
@@ -952,6 +956,7 @@ func LoadConfig() (*Config, error) {
 	// Default true — must be enabled before Phase 1b flips authoritative writes.
 	// Ops kill-switch: set TENANT_PROJECTION_ENABLED=false without redeploying.
 	viper.SetDefault("TENANT_PROJECTION_ENABLED", true)
+	viper.SetDefault("STANDALONE_MODE", false)
 	viper.SetDefault("ENTITLEMENT_SYNC_ENABLED", true)
 	viper.SetDefault("MODULE_ACCESS_RECONCILE_ON_STARTUP", true)
 	viper.SetDefault("ACMEAPP_GRANT_SYNC_ON_STARTUP", true)
@@ -1296,6 +1301,7 @@ func LoadConfig() (*Config, error) {
 
 	// Tenant reverse projection (ADR 0029 Phase 1a).
 	config.TenantProjectionEnabled = viper.GetBool("TENANT_PROJECTION_ENABLED")
+	config.StandaloneMode = viper.GetBool("STANDALONE_MODE")
 	config.EntitlementSyncEnabled = viper.GetBool("ENTITLEMENT_SYNC_ENABLED")
 	config.ModuleAccessReconcileOnStartup = viper.GetBool("MODULE_ACCESS_RECONCILE_ON_STARTUP")
 	config.AcmeAppGrantSyncOnStartup = viper.GetBool("ACMEAPP_GRANT_SYNC_ON_STARTUP")

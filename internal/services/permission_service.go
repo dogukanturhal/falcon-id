@@ -743,6 +743,9 @@ func (s *PermissionService) Update(ctx context.Context, id uuid.UUID, req *model
 	if err != nil {
 		return nil, fmt.Errorf("Update: re-fetch: %w", err)
 	}
+	if updated == nil {
+		return nil, fmt.Errorf("Update: re-fetch: permission not found")
+	}
 
 	// Audit log
 	if s.auditService != nil && auditLog != nil {

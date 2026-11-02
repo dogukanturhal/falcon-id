@@ -955,3 +955,35 @@ func TestOAuthProviderService_DeleteClient_Success(t *testing.T) {
 	require.NoError(t, err)
 	mockClientRepo.AssertExpectations(t)
 }
+
+type nilTenantLookup struct{}
+
+func (nilTenantLookup) GetByID(context.Context, uuid.UUID) (*models.Tenant, error) {
+	return nil, nil
+}
+
+// A missing tenant row (repository returns nil, nil) must yield
+// ErrTenantNotFound, not a nil-pointer panic.
+func TestOAuthProviderService_CreateClient_MissingTenant(t *testing.T) {
+	ctx := context.Background()
+	mockClientRepo := new(MockOAuthClientRepo)
+	mockUserRepo := new(MockOAuthUserRepo)
+	svc := newTestOAuthProviderService(t, mockClientRepo, mockUserRepo)
+	svc.SetTenantTypeLookup(nilTenantLookup{})
+
+	req := &models.CreateOAuthClientRequest{
+		Name:          "SPA App",
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		RedirectURIs:  []string{"https://spa.example.com/callback"},
+		Scopes:        []string{"openid"},
+		IsPublic:      true,
+		RequirePKCE:   true,
+	}
+
+	client, _, err := svc.CreateClient(ctx, uuid.New(), req, nil)
+
+	require.ErrorIs(t, err, ErrTenantNotFound)
+	assert.Nil(t, client)
+	mockClientRepo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
+}

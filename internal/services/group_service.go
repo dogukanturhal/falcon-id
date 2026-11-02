@@ -287,7 +287,7 @@ func (s *GroupService) AddMembers(ctx context.Context, groupID uuid.UUID, userID
 	for _, userID := range userIDs {
 		// Verify user exists and belongs to same tenant
 		user, err := s.userRepo.GetByID(ctx, userID)
-		if err != nil {
+		if err != nil || user == nil {
 			continue // Skip non-existent users
 		}
 		if user.TenantID != group.TenantID {
@@ -416,7 +416,7 @@ func (s *GroupService) AssignRoles(ctx context.Context, groupID uuid.UUID, roleI
 	for _, roleID := range roleIDs {
 		// Verify role exists and belongs to same tenant
 		role, err := s.roleRepo.GetByID(ctx, roleID)
-		if err != nil {
+		if err != nil || role == nil {
 			continue // Skip non-existent roles
 		}
 		if role.TenantID != group.TenantID {
@@ -482,7 +482,7 @@ func (s *GroupService) SetRoles(ctx context.Context, groupID uuid.UUID, roleIDs 
 		if !currentRoleMap[roleID] {
 			// Verify role belongs to same tenant
 			role, err := s.roleRepo.GetByID(ctx, roleID)
-			if err != nil || role.TenantID != group.TenantID {
+			if err != nil || role == nil || role.TenantID != group.TenantID {
 				continue
 			}
 			_ = s.groupRepo.AssignRole(ctx, groupID, roleID, assignedBy)
