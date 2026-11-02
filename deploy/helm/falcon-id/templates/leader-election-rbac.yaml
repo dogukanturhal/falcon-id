@@ -1,0 +1,33 @@
+{{- if .Values.leaderElection.k8s.enabled }}
+---
+# Lease access for pkg/leaderelection (method k8s_lease). Scoped to the release
+# namespace; client-go's LeaseLock needs get/create/update, patch is included
+# for forward compatibility.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "falcon-id.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "falcon-id.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "falcon-id.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "falcon-id.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

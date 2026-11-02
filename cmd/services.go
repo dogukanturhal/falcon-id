@@ -499,6 +499,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// http:// + loopback redirects; demo-tier tenants permit them.
 	// See internal/services/oauth_provider_redirect_uri.go for the policy.
 	oauthProviderService.SetTenantTypeLookup(repos.Tenant)
+	oauthProviderService.SetStandaloneMode(cfg.StandaloneMode)
 	logger.Info("Tier-1 redirect_uri policy enabled (production-tier tenants reject http://localhost)")
 
 	// Wire AuthService as the session-context provider for the OAuth

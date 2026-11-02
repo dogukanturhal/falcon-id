@@ -106,7 +106,7 @@ func main() {
 	//      after bootstrapProvisionerOAuthClient so the matrix can
 	//      assume the provisioner row already exists.
 	// All bootstrap steps are idempotent and safe to call on every restart.
-	bootstrapInternalTenant(repos)
+	bootstrapInternalTenant(repos, infra.Config)
 	bootstrapPlatformRealm(repos)
 	bootstrapPlatformRealmTenant(repos)
 	// The SHARED realm holds every self-service customer as a logical tenant

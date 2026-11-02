@@ -35,8 +35,14 @@ var privateUseSchemeRe = regexp.MustCompile(`^[a-z][a-z0-9.+-]*$`)
 // "no http://" rule. Non-native clients (services, server-side web
 // apps) continue to reject loopback on production tenants.
 func validateRedirectURIs(tenantType models.TenantType, uris []string, nativeApp bool, schemeDomains []string) error {
+	return validateRedirectURIsMode(tenantType, uris, nativeApp, schemeDomains, false)
+}
+
+// validateRedirectURIsMode is validateRedirectURIs plus the standalone
+// loopback exception (see validateRedirectURIMode).
+func validateRedirectURIsMode(tenantType models.TenantType, uris []string, nativeApp bool, schemeDomains []string, standaloneLoopback bool) error {
 	for _, uri := range uris {
-		if err := validateRedirectURI(tenantType, uri, nativeApp, schemeDomains); err != nil {
+		if err := validateRedirectURIMode(tenantType, uri, nativeApp, schemeDomains, standaloneLoopback); err != nil {
 			return err
 		}
 	}
@@ -82,6 +88,15 @@ func validateRedirectURIs(tenantType models.TenantType, uris []string, nativeApp
 // registration metadata (IsPublic + RequirePKCE + IsFirstParty in the
 // CreateClient path).
 func validateRedirectURI(tenantType models.TenantType, raw string, nativeApp bool, schemeDomains []string) error {
+	return validateRedirectURIMode(tenantType, raw, nativeApp, schemeDomains, false)
+}
+
+// validateRedirectURIMode is validateRedirectURI with the STANDALONE_MODE
+// exception: when standaloneLoopback is true, http(s) loopback redirect URIs
+// (localhost, 127.0.0.1, [::1], any port) are accepted regardless of tenant
+// tier, for local quickstarts (RFC 8252 §7.3). Non-loopback hosts keep the
+// full https / tier rules.
+func validateRedirectURIMode(tenantType models.TenantType, raw string, nativeApp bool, schemeDomains []string, standaloneLoopback bool) error {
 	if raw == "" {
 		return errors.New("redirect_uri must not be empty")
 	}
@@ -118,7 +133,7 @@ func validateRedirectURI(tenantType models.TenantType, raw string, nativeApp boo
 	// http:// OK on loopback hosts, regardless of tenant tier. The
 	// carve-out is intentionally narrow: only public+first-party PKCE
 	// clients qualify, gated at the caller (CreateClient/UpdateClient).
-	if nativeApp && isLoopback {
+	if (nativeApp || standaloneLoopback) && isLoopback {
 		return nil
 	}
 

@@ -30,11 +30,12 @@ func New(cfg Config, pool *pgxpool.Pool) (LeaderElector, error) {
 		return NewAdvisoryLockElector(pool, cfg.LockID), nil
 
 	case "k8s_lease":
-		ns := cfg.LockName
-		if ns == "" {
-			ns = "default"
-		}
-		return NewK8sLeaseElector(cfg.LockName, ns), nil
+		// Namespace and identity come from the pod environment
+		// (POD_NAMESPACE / service-account file, POD_NAME / hostname).
+		return NewK8sLeaseElector(cfg.LockName, "").WithOptions(K8sLeaseOptions{
+			LeaseDuration: cfg.LeaseDuration,
+			RetryPeriod:   cfg.RenewInterval,
+		}), nil
 
 	default:
 		return nil, fmt.Errorf("leaderelection: unknown method %q (supported: advisory_lock, k8s_lease)", cfg.Method)
