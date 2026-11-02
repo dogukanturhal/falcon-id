@@ -28,16 +28,16 @@
 # registry.example.com/... path below was never the actual
 # push target):
 #
-#     internal.example.com/ci-tools/ci-cosign:v2.6.3
+#     harbor.internal.example.com/ci-tools/ci-cosign:v2.6.3
 #
 # Build:
 #     docker build --build-arg COSIGN_VERSION=v2.6.3 \
 #                  --build-arg COSIGN_SHA256=<see below> \
-#                  -t internal.example.com/ci-tools/ci-cosign:v2.6.3 \
+#                  -t harbor.internal.example.com/ci-tools/ci-cosign:v2.6.3 \
 #                  -f deploy/cosign/Dockerfile.ci-cosign \
 #                  deploy/cosign
-# Push (after `docker login internal.example.com`):
-#     docker push internal.example.com/ci-tools/ci-cosign:v2.6.3
+# Push (after `docker login harbor.internal.example.com`):
+#     docker push harbor.internal.example.com/ci-tools/ci-cosign:v2.6.3
 #
 # Image is small (~40MB). Pull time from cluster ~2s warm, ~6s cold.
 # Compare to runtime-install pattern: ~5s when GitHub is healthy,

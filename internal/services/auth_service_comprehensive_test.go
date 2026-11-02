@@ -157,6 +157,39 @@ func TestAuthService_CheckUserStatus_PermanentlyLocked(t *testing.T) {
 	assert.Contains(t, err.Error(), "locked")
 }
 
+// TestAuthService_CheckUserStatus_PendingDeletionBlocksLogin is the
+// behavioural test for the self-service soft-delete login block.
+// CONTROL: TestAuthService_CheckUserStatus_Active (above) proves the same
+// call, with ActivationStatus left at its zero value, passes — so this
+// failure is the pending_deletion check firing, not some other gate.
+func TestAuthService_CheckUserStatus_PendingDeletionBlocksLogin(t *testing.T) {
+	svc := authSvc()
+	user := &models.User{ID: uuid.New(), IsActive: true, ActivationStatus: "pending_deletion"}
+	err := svc.checkUserStatus(context.Background(), uuid.New(), user, "alice", "1.2.3.4", "UA")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "scheduled for deletion")
+}
+
+// TestAuthService_CheckUserStatus_AdminDeletedBlocksLogin is the
+// behavioural test for the admin-triggered soft-delete login block.
+func TestAuthService_CheckUserStatus_AdminDeletedBlocksLogin(t *testing.T) {
+	svc := authSvc()
+	user := &models.User{ID: uuid.New(), IsActive: true, ActivationStatus: "admin_deleted"}
+	err := svc.checkUserStatus(context.Background(), uuid.New(), user, "alice", "1.2.3.4", "UA")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deleted")
+}
+
+// TestAuthService_CheckUserStatus_OrdinaryActivationStatusPasses is a
+// second control: an activation_status value that is neither
+// pending_deletion nor admin_deleted must NOT be blocked by this gate.
+func TestAuthService_CheckUserStatus_OrdinaryActivationStatusPasses(t *testing.T) {
+	svc := authSvc()
+	user := &models.User{ID: uuid.New(), IsActive: true, ActivationStatus: "active"}
+	err := svc.checkUserStatus(context.Background(), uuid.New(), user, "alice", "1.2.3.4", "UA")
+	require.NoError(t, err)
+}
+
 func TestAuthService_CheckUserStatus_LockedWithFutureExpiry(t *testing.T) {
 	svc := authSvc()
 	future := time.Now().Add(30 * time.Minute)

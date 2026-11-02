@@ -5,9 +5,12 @@ package handlers
 import (
 	"crypto/rsa"
 	"encoding/base64"
+	"fmt"
 	"math/big"
 	"net/http"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -34,12 +37,29 @@ type JWKSHandler struct {
 	// cached response fields — invalidated when the key provider is swapped.
 	cached    *models.JWKSet
 	cachedKID string
+
+	// maxAge is the Cache-Control max-age (seconds) advertised to clients. It must stay
+	// well under the key publish delay so a pending key is seen before it signs.
+	maxAge time.Duration
 }
 
 // NewJWKSHandler creates a JWKSHandler. keyProvider may be nil when the service is
 // started in HS256-only mode; in that case the endpoint returns an empty key set.
 func NewJWKSHandler(keyProvider *crypto.JWTKeyProvider) *JWKSHandler {
-	return &JWKSHandler{keyProvider: keyProvider}
+	return &JWKSHandler{keyProvider: keyProvider, maxAge: defaultJWKSMaxAge}
+}
+
+// defaultJWKSMaxAge is the default Cache-Control max-age for the JWKS response.
+const defaultJWKSMaxAge = 300 * time.Second
+
+// SetMaxAge overrides the Cache-Control max-age of the JWKS response (d <= 0 is ignored).
+func (h *JWKSHandler) SetMaxAge(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.maxAge = d
 }
 
 // SetOAuthKeysFunc wires in a function that returns the current OAuth key set so that
@@ -82,7 +102,10 @@ func (h *JWKSHandler) SetKeyManager(km *keys.KeyManager) {
 // @Router   /.well-known/platform-jwks.json [get]
 func (h *JWKSHandler) GetJWKS(c *gin.Context) {
 	jwks := h.buildJWKS()
-	c.Header("Cache-Control", "public, max-age=3600")
+	h.mu.RLock()
+	maxAge := h.maxAge
+	h.mu.RUnlock()
+	c.Header("Cache-Control", fmt.Sprintf("public, max-age=%d", int(maxAge.Seconds())))
 	c.JSON(http.StatusOK, jwks)
 }
 
@@ -110,10 +133,13 @@ func (h *JWKSHandler) buildJWKS() *models.JWKSet {
 // resolveCurrentKID returns the key ID of the currently active signing key.
 func (h *JWKSHandler) resolveCurrentKID() string {
 	if h.keyManager != nil {
+		// The key-set version is part of the cache key so pending/rotated/retired
+		// changes (which do not change the active kid) also invalidate the cache.
+		suffix := "@" + strconv.FormatUint(h.keyManager.Version(), 10)
 		if _, kid, err := h.keyManager.ActiveKey(); err == nil {
-			return kid
+			return kid + suffix
 		}
-		return ""
+		return suffix
 	}
 	if h.keyProvider != nil {
 		return h.keyProvider.KeyID()

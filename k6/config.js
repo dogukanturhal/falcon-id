@@ -5,7 +5,7 @@
  *   FALCON_ID_URL   Base URL of the Falcon ID service  (default: http://localhost:8005)
  *   TENANT_SLUG     Tenant slug used for authentication (default: exampletenant)
  *   ADMIN_USERNAME  Platform admin username             (default: admin)
- *   ADMIN_PASSWORD  Platform admin password             (default: HexxAdmin@2024!)
+ *   ADMIN_PASSWORD  Platform admin password             (default: ChangeMe-dev-only-1!)
  */
 
 import http from 'k6/http';
@@ -24,7 +24,7 @@ export const TENANT_SLUG = __ENV.TENANT_SLUG || 'exampletenant';
 /** @type {{ username: string, password: string, tenant_slug: string }} */
 export const ADMIN_CREDS = {
   username: __ENV.ADMIN_USERNAME || 'admin',
-  password: __ENV.ADMIN_PASSWORD || 'HexxAdmin@2024!',
+  password: __ENV.ADMIN_PASSWORD || 'ChangeMe-dev-only-1!',
   tenant_slug: TENANT_SLUG,
 };
 

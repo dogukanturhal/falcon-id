@@ -316,6 +316,22 @@ func refreshTokenFamilyFromContext(ctx context.Context) uuid.UUID {
 	return v
 }
 
+// ctxKeyIssuedTokenID carries a *uuid.UUID that generateTokensWithSink fills
+// with the id of the token row it persists, so RefreshTokens can record the
+// successor (replaced_by) on the consumed token without changing the
+// generateTokens signature.
+const ctxKeyIssuedTokenID contextKey = "oauth_issued_token_id"
+
+func withIssuedTokenIDSink(ctx context.Context, sink *uuid.UUID) context.Context {
+	return context.WithValue(ctx, ctxKeyIssuedTokenID, sink)
+}
+
+func recordIssuedTokenID(ctx context.Context, id uuid.UUID) {
+	if sink, _ := ctx.Value(ctxKeyIssuedTokenID).(*uuid.UUID); sink != nil {
+		*sink = id
+	}
+}
+
 const (
 	oauthAlgRS256 = "RS256"
 	oauthAlgS256  = "S256"
@@ -342,6 +358,10 @@ type oauthProviderServiceClientRepo interface {
 	RevokeOAuthToken(ctx context.Context, tokenHash string) error
 	ConsumeRefreshToken(ctx context.Context, tokenID uuid.UUID) (bool, error)
 	RevokeRefreshTokenFamily(ctx context.Context, familyID uuid.UUID) (int64, error)
+	SetTokenReplacedBy(ctx context.Context, tokenID, successorID uuid.UUID) error
+	RefreshSuccessorUnused(ctx context.Context, successorID uuid.UUID) (bool, error)
+	RevokeTokensBySession(ctx context.Context, sessionID, userID uuid.UUID) (int64, error)
+	ListSessionIDsByIdpSession(ctx context.Context, idpSessionID, userID uuid.UUID) ([]uuid.UUID, error)
 	RevokeAllClientTokens(ctx context.Context, clientID uuid.UUID) error
 	RevokeUserClientTokens(ctx context.Context, userID, clientID uuid.UUID) error
 	GetConsent(ctx context.Context, userID, clientID uuid.UUID) (*models.OAuthConsent, error)
@@ -359,6 +379,18 @@ type oauthProviderServiceUserRepo interface {
 
 // OAuthProviderService handles OAuth2/OIDC provider operations
 type OAuthProviderService struct {
+	// tenantSuspension denies code exchange, refresh and token minting for
+	// suspended tenants (R1-GAPS row 27). Optional; nil disables enforcement.
+	tenantSuspension TenantSuspensionChecker
+	// tenantExchangeStore/Limiter back the RFC 8693 tenant token exchange
+	// (oauth_provider_tenant_exchange.go). nil store = exchange disabled.
+	tenantExchangeStore   tenantExchangeMembershipStore
+	tenantExchangeLimiter tenantExchangeRateLimiter
+	// platformAuthority/opsPerms back the is_platform_admin claim and the
+	// operator token exchange (oauth_provider_operator_exchange.go).
+	platformAuthority *PlatformAuthority
+	opsPerms          opsPermissionSource
+
 	clientRepo oauthProviderServiceClientRepo
 	userRepo   oauthProviderServiceUserRepo
 	cfg        *config.Config
@@ -430,7 +462,7 @@ type OAuthProviderService struct {
 	// Mirrors token_service.productSubscriptionResolver — without this
 	// wiring the OAuth /oauth/token mint path (authorization_code,
 	// refresh_token, token-exchange grants) silently dropped the claim
-	// and downstream product-entitlement middleware (e.g. mearax
+	// and downstream product-entitlement middleware (e.g. acmeweb
 	// productSlug gate) had no source for /app/* gating decisions.
 	// nil-safe: when unset the claim is omitted and behaviour matches
 	// pre-extension.
@@ -439,7 +471,7 @@ type OAuthProviderService struct {
 	// externalIssuerRepo is optional; when set, TokenExchangeGrant
 	// accepts subject_token_type=urn:ietf:params:oauth:token-type:jwt
 	// signed by EXTERNAL trusted issuers (most importantly Talon at
-	// internal.example.com) and exchanges them for user-bound
+	// auth.internal.example.com) and exchanges them for user-bound
 	// Falcon-ID access tokens. nil → only Falcon-ID-issued
 	// access_token subject types are accepted (backward compat with
 	// the pre-extension behaviour).
@@ -511,6 +543,11 @@ func (s *OAuthProviderService) SetExternalIssuerRepository(repo externalIssuerRe
 	}
 }
 
+// SetTenantSuspensionChecker wires the tenant-suspension gate.
+func (s *OAuthProviderService) SetTenantSuspensionChecker(c TenantSuspensionChecker) {
+	s.tenantSuspension = c
+}
+
 // SetCAEService wires the CAEP event publisher into the OAuth provider
 // service. Called from cmd/services.go alongside Redis client construction.
 // Safe to call with nil (disables publish).
@@ -537,7 +574,7 @@ func (s *OAuthProviderService) SetAuditService(svc *AuditService) {
 // client_credentials, and token-exchange grants. Mirrors the equivalent
 // setter on TokenService (which covers the legacy /api/v1/auth/login mint
 // path); without this wiring the OAuth path silently dropped the claim and
-// downstream product-entitlement middleware (e.g. mearax) had no source for
+// downstream product-entitlement middleware (e.g. acmeweb) had no source for
 // gating /app/*.
 //
 // nil-safe: when unset (tests, partial deployments) generateTokens skips
@@ -546,6 +583,57 @@ func (s *OAuthProviderService) SetAuditService(svc *AuditService) {
 // cmd/services.go alongside tokenService.SetProductSubscriptionResolver.
 func (s *OAuthProviderService) SetProductSubscriptionResolver(resolver *ProductSubscriptionResolver) {
 	s.productSubscriptionResolver = resolver
+}
+
+// ctxKeyLoginSessionRow carries the iam_sessions row id a rotated token must
+// stay bound to (see WithLoginSessionRow).
+const ctxKeyLoginSessionRow contextKey = "oauth_login_session_row"
+
+// WithLoginSessionRow returns a derived context making the next generateTokens
+// call stamp the minted token row with this iam_sessions row id (the session
+// binding explicit session end revokes by). uuid.Nil is a no-op.
+func WithLoginSessionRow(ctx context.Context, sessionRowID uuid.UUID) context.Context {
+	if sessionRowID == uuid.Nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyLoginSessionRow, sessionRowID)
+}
+
+// idpSessionRowSource is the optional capability of the IdP session cache to
+// map an opaque falcon_idp_session id to its iam_sessions row id. Probed with
+// a type assertion on idpSessionAuthTimeSource so stubs need not implement it.
+type idpSessionRowSource interface {
+	GetIdpSessionRowID(ctx context.Context, idpSessionID uuid.UUID) (rowID, userID uuid.UUID, found bool, err error)
+}
+
+// resolveLoginSessionRow returns the iam_sessions row id to bind a freshly
+// minted token to: an explicit WithLoginSessionRow (refresh rotation) wins,
+// otherwise the row behind the IdP session in the cache (authorization_code
+// exchange) provided it belongs to user. nil when neither is known (client_credentials, cache miss); the
+// token is then unbound, like a legacy one. A cache error degrades the same
+// way rather than failing issuance.
+func (s *OAuthProviderService) resolveLoginSessionRow(ctx context.Context, idpSessionID *uuid.UUID, user *models.User) *uuid.UUID {
+	if v, ok := ctx.Value(ctxKeyLoginSessionRow).(uuid.UUID); ok && v != uuid.Nil {
+		return &v
+	}
+	if idpSessionID == nil {
+		return nil
+	}
+	src, ok := s.sessionCache.(idpSessionRowSource)
+	if !ok {
+		return nil
+	}
+	rowID, owner, found, err := src.GetIdpSessionRowID(ctx, *idpSessionID)
+	if err != nil || !found {
+		return nil
+	}
+	// Never bind a token to another user's session: a stolen or mismatched
+	// idp session id would let that user's logout revoke this token (or this
+	// token outlive its owner's checks). Mismatch or no user = unbound.
+	if user == nil || owner != user.ID {
+		return nil
+	}
+	return &rowID
 }
 
 // idpSessionAuthTimeSource is the minimal interface generateTokens
@@ -619,6 +707,18 @@ type sessionContextService interface {
 	// nil when the row does not exist / is no longer active.
 	GetSessionByID(ctx context.Context, sessionID uuid.UUID) (*models.Session, error)
 
+	// GetSessionByIDInRealm is the realm-scoped read (RLS-safe): the refresh
+	// backstop and drift detection use it so a future FORCE RLS on
+	// iam_sessions cannot silently blind them.
+	GetSessionByIDInRealm(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error)
+
+	// GetSessionByIDInRealmForShare is the same read with FOR SHARE: it waits
+	// for an in-flight session end, for the post-mint re-check.
+	GetSessionByIDInRealmForShare(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error)
+
+	// EndSession ends a session row and (explicit reasons) sweeps its tokens.
+	EndSession(ctx context.Context, sessionID uuid.UUID, reason string) error
+
 	// CreateSessionFromRefresh cuts a new iam_sessions row for the
 	// supplied user using the inbound /oauth/token request's context
 	// (IP / UA / country / geo via ctx) and the auth-methods carried
@@ -683,6 +783,21 @@ func (s *OAuthProviderService) SigningKeyInfo() (keyID string, pubKey *rsa.Publi
 	return s.keyID, s.publicKey
 }
 
+// LookupSigningPublicKey resolves a self-issued token's kid to its RSA public key
+// from the live KeyManager set; ok is false when there is no KeyManager or the kid
+// is unknown/revoked/non-RSA.
+func (s *OAuthProviderService) LookupSigningPublicKey(kid string) (*rsa.PublicKey, bool) {
+	if s.keyManager == nil || kid == "" {
+		return nil, false
+	}
+	pub, err := s.keyManager.PublicKey(kid)
+	if err != nil {
+		return nil, false
+	}
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	return rsaPub, ok
+}
+
 // SetKeyManager wires in the DB-backed key manager. When set, token signing uses the
 // KeyManager's active key instead of the ephemeral key, and GetJWKS returns all
 // active+rotated keys enabling clients to validate tokens issued before rotation.
@@ -705,6 +820,38 @@ func (s *OAuthProviderService) SetKeyManager(km *keys.KeyManager) {
 	s.privateKey = rsaKey
 	s.publicKey = &rsaKey.PublicKey
 	s.keyID = kid
+}
+
+// signingKey returns the key to sign with right now. With a KeyManager it follows
+// the live active key (so rotation takes effect without a restart); otherwise it
+// uses the key cached at startup.
+func (s *OAuthProviderService) signingKey() (*rsa.PrivateKey, string) {
+	if s.keyManager != nil {
+		if signer, kid, err := s.keyManager.ActiveKey(); err == nil {
+			if rsaKey, ok := signer.(*rsa.PrivateKey); ok {
+				return rsaKey, kid
+			}
+		}
+	}
+	return s.privateKey, s.keyID
+}
+
+// verifyKeyFunc resolves the verification key from the token's kid header via the
+// KeyManager (active and still-published rotated keys). A kid the manager does not
+// know (revoked, retired, foreign) is rejected rather than falling back to the
+// startup key, which could be a revoked one. Without a KeyManager, or for a token
+// with no kid, the startup key is used.
+func (s *OAuthProviderService) verifyKeyFunc(token *jwt.Token) (interface{}, error) {
+	if s.keyManager != nil {
+		if kid, _ := token.Header["kid"].(string); kid != "" {
+			pub, err := s.keyManager.PublicKey(kid)
+			if err != nil {
+				return nil, err
+			}
+			return pub, nil
+		}
+	}
+	return s.publicKey, nil
 }
 
 // NewOAuthProviderService creates a new OAuthProviderService
@@ -840,9 +987,48 @@ func (s *OAuthProviderService) validateOAuth21GrantsAndResponses(grants, respons
 	return nil
 }
 
+// privilegedScopePrefixes are scopes that grant service-to-service authority on
+// the internal API surface (every ServiceClientClaim scope family plus the
+// authorisation scopes). Tenant-administered clients must never hold them.
+var privilegedScopePrefixes = []string{
+	"service:", "tenant:", "iam:", "iam-devices:", "authz:", "quota:", "platform:",
+	"admin:", "billing:", "subscription-management:", "talon:", "example.",
+}
+
+// ValidateTenantClientScopes rejects privileged scopes on clients registered
+// through the tenant-admin surface. The trusted internal provisioner route is
+// exempt (callers skip this check when the request is trusted).
+func ValidateTenantClientScopes(scopes []string) error {
+	for _, sc := range scopes {
+		for _, p := range privilegedScopePrefixes {
+			if strings.HasPrefix(sc, p) {
+				return fmt.Errorf("invalid_scope: scope %q is reserved for platform service clients", sc)
+			}
+		}
+	}
+	return nil
+}
+
+// validatePublicClientGrants forbids client_credentials on public clients: a
+// public client has no secret to authenticate with.
+func validatePublicClientGrants(isPublic bool, grantTypes []string) error {
+	if !isPublic {
+		return nil
+	}
+	for _, g := range grantTypes {
+		if g == "client_credentials" {
+			return fmt.Errorf("invalid_client_metadata: public clients cannot use the client_credentials grant")
+		}
+	}
+	return nil
+}
+
 // CreateClient creates a new OAuth client
 func (s *OAuthProviderService) CreateClient(ctx context.Context, tenantID uuid.UUID, req *models.CreateOAuthClientRequest, createdBy *uuid.UUID) (*models.OAuthClient, string, error) {
 	if err := s.validateOAuth21GrantsAndResponses(req.GrantTypes, req.ResponseTypes); err != nil {
+		return nil, "", err
+	}
+	if err := validatePublicClientGrants(req.IsPublic, req.GrantTypes); err != nil {
 		return nil, "", err
 	}
 	// RFC 7591 §2 — validate registered branding URIs are HTTPS-only and
@@ -869,9 +1055,12 @@ func (s *OAuthProviderService) CreateClient(ctx context.Context, tenantID uuid.U
 		// kept on the strict OAuth 2.1 rails — they go through the
 		// normal sandbox-tenant path for any localhost dev work.
 		nativeApp := req.IsPublic && req.RequirePKCE && req.IsFirstParty
-		if err := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp); err != nil {
+		if err := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains()); err != nil {
 			return nil, "", fmt.Errorf("invalid_redirect_uri: %w", err)
 		}
+	}
+	if err := validatePostLogoutRedirectURIs(req.PostLogoutRedirectURIs, req.IsPublic && req.RequirePKCE && req.IsFirstParty, s.nativeAppSchemeDomains()); err != nil {
+		return nil, "", fmt.Errorf("invalid_redirect_uri: %w", err)
 	}
 
 	// Resolve the client_id: honor a caller-supplied value when present
@@ -1121,18 +1310,33 @@ func (s *OAuthProviderService) UpdateClient(ctx context.Context, id uuid.UUID, r
 	// slice means "no change" per the DTO contract. The tenant type
 	// comes from the existing client's tenant_id since the request
 	// can't change ownership.
+	// Native-app status uses the merged values (request overrides stored),
+	// so one update cannot flip a client to native and pass the relaxed
+	// scheme rules with the old traits, or the reverse.
+	mergedPublic, mergedPKCE, mergedFirstParty := client.IsPublic, client.RequirePKCE, client.IsFirstParty
+	if req.IsPublic != nil {
+		mergedPublic = *req.IsPublic
+	}
+	if req.RequirePKCE != nil {
+		mergedPKCE = *req.RequirePKCE
+	}
+	if req.IsFirstParty != nil {
+		mergedFirstParty = *req.IsFirstParty
+	}
+	nativeApp := mergedPublic && mergedPKCE && mergedFirstParty
 	if s.tenantTypeLookup != nil && len(req.RedirectURIs) > 0 {
 		tenant, terr := s.tenantTypeLookup.GetByID(ctx, client.TenantID)
 		if terr != nil {
 			return nil, fmt.Errorf("UpdateClient: tenant lookup: %w", terr)
 		}
-		// RFC 8252 native-app gate — read from the live client record
-		// since UpdateClient can't change these traits. Same condition
+		// RFC 8252 native-app gate on the merged traits; same condition
 		// as CreateClient: public + PKCE + first-party.
-		nativeApp := client.IsPublic && client.RequirePKCE && client.IsFirstParty
-		if verr := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp); verr != nil {
+		if verr := validateRedirectURIs(tenant.Type, req.RedirectURIs, nativeApp, s.nativeAppSchemeDomains()); verr != nil {
 			return nil, fmt.Errorf("invalid_redirect_uri: %w", verr)
 		}
+	}
+	if verr := validatePostLogoutRedirectURIs(req.PostLogoutRedirectURIs, nativeApp, s.nativeAppSchemeDomains()); verr != nil {
+		return nil, fmt.Errorf("invalid_redirect_uri: %w", verr)
 	}
 
 	// Apply updates
@@ -1165,6 +1369,9 @@ func (s *OAuthProviderService) UpdateClient(ctx context.Context, id uuid.UUID, r
 	}
 	if req.IsPublic != nil {
 		client.IsPublic = *req.IsPublic
+	}
+	if err := validatePublicClientGrants(client.IsPublic, client.GrantTypes); err != nil {
+		return nil, err
 	}
 	if req.IsConfidential != nil {
 		client.IsConfidential = *req.IsConfidential
@@ -1454,6 +1661,19 @@ func (s *OAuthProviderService) ExchangeAuthorizationCode(ctx context.Context, cl
 	if err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
+	if user == nil {
+		return nil, fmt.Errorf("invalid_grant: user not found")
+	}
+	// A disabled / deleted / locked account must not turn a still-valid code
+	// into tokens. Checked before the code is consumed.
+	if err := userEligibleForTokens(user); err != nil {
+		return nil, err
+	}
+
+	// Tenant suspension gate (R1-GAPS row 27) — before the code is consumed.
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+		return nil, err
+	}
 
 	// RFC 9449 §6 — sender-constrain enforcement at issuance.
 	// Sensitive scopes (admin:* / offline_access) MUST be issued only
@@ -1539,6 +1759,14 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 		return nil, fmt.Errorf("invalid_grant: refresh token not found")
 	}
 
+	// Tenant suspension gate (R1-GAPS row 27). Deliberately BEFORE the revoked
+	// check: a suspension revokes every refresh token of the tenant, and the
+	// caller must get the clear `tenant_suspended` code, not a spurious
+	// "revoked" that would also trip refresh-reuse theft detection.
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, token.TenantID); err != nil {
+		return nil, err
+	}
+
 	// RFC 9700 §4.14.2 — refresh-token reuse detection. A presented refresh
 	// token that is ALREADY revoked is the theft signal: under rotation a
 	// prior legitimate rotation already consumed this token and advanced the
@@ -1561,15 +1789,79 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 	// Reuse-policy (BFF) tokens are intentionally never rotated/revoked, so an
 	// is_revoked row there can only be an explicit admin/compromise sweep —
 	// treat that as a plain invalid_grant, never a theft.
+	recovering := false
 	if token.IsRevoked {
+		// A token swept because its login session was explicitly ended is
+		// not a theft signal: plain invalid_grant, no family-revoke storm,
+		// no CAEP event, no reuse metric.
+		//
+		// Likewise a suspension revokes every token of the tenant's users: the
+		// replays that follow must report tenant_suspended, not trip the
+		// theft handling (a CAEP storm per replayed token).
+		if user := s.lookupTokenUser(ctx, token); user != nil {
+			if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+				return nil, err
+			}
+			if s.boundSessionExplicitlyEnded(ctx, token, user) {
+				return nil, fmt.Errorf("invalid_grant: session has ended")
+			}
+		}
+		// A successor revoked by a lost-response recovery was never legitimately
+		// delivered; presenting it means a second party holds it. Always theft:
+		// no grace window, no recovery.
+		if token.RevokeReason != nil && *token.RevokeReason == repositories.RevokeReasonRecoverySuperseded {
+			s.handleRefreshTokenReuse(ctx, token)
+			return nil, fmt.Errorf("invalid_grant: refresh token has been revoked")
+		}
+		// Only a token consumed by rotation can be a stolen-copy replay. Any
+		// other reason (logout, password change, family/session revoke, or
+		// NULL on legacy rows) is a plain ended session: no family revoke, no
+		// CAEP event, no reuse metric.
+		if token.RevokeReason == nil || *token.RevokeReason != repositories.RevokeReasonRotated {
+			return nil, fmt.Errorf("invalid_grant: session has ended")
+		}
 		if client.RefreshTokenRotationPolicy != "reuse" {
+			// Grace window first, exactly as before recovery existed: a replay
+			// this soon after the rotation is a benign double-submit.
 			if token.RevokedAt != nil && time.Since(*token.RevokedAt) <= refreshReuseGraceWindow {
 				metrics.AuthTokenConcurrentRace.Inc()
-				return nil, fmt.Errorf("invalid_grant: refresh token already consumed")
+				return nil, fmt.Errorf("invalid_grant: refresh_race")
 			}
-			s.handleRefreshTokenReuse(ctx, token)
+			// Lost-response recovery: the consumed token's direct successor was
+			// never used and the caller is an authenticated confidential
+			// client, so the rotated pair most likely never reached it.
+			// Re-issue from the same lineage instead of revoking. This is a
+			// cheap lock-free pre-check; the authoritative age / one-shot / IP
+			// check runs under row locks in LockRefreshRecovery.
+			if s.refreshRecoveryEligible(client, token) {
+				unused, uerr := s.clientRepo.RefreshSuccessorUnused(ctx, *token.ReplacedBy)
+				if uerr != nil {
+					// Transient store error: neither recover nor accuse.
+					return nil, fmt.Errorf("server_error: refresh recovery pre-check failed: %w", uerr)
+				}
+				if unused {
+					recovering = true
+				} else {
+					// A concurrent recovery may have moved replaced_by (and
+					// revoked the successor we read): that replay won, this is
+					// not reuse. Fail closed without revoking the family.
+					fresh, ferr := s.clientRepo.GetOAuthTokenByHash(ctx, tokenHash)
+					if ferr != nil {
+						return nil, fmt.Errorf("server_error: refresh recovery pre-check failed: %w", ferr)
+					}
+					if fresh.ReplacedBy == nil || *fresh.ReplacedBy != *token.ReplacedBy {
+						metrics.AuthTokenConcurrentRace.Inc()
+						return nil, fmt.Errorf("invalid_grant: refresh_race")
+					}
+				}
+			}
+			if !recovering {
+				s.handleRefreshTokenReuse(ctx, token)
+			}
 		}
-		return nil, fmt.Errorf("invalid_grant: refresh token has been revoked")
+		if !recovering {
+			return nil, fmt.Errorf("invalid_grant: refresh token has been revoked")
+		}
 	}
 
 	if token.IsExpired() {
@@ -1618,13 +1910,22 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 		// live, it merely arrived second). The benign-race counter is
 		// deliberately separate from the theft counter so dashboards don't
 		// page OnCall on client-side coordination gaps.
-		won, consumeErr := s.clientRepo.ConsumeRefreshToken(ctx, token.ID)
-		if consumeErr != nil {
-			return nil, fmt.Errorf("failed to consume refresh token: %w", consumeErr)
-		}
-		if !won {
-			metrics.AuthTokenConcurrentRace.Inc()
-			return nil, fmt.Errorf("invalid_grant: refresh token already consumed")
+		if !recovering {
+			won, consumeErr := s.clientRepo.ConsumeRefreshToken(ctx, token.ID)
+			if consumeErr != nil {
+				return nil, fmt.Errorf("failed to consume refresh token: %w", consumeErr)
+			}
+			if !won {
+				// The CAS loser may be holding a recovery-superseded token that
+				// was live when read: that is theft, not a benign race.
+				if cur, rerr := s.clientRepo.GetOAuthTokenByHash(ctx, tokenHash); rerr == nil && cur.RevokeReason != nil &&
+					*cur.RevokeReason == repositories.RevokeReasonRecoverySuperseded {
+					s.handleRefreshTokenReuse(ctx, cur)
+					return nil, fmt.Errorf("invalid_grant: refresh token has been revoked")
+				}
+				metrics.AuthTokenConcurrentRace.Inc()
+				return nil, fmt.Errorf("invalid_grant: refresh_race")
+			}
 		}
 	}
 
@@ -1634,6 +1935,22 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 		user, err = s.userRepo.GetByID(ctx, *token.UserID)
 		if err != nil {
 			return nil, fmt.Errorf("user not found: %w", err)
+		}
+		// GetByID returns (nil, nil) for a deleted user. Without this guard
+		// the nil user falls through to the no-user (client_credentials)
+		// minting branch.
+		if user == nil {
+			return nil, fmt.Errorf("invalid_grant: user not found")
+		}
+		// Disabled / deleted / locked owner: refuse and kill the whole
+		// refresh family so no sibling token can be replayed. A token with no
+		// user (client_credentials) skips this block entirely.
+		if eligErr := userEligibleForTokens(user); eligErr != nil {
+			if _, revErr := s.clientRepo.RevokeRefreshTokenFamily(ctx, familyID); revErr != nil {
+				logger.Warn("RefreshTokens: family revoke after ineligible user failed",
+					zap.String("user_id", user.ID.String()), zap.Error(revErr))
+			}
+			return nil, eligErr
 		}
 	}
 
@@ -1647,24 +1964,6 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 	// won't actually verify against the original binding.)
 	if s.cfg.DPoPEnabled && scopeRequiresDPoP(token.Scopes) && dpopJKTFromContext(ctx) == "" {
 		return nil, ErrDPoPRequired
-	}
-
-	// OpenID CAEP §5.3 — emit CAEIPChanged when the new request's IP
-	// differs from the IP stamped on the prior token. CAEP is signal,
-	// not enforcement: receivers (Talon IAP, SIEM) decide whether to
-	// revoke. Best-effort; never fail the refresh on publisher errors.
-	// Skips silently when the prior token has no IP captured (pre-fix
-	// rows) or when the current request did not flow through ctx
-	// (background callers).
-	if s.caeService != nil && token.IPAddress != nil && *token.IPAddress != "" {
-		newIP := requestIPFromContext(ctx)
-		if newIP != "" && newIP != *token.IPAddress {
-			userID := uuid.Nil
-			if token.UserID != nil {
-				userID = *token.UserID
-			}
-			_ = s.caeService.OnIPChanged(ctx, userID, token.TenantID, *token.IPAddress, newIP, token.IdpSessionID)
-		}
 	}
 
 	// Session-row drift detection (Auth0 / Okta / Entra canonical
@@ -1687,16 +1986,41 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 	// nil-safe: when sessionContextSvc is unwired (test / minimal
 	// build) the rotation preserves the old IdpSessionID verbatim
 	// (legacy behaviour).
+	// Session binding (OIDC Back-Channel Logout / RFC 9700). ONE read of the
+	// bound session, taken AFTER the CAS consume above so a session end that
+	// lands between the check and the insert cannot be missed, is shared by
+	// the explicit-end backstop and the drift detector.
+	//
+	// A token whose login session was EXPLICITLY ended (logout, admin revoke,
+	// password change, deactivation...) must not mint anything, even if the
+	// revoke sweep missed it. Idle/absolute expiry of the SSO session is NOT an
+	// explicit end: the refresh token keeps its own lifetime and the drift
+	// path below simply cuts a fresh session. A lookup ERROR changes nothing
+	// (no reject, no new row): a transient DB error must neither log users out
+	// nor orphan the binding. Legacy tokens without a session are unbound.
+	boundSessionID := tokenSessionRow(token)
+	var boundSession *models.Session
+	var boundErr error
+	if s.sessionContextSvc != nil && user != nil && boundSessionID != nil {
+		boundSession, boundErr = s.readBoundSession(ctx, *boundSessionID, user.RealmID)
+		if boundErr == nil && sessionExplicitlyEnded(boundSession) {
+			s.revokeFamilyOnSessionEnd(ctx, token)
+			return nil, fmt.Errorf("invalid_grant: session has ended")
+		}
+	}
+
 	idpSessionIDForRotation := token.IdpSessionID
-	if s.sessionContextSvc != nil && user != nil && token.IdpSessionID != nil {
-		drift, reason := s.detectSessionDrift(ctx, *token.IdpSessionID)
+	var cutSession *models.Session
+	if token.SessionID != nil {
+		// Keep the rotated token bound to the same login session row.
+		ctx = WithLoginSessionRow(ctx, *token.SessionID)
+	}
+	if s.sessionContextSvc != nil && user != nil && boundSessionID != nil {
+		drift, reason := detectSessionDrift(ctx, boundSession, boundErr)
 		if drift {
 			newSession, sessionErr := s.sessionContextSvc.CreateSessionFromRefresh(ctx, user.ID, token.AuthMethodsUsed)
 			if sessionErr != nil {
-				// Best-effort — don't fail the refresh on a session-cut
-				// error. The user still gets rotated tokens; the
-				// Active-Sessions UI will continue showing the stale
-				// row. Surface to telemetry so we notice if it spikes.
+				// Best-effort: don't fail the refresh on a session-cut error.
 				if s.claimsLogger != nil {
 					s.claimsLogger.Warn("refresh-token rotation: failed to cut new session row on drift",
 						zap.String("user_id", user.ID.String()),
@@ -1704,13 +2028,15 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 						zap.Error(sessionErr))
 				}
 			} else {
+				cutSession = newSession
 				newID := newSession.ID
 				idpSessionIDForRotation = &newID
+				ctx = WithLoginSessionRow(ctx, newID)
 				if s.claimsLogger != nil {
 					s.claimsLogger.Info("refresh-token rotation: cut new session row on context drift",
 						zap.String("user_id", user.ID.String()),
 						zap.String("drift_reason", reason),
-						zap.String("old_session_id", token.IdpSessionID.String()),
+						zap.String("old_session_id", boundSessionID.String()),
 						zap.String("new_session_id", newID.String()))
 				}
 			}
@@ -1724,7 +2050,175 @@ func (s *OAuthProviderService) RefreshTokens(ctx context.Context, client *models
 	// newly-cut session row (drift detected above) so id_tokens issued through
 	// this rotation carry the correct `sid` claim for FCL/BCL cascades
 	// (migration 220).
-	return s.generateTokens(ctx, client, user, token.Scopes, nil, nil, token.AuthMethodsUsed, idpSessionIDForRotation)
+	resp, err := s.issueRefreshedTokens(ctx, client, user, token, recovering, idpSessionIDForRotation)
+	if err != nil {
+		// No pair was issued: do not leave the session row cut for it active.
+		if cutSession != nil {
+			_ = s.sessionContextSvc.EndSession(ctx, cutSession.ID, "revoked")
+		}
+		return nil, err
+	}
+
+	// OpenID CAEP §5.3 — emit CAEIPChanged when the new request's IP
+	// differs from the IP stamped on the prior token. CAEP is signal,
+	// not enforcement: receivers (Talon IAP, SIEM) decide whether to
+	// revoke. Best-effort; never fail the refresh on publisher errors.
+	// Skips silently when the prior token has no IP captured (pre-fix
+	// rows) or when the current request did not flow through ctx
+	// (background callers).
+	if s.caeService != nil && token.IPAddress != nil && *token.IPAddress != "" {
+		newIP := requestIPFromContext(ctx)
+		if newIP != "" && newIP != *token.IPAddress {
+			userID := uuid.Nil
+			if token.UserID != nil {
+				userID = *token.UserID
+			}
+			_ = s.caeService.OnIPChanged(ctx, userID, token.TenantID, *token.IPAddress, newIP, token.IdpSessionID)
+		}
+	}
+
+	// Close the check-to-insert window: if the ORIGINAL bound session was
+	// explicitly ended while we were minting, the end's token sweep may have
+	// run before our insert and missed the new row. Re-read it; on an explicit
+	// end revoke the whole family (covers the new token), end any session row
+	// we just cut, and refuse to hand the tokens out. A read error keeps the
+	// tokens: the first check already passed.
+	if s.sessionContextSvc != nil && user != nil && boundSessionID != nil {
+		if again, rerr := s.readBoundSessionForShare(ctx, *boundSessionID, user.RealmID); rerr == nil && sessionExplicitlyEnded(again) {
+			s.revokeFamilyOnSessionEnd(ctx, token)
+			if cutSession != nil {
+				if eerr := s.sessionContextSvc.EndSession(ctx, cutSession.ID, "revoked"); eerr != nil && s.claimsLogger != nil {
+					s.claimsLogger.Warn("refresh: failed to end session row cut during a racing session end",
+						zap.String("session_id", cutSession.ID.String()), zap.Error(eerr))
+				}
+			}
+			return nil, fmt.Errorf("invalid_grant: session has ended")
+		}
+	}
+	return resp, nil
+}
+
+// tokenSessionRow returns the iam_sessions row id a token is bound to: the
+// explicit session_id, else idp_session_id (which holds a row id on tokens
+// re-linked after session drift). nil for unbound/legacy tokens.
+func tokenSessionRow(token *models.OAuthToken) *uuid.UUID {
+	if token.SessionID != nil {
+		return token.SessionID
+	}
+	return token.IdpSessionID
+}
+
+// readBoundSession reads the iam_sessions row through the realm-scoped getter
+// (falls back to the plain read when the realm is unknown).
+func (s *OAuthProviderService) readBoundSession(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error) {
+	if realmID == uuid.Nil {
+		return s.sessionContextSvc.GetSessionByID(ctx, sessionID)
+	}
+	return s.sessionContextSvc.GetSessionByIDInRealm(ctx, sessionID, realmID)
+}
+
+// readBoundSessionForShare is readBoundSession with FOR SHARE, so it blocks on
+// an in-flight end's row lock instead of reading the pre-commit state.
+func (s *OAuthProviderService) readBoundSessionForShare(ctx context.Context, sessionID, realmID uuid.UUID) (*models.Session, error) {
+	if realmID == uuid.Nil {
+		return s.sessionContextSvc.GetSessionByID(ctx, sessionID)
+	}
+	return s.sessionContextSvc.GetSessionByIDInRealmForShare(ctx, sessionID, realmID)
+}
+
+// sessionExplicitlyEnded reports whether the session row is ended for an
+// EXPLICIT reason (models.IsExplicitSessionEnd). nil (absent row) is the
+// expired/cleaned-up case and an active session is not ended.
+func sessionExplicitlyEnded(session *models.Session) bool {
+	if session == nil || session.IsActive || session.EndReason == nil {
+		return false
+	}
+	return models.IsExplicitSessionEnd(*session.EndReason)
+}
+
+// lookupTokenUser loads the token's user (nil when none or on error). Used on
+// the rare already-revoked path only.
+func (s *OAuthProviderService) lookupTokenUser(ctx context.Context, token *models.OAuthToken) *models.User {
+	if token.UserID == nil {
+		return nil
+	}
+	u, err := s.userRepo.GetByID(ctx, *token.UserID)
+	if err != nil {
+		return nil
+	}
+	return u
+}
+
+// boundSessionExplicitlyEnded reports an explicit end of the token's bound
+// session, read in the user's realm.
+func (s *OAuthProviderService) boundSessionExplicitlyEnded(ctx context.Context, token *models.OAuthToken, user *models.User) bool {
+	sid := tokenSessionRow(token)
+	if s.sessionContextSvc == nil || sid == nil || user == nil {
+		return false
+	}
+	session, err := s.readBoundSession(ctx, *sid, user.RealmID)
+	return err == nil && sessionExplicitlyEnded(session)
+}
+
+// revokeFamilyOnSessionEnd kills the rotation family of a token presented
+// after its session was explicitly ended. Not a theft signal (no CAEP, no
+// reuse metric): the user ended the session, the client just did not know yet.
+func (s *OAuthProviderService) revokeFamilyOnSessionEnd(ctx context.Context, token *models.OAuthToken) {
+	familyID := token.ID
+	if token.TokenFamilyID != nil {
+		familyID = *token.TokenFamilyID
+	}
+	if _, err := s.clientRepo.RevokeRefreshTokenFamily(ctx, familyID); err != nil && s.claimsLogger != nil {
+		s.claimsLogger.Error("refresh: failed to revoke token family of an explicitly ended session",
+			zap.String("family_id", familyID.String()),
+			zap.Error(err))
+	}
+}
+
+// RevokeSessionTokens revokes every token (and rotation family) of userID bound
+// to the login session sessionID. Called on EXPLICIT session end from paths
+// that do not go through the user-wide sweep (RP-initiated logout). Never call
+// it on idle/absolute expiry.
+func (s *OAuthProviderService) RevokeSessionTokens(ctx context.Context, sessionID, userID uuid.UUID) error {
+	if sessionID == uuid.Nil || userID == uuid.Nil {
+		return nil
+	}
+	if _, err := s.clientRepo.RevokeTokensBySession(ctx, sessionID, userID); err != nil {
+		return fmt.Errorf("RevokeSessionTokens: %w", err)
+	}
+	return nil
+}
+
+// EndHintedSession ends the login session named by the sid claim of a valid
+// id_token_hint whose subject is subject, when no Redis IdP session is left to
+// name the row. The sid is the opaque IdP session id: if it is itself an
+// iam_sessions row owned by the subject that row is ended, and either way the
+// subject's tokens bound to that IdP session are revoked and each
+// iam_sessions row they point at is ended. Everything is scoped to subject.
+func (s *OAuthProviderService) EndHintedSession(ctx context.Context, hintSID, subject uuid.UUID) error {
+	if hintSID == uuid.Nil || subject == uuid.Nil {
+		return nil
+	}
+	if err := s.RevokeSessionTokens(ctx, hintSID, subject); err != nil {
+		return err
+	}
+	if s.sessionContextSvc == nil {
+		return nil
+	}
+	if row, err := s.sessionContextSvc.GetSessionByID(ctx, hintSID); err == nil && row != nil && row.UserID == subject {
+		return s.sessionContextSvc.EndSession(ctx, hintSID, "logout")
+	}
+	rows, err := s.clientRepo.ListSessionIDsByIdpSession(ctx, hintSID, subject)
+	if err != nil {
+		return fmt.Errorf("EndHintedSession: %w", err)
+	}
+	var firstErr error
+	for _, id := range rows {
+		if err := s.sessionContextSvc.EndSession(ctx, id, "logout"); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // handleRefreshTokenReuse executes the RFC 9700 §4.14.2 response to a detected
@@ -1752,12 +2246,14 @@ func (s *OAuthProviderService) handleRefreshTokenReuse(ctx context.Context, toke
 			s.claimsLogger.Error("refresh-token REUSE detected — failed to revoke token family (RFC 9700 §4.14)",
 				zap.String("family_id", familyID.String()),
 				zap.String("token_id", token.ID.String()),
+				zap.Int64("since_rotation_ms", sinceRotationMs(token)),
 				zap.Error(err))
 		}
 	} else if s.claimsLogger != nil {
 		s.claimsLogger.Warn("refresh-token REUSE detected — revoked token family (RFC 9700 §4.14)",
 			zap.String("family_id", familyID.String()),
 			zap.String("token_id", token.ID.String()),
+			zap.Int64("since_rotation_ms", sinceRotationMs(token)),
 			zap.Int64("tokens_revoked", revoked))
 	}
 
@@ -1771,18 +2267,136 @@ func (s *OAuthProviderService) handleRefreshTokenReuse(ctx context.Context, toke
 	}
 }
 
+// refreshRecoveryEligible reports whether a replay of a consumed refresh token
+// may be answered with a fresh pair (lost-response recovery) instead of reuse
+// handling. Requires an authenticated confidential client (the handler only
+// hands RefreshTokens a non-public client after secret / mTLS verification;
+// public clients are never trusted with a replay), the token to belong to that
+// client, and a recorded successor.
+func (s *OAuthProviderService) refreshRecoveryEligible(client *models.OAuthClient, token *models.OAuthToken) bool {
+	return client != nil && !client.IsPublic && client.IsConfidential &&
+		token.ReplacedBy != nil && token.ClientID == client.ID &&
+		token.RecoveryCount < 1 && token.RevokedAt != nil &&
+		time.Since(*token.RevokedAt) <= repositories.RefreshRecoveryWindow
+}
+
+// issueRefreshedTokens mints the pair for a refresh grant. Normal rotation
+// generates on the pool and records replaced_by best-effort. Recovery runs in
+// one transaction: it row-locks the consumed token and its unused successor,
+// revokes the successor, mints a fresh pair from the same lineage, repoints
+// replaced_by and commits. The family is never revoked on this path.
+func (s *OAuthProviderService) issueRefreshedTokens(ctx context.Context, client *models.OAuthClient, user *models.User, token *models.OAuthToken, recovering bool, idpSessionID *uuid.UUID) (*models.OAuthTokenResponse, error) {
+	var newID uuid.UUID
+	ctx = withIssuedTokenIDSink(ctx, &newID)
+
+	if !recovering {
+		resp, err := s.generateTokens(ctx, client, user, token.Scopes, nil, nil, token.AuthMethodsUsed, idpSessionID)
+		if err != nil {
+			return nil, err
+		}
+		if client.RefreshTokenRotationPolicy != "reuse" && newID != uuid.Nil {
+			if serr := s.clientRepo.SetTokenReplacedBy(ctx, token.ID, newID); serr != nil {
+				metrics.AuthTokenReplacedByWriteFailed.Inc()
+				if s.claimsLogger != nil {
+					s.claimsLogger.Warn("refresh rotation: failed to record replaced_by (lost-response recovery unavailable for this token)",
+						zap.String("token_id", token.ID.String()), zap.Error(serr))
+				}
+			}
+		}
+		return resp, nil
+	}
+
+	tx, err := s.clientRepo.BeginTx(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin refresh recovery: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	outcome, err := tx.LockRefreshRecovery(ctx, token.ID, *token.ReplacedBy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lock refresh recovery: %w", err)
+	}
+	switch outcome {
+	case repositories.RefreshRecoveryRaced:
+		metrics.AuthTokenConcurrentRace.Inc()
+		return nil, fmt.Errorf("invalid_grant: refresh_race")
+	case repositories.RefreshRecoveryLineageAdvanced, repositories.RefreshRecoveryIneligible:
+		if token.RevokedAt != nil && time.Since(*token.RevokedAt) <= refreshReuseGraceWindow {
+			metrics.AuthTokenConcurrentRace.Inc()
+			return nil, fmt.Errorf("invalid_grant: refresh_race")
+		}
+		// Release the row locks (R0, successor) before the family revoke:
+		// RevokeRefreshTokenFamily runs on another pool connection and would
+		// otherwise wait forever on our own FOR UPDATE.
+		_ = tx.Rollback(ctx)
+		committed = true
+		s.handleRefreshTokenReuse(ctx, token)
+		return nil, fmt.Errorf("invalid_grant: refresh token has been revoked")
+	}
+
+	resp, err := s.generateTokensWithSink(ctx, tx, client, user, token.Scopes, nil, nil, token.AuthMethodsUsed, idpSessionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.RepointTokenReplacedBy(ctx, token.ID, *token.ReplacedBy, newID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit refresh recovery: %w", err)
+	}
+	committed = true
+
+	if s.auditService != nil {
+		s.auditService.LogSecurityEvent(ctx, &SecurityAuditEvent{
+			TenantID:    token.TenantID,
+			UserID:      token.UserID,
+			Category:    SecurityCategoryAuthentication,
+			Severity:    SecuritySeverityMedium,
+			Action:      "refresh_token_recovered",
+			Description: fmt.Sprintf("Refresh token re-issued for client %s after a lost rotation response", client.ClientID),
+			Details: map[string]interface{}{
+				"client_id":         client.ClientID,
+				"consumed_token_id": token.ID.String(),
+				"revoked_successor": token.ReplacedBy.String(),
+				"new_token_id":      newID.String(),
+				"token_family_id":   refreshTokenFamilyFromContext(ctx).String(),
+				"since_rotation_ms": sinceRotationMs(token),
+				"ip_match":          token.IPAddress != nil && *token.IPAddress == requestIPFromContext(ctx),
+			},
+		})
+	}
+	return resp, nil
+}
+
+// sinceRotationMs is how long ago the presented refresh token was consumed, in
+// milliseconds (-1 when its revocation time is unknown).
+func sinceRotationMs(token *models.OAuthToken) int64 {
+	if token.RevokedAt == nil {
+		return -1
+	}
+	return time.Since(*token.RevokedAt).Milliseconds()
+}
+
 // detectSessionDrift returns true (with a short reason label) when the
-// /oauth/token rotation's request context no longer matches the
-// session row that the inbound refresh-token was originally linked
-// to. Reason labels: "session_missing", "session_inactive",
+// /oauth/token rotation's request context no longer matches the session row
+// that the inbound refresh-token was originally linked to, given the
+// already-read session. Reason labels: "session_missing", "session_inactive",
 // "country_drift", "os_class_drift".
 //
-// Called only when sessionContextSvc is wired. Errors looking up the
-// session are treated as "session_missing" — fail safe by cutting a
-// new row rather than zombie-ing an unverifiable one.
-func (s *OAuthProviderService) detectSessionDrift(ctx context.Context, sessionID uuid.UUID) (bool, string) {
-	session, err := s.sessionContextSvc.GetSessionByID(ctx, sessionID)
-	if err != nil || session == nil {
+// A failed lookup (lookupErr) is NOT drift: cutting a new row on a transient
+// error would orphan the token's session binding. An absent row is
+// "session_missing"; an inactive row here is a lapsed one (explicit ends were
+// rejected before this runs).
+func detectSessionDrift(ctx context.Context, session *models.Session, lookupErr error) (bool, string) {
+	if lookupErr != nil {
+		return false, ""
+	}
+	if session == nil {
 		return true, "session_missing"
 	}
 	if !session.IsActive {
@@ -1817,6 +2431,9 @@ func (s *OAuthProviderService) detectSessionDrift(ctx context.Context, sessionID
 // path threads the JKT via context (services.WithDPoPJKT). Argument
 // retained as `_` for signature stability.
 func (s *OAuthProviderService) ClientCredentialsGrant(ctx context.Context, client *models.OAuthClient, requestedScopes []string, _ string) (*models.OAuthTokenResponse, error) {
+	if client.IsPublic {
+		return nil, fmt.Errorf("unauthorized_client: public clients cannot use client_credentials")
+	}
 	// Validate grant type is allowed
 	if !s.containsString(client.GrantTypes, "client_credentials") {
 		return nil, fmt.Errorf("unauthorized_client: client_credentials grant is not allowed")
@@ -1986,13 +2603,21 @@ func (s *OAuthProviderService) TokenExchangeGrant(
 		return s.tokenExchangeFromExternalJWT(ctx, client, subjectToken, requestedScopes)
 	}
 
+	// Per-client grant gate (RFC 6749 §5.2 unauthorized_client): only a
+	// client registered for token-exchange may narrow tokens, the same
+	// deny-by-default rule ClientCredentialsGrant applies to its grant.
+	if !s.containsString(client.GrantTypes, tokenExchangeGrantType) {
+		return nil, fmt.Errorf("unauthorized_client: token-exchange grant is not allowed for this client")
+	}
+
 	// Validate the subject token's signature + expiry. ValidateAccessToken
 	// uses our active public key — anything not signed by us is rejected
 	// (we don't trust externally-issued tokens for exchange today). The
-	// returned claims are not consumed directly; the iam_oauth_tokens
-	// row lookup below is the canonical source for scope/user/tenant.
-	if _, vErr := s.ValidateAccessToken(subjectToken); vErr != nil {
-		return nil, fmt.Errorf("invalid_grant: subject_token validation failed: %v", vErr)
+	// iam_oauth_tokens row lookup below is the canonical source for
+	// scope/user/tenant.
+	claims, vErr := s.ValidateAccessToken(subjectToken)
+	if vErr != nil {
+		return nil, fmt.Errorf("invalid_grant: subject_token is invalid or expired")
 	}
 
 	// Cross-check the JWT against the iam_oauth_tokens row so a
@@ -2007,6 +2632,17 @@ func (s *OAuthProviderService) TokenExchangeGrant(
 	if row.IsRevoked {
 		return nil, fmt.Errorf("invalid_grant: subject_token has been revoked")
 	}
+	// Client binding: a client may only exchange tokens that were issued to
+	// itself. Without it any token-exchange client holding another client's
+	// access token (a leaked bearer, a token forwarded to it as a resource
+	// server) could re-mint it under its own identity and audience. The
+	// JWT's client_id must agree with the row.
+	if row.ClientID != client.ID {
+		return nil, fmt.Errorf("invalid_grant: subject_token was not issued to this client")
+	}
+	if cid, _ := claims["client_id"].(string); cid != client.ClientID {
+		return nil, fmt.Errorf("invalid_grant: subject_token was not issued to this client")
+	}
 
 	// Resolve the original user (if any). Client_credentials subject
 	// tokens have no user — the caller is just narrowing the audience
@@ -2016,7 +2652,13 @@ func (s *OAuthProviderService) TokenExchangeGrant(
 	if row.UserID != nil {
 		user, err = s.userRepo.GetByID(ctx, *row.UserID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid_grant: subject_token user not found: %v", err)
+			return nil, fmt.Errorf("invalid_grant: subject_token user not found")
+		}
+		if user == nil {
+			return nil, fmt.Errorf("invalid_grant: subject_token user not found")
+		}
+		if eligErr := userEligibleForTokens(user); eligErr != nil {
+			return nil, eligErr
 		}
 	}
 
@@ -2104,7 +2746,7 @@ func (s *OAuthProviderService) TokenExchangeGrant(
 // branch of RFC 8693 — the BFF-fronted Identity-Aware Proxy bridge.
 // The subject_token is a JWT signed by an EXTERNAL issuer registered
 // in iam_oauth_trusted_external_issuers (most importantly Talon at
-// internal.example.com). On success we mint a fresh user-bound
+// auth.internal.example.com). On success we mint a fresh user-bound
 // access + refresh token pair scoped to the caller-requested
 // audience, with an `act` claim recording the BFF as the actor.
 //

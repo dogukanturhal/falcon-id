@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -104,15 +105,36 @@ func (m *mockServiceAccountRoleRepo) GetRolePermissions(ctx context.Context, rol
 // Helper
 // ---------------------------------------------------------------------------
 
-func newServiceAccountService(repo *mockServiceAccountRepo) *ServiceAccountService {
-	return newServiceAccountServiceWithRoles(repo, new(mockServiceAccountRoleRepo))
+func newServiceAccountService(t *testing.T, repo *mockServiceAccountRepo) *ServiceAccountService {
+	return newServiceAccountServiceWithRoles(t, repo, new(mockServiceAccountRoleRepo))
 }
 
-func newServiceAccountServiceWithRoles(repo *mockServiceAccountRepo, roleRepo *mockServiceAccountRoleRepo) *ServiceAccountService {
+func newServiceAccountServiceWithRoles(t *testing.T, repo *mockServiceAccountRepo, roleRepo *mockServiceAccountRoleRepo) *ServiceAccountService {
 	cfg := &config.Config{
 		JWTSecret: "test-jwt-secret-at-least-32-chars-long!!",
 	}
-	return NewServiceAccountService(repo, roleRepo, cfg)
+	svc := NewServiceAccountService(repo, roleRepo, cfg)
+	svc.SetTokenSigner(newRS256TestSigner(t, nil))
+	return svc
+}
+
+// newRS256TestSigner returns a TokenService signing RS256 with an ephemeral key.
+// cfgOut, when non-nil, receives the service so tests can validate with it.
+func newRS256TestSigner(t *testing.T, cfgOut **TokenService) *TokenService {
+	t.Helper()
+	t.Setenv("JWT_PRIVATE_KEY", "")
+	t.Setenv("JWT_PRIVATE_KEY_FILE", "")
+	t.Setenv("JWT_PUBLIC_KEY", "")
+	t.Setenv("JWT_PUBLIC_KEY_FILE", "")
+	kp, err := crypto.NewJWTKeyProvider(nil, "sa-test-kid")
+	require.NoError(t, err)
+	// JWTHMACFallbackEnabled deliberately false: tokens must validate via RS256 only.
+	tok := NewTokenService(&config.Config{JWTSecret: "test-jwt-secret-at-least-32-chars-long!!", JWTSigningAlgorithm: "RS256"}, nil, nil)
+	tok.SetJWTKeyProvider(kp)
+	if cfgOut != nil {
+		*cfgOut = tok
+	}
+	return tok
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +144,7 @@ func newServiceAccountServiceWithRoles(repo *mockServiceAccountRepo, roleRepo *m
 func TestServiceAccount_Create_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	userID := uuid.New()
@@ -153,7 +175,7 @@ func TestServiceAccount_Create_Success(t *testing.T) {
 func TestServiceAccount_Create_DefaultTokenLifetime(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	req := &models.CreateServiceAccountRequest{
 		Name:    "Bot",
@@ -172,7 +194,7 @@ func TestServiceAccount_Create_DefaultTokenLifetime(t *testing.T) {
 func TestServiceAccount_Create_CustomTokenLifetime(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	lifetime := 120
 	req := &models.CreateServiceAccountRequest{
@@ -192,7 +214,7 @@ func TestServiceAccount_Create_CustomTokenLifetime(t *testing.T) {
 func TestServiceAccount_Create_RepoError(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	repo.On("Create", ctx, mock.AnythingOfType("*models.ServiceAccount")).
 		Return(errors.New("db error"))
@@ -213,7 +235,7 @@ func TestServiceAccount_Create_RepoError(t *testing.T) {
 func TestServiceAccount_GetByID_Found(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	expected := &models.ServiceAccount{ID: saID, Name: "Test Bot"}
@@ -231,7 +253,7 @@ func TestServiceAccount_GetByID_Found(t *testing.T) {
 func TestServiceAccount_GetByID_NotFound(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, nil)
@@ -245,7 +267,7 @@ func TestServiceAccount_GetByID_NotFound(t *testing.T) {
 func TestServiceAccount_GetByID_RepoError(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, errors.New("db error"))
@@ -263,7 +285,7 @@ func TestServiceAccount_GetByID_RepoError(t *testing.T) {
 func TestServiceAccount_Update_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	saID := uuid.New()
@@ -290,7 +312,7 @@ func TestServiceAccount_Update_Success(t *testing.T) {
 func TestServiceAccount_Update_NotFound_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, nil)
@@ -304,7 +326,7 @@ func TestServiceAccount_Update_NotFound_Error(t *testing.T) {
 func TestServiceAccount_Update_WrongTenant_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	existing := &models.ServiceAccount{ID: saID, TenantID: uuid.New()}
@@ -324,7 +346,7 @@ func TestServiceAccount_Update_WrongTenant_Error(t *testing.T) {
 func TestServiceAccount_Delete_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	saID := uuid.New()
@@ -342,7 +364,7 @@ func TestServiceAccount_Delete_Success(t *testing.T) {
 func TestServiceAccount_Delete_NotFound_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, nil)
@@ -356,7 +378,7 @@ func TestServiceAccount_Delete_NotFound_Error(t *testing.T) {
 func TestServiceAccount_Delete_WrongTenant_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	existing := &models.ServiceAccount{ID: saID, TenantID: uuid.New()}
@@ -376,7 +398,7 @@ func TestServiceAccount_Delete_WrongTenant_Error(t *testing.T) {
 func TestServiceAccount_List_ByTenant(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	expected := []*models.ServiceAccount{
@@ -395,7 +417,7 @@ func TestServiceAccount_List_ByTenant(t *testing.T) {
 func TestServiceAccount_List_Empty(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	repo.On("GetByTenantID", ctx, tenantID).Return([]*models.ServiceAccount{}, nil)
@@ -413,7 +435,7 @@ func TestServiceAccount_List_Empty(t *testing.T) {
 func TestServiceAccount_RegenerateSecret_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	saID := uuid.New()
@@ -439,7 +461,7 @@ func TestServiceAccount_RegenerateSecret_Success(t *testing.T) {
 func TestServiceAccount_RegenerateSecret_NotFound_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, nil)
@@ -457,7 +479,7 @@ func TestServiceAccount_RegenerateSecret_NotFound_Error(t *testing.T) {
 
 func TestServiceAccount_GenerateClientCredentials_Format(t *testing.T) {
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	clientID, secret, err := svc.GenerateClientCredentials()
 
@@ -468,7 +490,7 @@ func TestServiceAccount_GenerateClientCredentials_Format(t *testing.T) {
 
 func TestServiceAccount_GenerateClientCredentials_Uniqueness(t *testing.T) {
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	id1, sec1, _ := svc.GenerateClientCredentials()
 	id2, sec2, _ := svc.GenerateClientCredentials()
@@ -483,7 +505,7 @@ func TestServiceAccount_GenerateClientCredentials_Uniqueness(t *testing.T) {
 
 func TestServiceAccount_IsEndpointAllowed(t *testing.T) {
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tests := []struct {
 		name     string
@@ -514,7 +536,7 @@ func TestServiceAccount_IsEndpointAllowed(t *testing.T) {
 func TestServiceAccount_RevokeAllTokens_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	tenantID := uuid.New()
 	saID := uuid.New()
@@ -532,7 +554,7 @@ func TestServiceAccount_RevokeAllTokens_Success(t *testing.T) {
 func TestServiceAccount_RevokeAllTokens_NotFound_Error(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	saID := uuid.New()
 	repo.On("GetByID", ctx, saID).Return(nil, nil)
@@ -578,7 +600,7 @@ func newValidatedSA(t *testing.T) (string, *models.ServiceAccount) {
 func TestServiceAccount_Authenticate_Success(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	secret, sa := newValidatedSA(t)
 	repo.On("GetByClientID", ctx, sa.ClientID).Return(sa, nil)
@@ -594,7 +616,7 @@ func TestServiceAccount_Authenticate_Success(t *testing.T) {
 func TestServiceAccount_Authenticate_UnknownClientID_GenericError(t *testing.T) {
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	repo.On("GetByClientID", ctx, "unknown").Return(nil, nil)
 	_, err := svc.Authenticate(ctx, "unknown", "secret", "10.0.0.1")
@@ -611,7 +633,7 @@ func TestServiceAccount_Authenticate_WrongSecret_GenericError(t *testing.T) {
 	// leak the deactivated state).
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	_, sa := newValidatedSA(t)
 	sa.IsActive = false // deactivated AND we'll send the wrong secret
@@ -631,7 +653,7 @@ func TestServiceAccount_Authenticate_Deactivated_AuditButGenericError(t *testing
 	// the state from the response alone.
 	ctx := context.Background()
 	repo := new(mockServiceAccountRepo)
-	svc := newServiceAccountService(repo)
+	svc := newServiceAccountService(t, repo)
 
 	secret, sa := newValidatedSA(t)
 	sa.IsActive = false
@@ -641,4 +663,43 @@ func TestServiceAccount_Authenticate_Deactivated_AuditButGenericError(t *testing
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "authentication failed",
 		"deactivated-account replay must NOT leak its state via the client-facing error — the audit-log differs but the response is identical to other failure modes")
+}
+
+func TestServiceAccount_Authenticate_TokenIsRS256WithKidAndValidatesWithoutHMACFallback(t *testing.T) {
+	ctx := context.Background()
+	repo := new(mockServiceAccountRepo)
+	roleRepo := new(mockServiceAccountRoleRepo)
+	svc := newServiceAccountServiceWithRoles(t, repo, roleRepo)
+	var tok *TokenService
+	signer := newRS256TestSigner(t, &tok)
+	svc.SetTokenSigner(signer)
+
+	secret, sa := newValidatedSA(t)
+	repo.On("GetByClientID", ctx, sa.ClientID).Return(sa, nil)
+	repo.On("CreateToken", mock.Anything, mock.AnythingOfType("*models.ServiceAccountToken")).Return(nil)
+	repo.On("UpdateLastUsed", mock.Anything, sa.ID, mock.Anything).Return(nil)
+
+	resp, err := svc.Authenticate(ctx, sa.ClientID, secret, "10.0.0.1")
+	require.NoError(t, err)
+
+	parsed, _, err := jwt.NewParser().ParseUnverified(resp.AccessToken, jwt.MapClaims{})
+	require.NoError(t, err)
+	assert.Equal(t, "RS256", parsed.Method.Alg())
+	assert.Equal(t, "sa-test-kid", parsed.Header["kid"])
+
+	claims, err := tok.ValidateAccessToken(resp.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, sa.ID, claims.UserID)
+	assert.Equal(t, sa.TenantID, claims.TenantID)
+}
+
+func TestServiceAccount_Authenticate_NoSignerAndNoFallbackFails(t *testing.T) {
+	ctx := context.Background()
+	repo := new(mockServiceAccountRepo)
+	svc := NewServiceAccountService(repo, new(mockServiceAccountRoleRepo), &config.Config{JWTSecret: "test-jwt-secret-at-least-32-chars-long!!"})
+
+	secret, sa := newValidatedSA(t)
+	repo.On("GetByClientID", ctx, sa.ClientID).Return(sa, nil)
+	_, err := svc.Authenticate(ctx, sa.ClientID, secret, "10.0.0.1")
+	require.Error(t, err)
 }

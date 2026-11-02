@@ -139,6 +139,7 @@ func TestTokenExchangeGrant_LogsDroppedScopes(t *testing.T) {
 
 	client := newServiceClient("svc-exchange-source", uuid.New())
 	client.Scopes = []string{"events:publish", "events:consume"}
+	client.GrantTypes = append(client.GrantTypes, tokenExchangeGrantType)
 	subjectToken := mintAccessTokenForExchange(t, svc, repo, client, []string{"events:publish", "events:consume"})
 
 	resp, err := svc.TokenExchangeGrant(
@@ -174,6 +175,7 @@ func TestTokenExchangeGrant_NoLogWhenRequestedScopesAllSubset(t *testing.T) {
 
 	client := newServiceClient("svc-exchange-clean", uuid.New())
 	client.Scopes = []string{"events:publish", "events:consume"}
+	client.GrantTypes = append(client.GrantTypes, tokenExchangeGrantType)
 	subjectToken := mintAccessTokenForExchange(t, svc, repo, client, []string{"events:publish", "events:consume"})
 
 	resp, err := svc.TokenExchangeGrant(

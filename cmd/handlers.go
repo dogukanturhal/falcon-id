@@ -3,8 +3,11 @@
 package main
 
 import (
+	"context"
 	"os"
 
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/platform-shared/hooks"
@@ -12,6 +15,8 @@ import (
 	"github.com/dogukanturhal/falcon-id/internal/handlers"
 	platformhandlers "github.com/dogukanturhal/falcon-id/internal/handlers/platform"
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
+	"github.com/dogukanturhal/falcon-id/internal/opsconsole"
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	svc "github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
@@ -20,30 +25,41 @@ import (
 
 // Handlers holds all handler instances.
 type Handlers struct {
-	Auth             *handlers.AuthHandler
-	User             *handlers.UserHandler
-	UserPreferences  *handlers.UserPreferencesHandler
-	Role             *handlers.RoleHandler
-	SocialAuth       *handlers.SocialAuthHandler
-	Admin            *handlers.AdminHandler
-	MFA              *handlers.MFAHandler
-	PushMFA          *handlers.PushMFAHandler
-	OnboardingVerify *handlers.OnboardingVerifyHandler
-	OnboardingSlug   *handlers.OnboardingSlugHandler
-	OnboardingStatus *handlers.OnboardingStatusHandler
-	AD               *handlers.ADHandler
-	Settings         *handlers.SettingsHandler
-	APIKey           *handlers.APIKeyHandler
-	ServiceAccount   *handlers.ServiceAccountHandler
-	OAuthProvider    *handlers.OAuthProviderHandler
-	SAML             *handlers.SAMLHandler
-	SAMLSP           *handlers.SAMLSPHandler
-	SCIM             *handlers.SCIMHandler
-	Group            *handlers.GroupHandler
-	Organization     *handlers.OrganizationHandler
-	Impersonation    *handlers.ImpersonationHandler
-	Webhook          *handlers.WebhookHandler
-	Device           *handlers.DeviceHandler
+	ApprovalDirectory *handlers.ApprovalDirectoryHandler
+	NotifRecipients   *handlers.NotificationRecipientsHandler
+	TeamScope         *handlers.TeamScopeHandler
+	TenantTeam        *handlers.TenantTeamHandler
+	Auth              *handlers.AuthHandler
+	User              *handlers.UserHandler
+	UserPreferences   *handlers.UserPreferencesHandler
+	Role              *handlers.RoleHandler
+	SoD               *handlers.SoDHandler
+	SocialAuth        *handlers.SocialAuthHandler
+	Admin             *handlers.AdminHandler
+	MFA               *handlers.MFAHandler
+	PushMFA           *handlers.PushMFAHandler
+	OnboardingVerify  *handlers.OnboardingVerifyHandler
+	OnboardingSlug    *handlers.OnboardingSlugHandler
+
+	// TenantWorkspaceName: S2S placeholder rename + platform-admin backfill.
+	TenantWorkspaceName *handlers.TenantWorkspaceNameHandler
+
+	OnboardingStatus  *handlers.OnboardingStatusHandler
+	AD                *handlers.ADHandler
+	Settings          *handlers.SettingsHandler
+	APIKey            *handlers.APIKeyHandler
+	TenantAPIKey      *handlers.TenantAPIKeyHandler
+	TenantAPIKeyLimit gin.HandlerFunc // rate limiter for POST /oauth/token/api-key
+	ServiceAccount    *handlers.ServiceAccountHandler
+	OAuthProvider     *handlers.OAuthProviderHandler
+	SAML              *handlers.SAMLHandler
+	SAMLSP            *handlers.SAMLSPHandler
+	SCIM              *handlers.SCIMHandler
+	Group             *handlers.GroupHandler
+	Organization      *handlers.OrganizationHandler
+	Impersonation     *handlers.ImpersonationHandler
+	Webhook           *handlers.WebhookHandler
+	Device            *handlers.DeviceHandler
 	// Recovery — self-service account-recovery (recovery email). nil when
 	// Redis is unavailable (the service it wraps is Redis-gated).
 	Recovery           *handlers.RecoveryHandler
@@ -53,8 +69,10 @@ type Handlers struct {
 	Risk               *handlers.RiskHandler
 	Policy             *handlers.PolicyHandler
 	Tenant             *handlers.TenantHandler
+	Entitlement        *handlers.EntitlementHandler
 	FeatureFlag        *handlers.FeatureFlagHandler
 	Permission         *handlers.PermissionHandler
+	RoleTemplate       *handlers.RoleTemplateHandler
 	ADSync             *handlers.ADSyncHandler
 	Context            *handlers.ContextHandler
 	PlatformManagement *handlers.PlatformManagementHandler
@@ -83,11 +101,18 @@ type Handlers struct {
 	WorkloadIdentity           *handlers.WorkloadIdentityHandler
 	OAuthTrustedExternalIssuer *handlers.OAuthTrustedExternalIssuerHandler
 	// Identity & access
-	TempAccessPass    *handlers.TempAccessPassHandler
-	Signup            *handlers.SignupHandler
-	Delegation        *handlers.DelegationHandler
-	GuestUser         *handlers.GuestUserHandler
-	JITAccess         *handlers.JITAccessHandler
+	TempAccessPass *handlers.TempAccessPassHandler
+	Signup         *handlers.SignupHandler
+	Delegation     *handlers.DelegationHandler
+	GuestUser      *handlers.GuestUserHandler
+	JITAccess      *handlers.JITAccessHandler
+	// PlatformJIT — R1 platform plane: JIT elevation + break-glass.
+	// /internal/v1/{jit-elevations,break-glass,platform-roles}.
+	PlatformJIT       *handlers.PlatformJITHandler
+	PlatformAuth      *handlers.PlatformAuthorityHandler
+	// Ops — staff console operator-chain surface (/internal/v1/ops/*,
+	// /internal/v1/ops-approvals/*); nil unless the operator exchange is on.
+	Ops *opsconsole.Console
 	AccessReview      *handlers.AccessReviewHandler
 	EmailDomain       *handlers.EmailDomainHandler
 	TenantBranding    *handlers.TenantBrandingHandler
@@ -95,6 +120,7 @@ type Handlers struct {
 	IDPRouting        *handlers.IDPRoutingHandler
 	IDPTenantOverride *handlers.IDPTenantOverrideHandler
 	WebAuthn          *handlers.WebAuthnHandler
+	WitnessTOTP       *handlers.WitnessTOTPHandler
 	SCP               *handlers.SCPHandler
 	RealmDB           *handlers.RealmDBHandler
 	RealmFederation   *handlers.RealmFederationHandler
@@ -191,6 +217,11 @@ type Handlers struct {
 	// TeamInvitation — Phase 2 Team page prereq.
 	// Full invite/RSVP workflow + tenant user list + role management.
 	TeamInvitation *handlers.TeamInvitationHandler
+	// SeatLimit — interim internal seat_limit source
+	// (PUT/GET /internal/v1/tenants/:id/seat-limit) until subscription-
+	// management/entitlements data exists. See seat_limit_handler.go.
+	SeatLimit *handlers.SeatLimitHandler
+	HREmploymentSync *handlers.HREmploymentSyncHandler
 	// IAMDevices — ZTNA Phase 3 device enrollment internal API.
 	// POST /internal/v1/iam-devices/enroll and
 	// GET  /internal/v1/iam-devices/by-ek-hash/:hash.
@@ -234,6 +265,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	userHandler := handlers.NewUserHandler(services.User)
 	userPreferencesHandler := handlers.NewUserPreferencesHandler(services.UserPreferences, logger.Log)
 	roleHandler := handlers.NewRoleHandler(services.Role)
+	sodHandler := handlers.NewSoDHandler(services.SoD)
 	socialAuthHandler := handlers.NewSocialAuthHandler(services.SocialAuth, cfg, logger.Log)
 
 	adminHandler := handlers.NewAdminHandler(services.User, services.Role, repos.Session, repos.IDP, services.LDAP, services.Audit, logger.Log)
@@ -242,6 +274,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	adminHandler.SetRateLimitService(services.RateLimit)
 	adminHandler.SetIPRuleService(services.IPRule)
 	adminHandler.SetDeviceService(services.Device)
+	adminHandler.SetTokenService(services.Token)
 	adminHandler.SetLDAPSyncHistoryRepo(repos.LDAPSyncHistory)
 	if infra.TokenBlacklist != nil {
 		adminHandler.SetTokenBlacklist(infra.TokenBlacklist)
@@ -251,7 +284,10 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	}
 
 	mfaHandler := handlers.NewMFAHandler(services.MFA)
-	// Onboarding contact-verification handler — Mearax wizard's
+	// Saved workspace names are mirrored into tenant-management (best effort).
+	tenantSettingsHandler := handlers.NewTenantSettingsHandler(repos.Tenant, logger.Log)
+	tenantSettingsHandler.SetWorkspaceNamePusher(services.TenantWorkspaceName)
+	// Onboarding contact-verification handler — AcmeWeb wizard's
 	// "confirm your mobile number" step, wired to send/verify via EMAIL
 	// (see MFAService's onboarding-verify doc comment). Shares the MFA
 	// service's email-OTP primitives but is registered on its own routes
@@ -287,9 +323,17 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	adHandler := handlers.NewADHandler(services.LDAP, logger.Log)
 	settingsHandler := handlers.NewSettingsHandler(repos.Settings, infra.EncryptionService, logger.Log)
 	apiKeyHandler := handlers.NewAPIKeyHandler(services.APIKey, logger.Log)
+	tenantAPIKeyHandler := handlers.NewTenantAPIKeyHandler(services.TenantAPIKey, logger.Log)
+	var tenantAPIKeyLimit gin.HandlerFunc
+	if infra.RedisClient != nil {
+		tenantAPIKeyLimit = middleware.APIKeyExchangeRateLimit(infra.RedisClient.Redis(), logger.Log)
+	} else {
+		tenantAPIKeyLimit = middleware.APIKeyExchangeRateLimit(nil, logger.Log)
+	}
 	serviceAccountHandler := handlers.NewServiceAccountHandler(services.ServiceAccount, logger.Log)
 	oauthProviderHandler := handlers.NewOAuthProviderHandler(services.OAuthProvider, services.Auth, logger.Log)
 	oauthProviderHandler.SetTenantLookup(repos.Tenant)
+	oauthProviderHandler.SetTokenService(services.Token)
 	if infra.SessionCache != nil {
 		oauthProviderHandler.SetSessionCache(infra.SessionCache)
 	}
@@ -311,8 +355,13 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	riskHandler := handlers.NewRiskHandler(services.Risk, services.User)
 	policyHandler := handlers.NewPolicyHandler(repos.Policy, repos.Settings)
 	tenantHandler := handlers.NewTenantHandler(repos.Tenant, repos.User, logger.Log)
+	var entitlementHandler *handlers.EntitlementHandler
+	if services.Entitlement != nil {
+		entitlementHandler = handlers.NewEntitlementHandler(services.Entitlement, logger.Log)
+	}
 	featureFlagHandler := handlers.NewFeatureFlagHandler(logger.Log)
 	permissionHandler := handlers.NewPermissionHandler(services.Permission)
+	roleTemplateHandler := handlers.NewRoleTemplateHandler(services.RoleTemplate)
 	adSyncHandler := handlers.NewADSyncHandler(services.ADSync)
 	authorizationHandler := handlers.NewAuthorizationHandler(services.Authorization, services.User)
 	tenantConfigHandler := handlers.NewTenantConfigHandler(services.ConfigProvider, repos.TenantConfig, logger.Log)
@@ -345,7 +394,11 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		services.Tenant,
 		services.Audit,
 		logger.Log,
+		services.AcmeAppRoleProvisioner,
 	)
+	if services.ModuleAccess != nil {
+		platformManagementHandler.SetModuleAccessReconciler(services.ModuleAccess)
+	}
 
 	metricsHandler, realmHandler, realmMiddleware := initPlatformComponents(cfg, services, repos, infra, tenantHandler)
 
@@ -359,6 +412,11 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	var csrfMiddleware *middleware.CSRFMiddleware
 	if infra.RedisClient != nil {
 		csrfMiddleware = middleware.NewCSRFMiddleware(infra.RedisClient)
+		// Stage 3: same dynamic, tenant-registry-derived origin set CORS
+		// consults (cmd/routes.go's CORSWithRegistry) — additive only, see
+		// DynamicOriginRegistry's fail-closed doc comment. services is
+		// nil-safe here too (SetOriginRegistry no-ops on a nil registry).
+		csrfMiddleware.SetOriginRegistry(services.OriginRegistry)
 		logger.Info("CSRF protection enabled with Redis session storage")
 		authHandler.SetCSRFMiddleware(csrfMiddleware)
 	} else {
@@ -373,6 +431,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	// the rows the handler wrote.
 	stepUpMiddleware := middleware.NewStepUpMiddleware(repos.StepUpVerification, logger.Log)
 	mfaHandler.SetStepUpRepo(repos.StepUpVerification)
+	mfaHandler.SetSessionCache(infra.SessionCache)
 
 	// Tier-1 IdP step-up — wire SessionRepo so MFA-verify handlers can
 	// elevate the current session's RFC 8176 AMR atomically with factor
@@ -442,6 +501,8 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	delegationHandler := handlers.NewDelegationHandler(services.Delegation, logger.Log)
 	guestUserHandler := handlers.NewGuestUserHandler(services.GuestUser)
 	jitAccessHandler := handlers.NewJITAccessHandler(services.JITAccess, logger.Log)
+	platformJITHandler := handlers.NewPlatformJITHandler(services.PlatformJIT, logger.Log)
+	platformAuthHandler := handlers.NewPlatformAuthorityHandler(repos.PlatformAuthority, services.PlatformJIT, services.PlatformAuth, logger.Log)
 	accessReviewHandler := handlers.NewAccessReviewHandler(services.AccessReview, logger.Log)
 	emailDomainHandler := handlers.NewEmailDomainHandler(services.EmailDomain)
 	tenantBrandingHandler := handlers.NewTenantBrandingHandler(services.TenantBranding)
@@ -457,6 +518,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	var webAuthnHandler *handlers.WebAuthnHandler
 	if services.WebAuthn != nil {
 		webAuthnHandler = handlers.NewWebAuthnHandler(services.WebAuthn, services.Auth, logger.Log)
+		webAuthnHandler.SetStepUpRepo(repos.StepUpVerification)
 		// RFC 9470 step-up — WebAuthn /step-up/{begin,finish} endpoints need
 		// SessionRepository to elevate the current session's AMR after a
 		// successful passkey assertion. Matches MFAHandler.SetSessionRepo
@@ -487,6 +549,11 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		// using the existing issuer key. When TokenService has no RS256
 		// key wired (HS256-only environment) the endpoint returns 503.
 		webAuthnHandler.SetTokenService(services.Token)
+		// Begin-time {device_uuid, ek_pubkey_hash, state} binding store for the
+		// passkey witness (nil Witness -> /witness/* return 503, fail closed).
+		if services.Witness != nil {
+			webAuthnHandler.SetWitnessState(services.Witness)
+		}
 		// Witness enrollment page (2026-06-10): wire CSRF middleware so
 		// the page can mint a per-session CSRF token and embed it in the
 		// bootstrap payload — the page's subsequent POSTs to /witness/
@@ -496,6 +563,10 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		if csrfMiddleware != nil {
 			webAuthnHandler.SetCSRFMiddleware(csrfMiddleware)
 		}
+	}
+	var witnessTOTPHandler *handlers.WitnessTOTPHandler
+	if services.Witness != nil {
+		witnessTOTPHandler = handlers.NewWitnessTOTPHandler(services.Witness, logger.Log)
 	}
 	scpHandler := handlers.NewSCPHandler(services.SCP, logger.Log)
 
@@ -607,6 +678,9 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	// + BCL fan-out so revocation latency is <5s instead of bound by
 	// access-token TTL.
 	services.User.SetBackchannelLogout(backchannelLogoutSvc)
+	// Access terminator (disable/delete/reset/SCIM/admin revoke) fans out BCL too.
+	services.AccessTerminator.SetBackchannel(backchannelLogoutSvc)
+	adminHandler.SetAccessTerminator(services.AccessTerminator)
 
 	backchannelLogoutHandler := handlers.NewBackchannelLogoutHandler(backchannelLogoutSvc, logger.Log)
 
@@ -621,6 +695,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	oauthProviderHandler.SetFrontchannelLogout(frontchannelLogoutSvc)
 
 	stubHandler := handlers.NewStubHandler(infra.DB.Pool)
+	stubHandler.SetTenantPurgePlanner(buildTenantPurgePlanner(infra.Config, logger.Log))
 
 	// DeviceFingerprintHandler — user-self-service for the richer-signal device store.
 	deviceFingerprintHandler := handlers.NewDeviceFingerprintHandler(services.DeviceFingerprint)
@@ -669,6 +744,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	// When KeyManager is wired, all active+rotated keys are served (graceful rotation).
 	// Merges OAuth provider keys so clients have a single discovery endpoint.
 	jwksHandler := handlers.NewJWKSHandler(services.JWTKeyProvider)
+	jwksHandler.SetMaxAge(cfg.JWKSMaxAge)
 	if services.KeyManager != nil {
 		jwksHandler.SetKeyManager(services.KeyManager)
 	}
@@ -713,12 +789,27 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 	teamInvitationHandler.SetMachineRepositories(repos.ServiceAccount, repos.ServicePrincipal)
 	teamInvitationHandler.SetEmailService(services.Email)
 	teamInvitationHandler.SetTenantBootstrap(services.TenantBootstrap)
+	teamInvitationHandler.SetEmployeeAccountServices(services.User, services.TemplateRoleProvisioner, services.Invitation, services.EmployeeAccess)
+	teamInvitationHandler.SetSeatRepositories(repos.UserMembership, repos.SeatCounter)
+	teamInvitationHandler.SetFirstPartyEmailProof(repos.SignupRequest)
+	teamInvitationHandler.SetOnboardingServices(services.User, services.Auth)
+	teamInvitationHandler.SetContextCacheInvalidator(func(ctx context.Context, userID uuid.UUID) {
+		handlers.InvalidateUserContextsCache(ctx, infra.RedisClient, userID)
+	})
+
+	seatLimitHandler := handlers.NewSeatLimitHandler(repos.SeatCounter, logger.Log)
+	hrEmploymentSyncHandler := handlers.NewHREmploymentSyncHandler(services.HREmploymentSync)
 
 	return &Handlers{
+		ApprovalDirectory:  handlers.NewApprovalDirectoryHandler(repos.UserMembership, infra.SpiceDBClient),
+		TeamScope:          handlers.NewTeamScopeHandler(services.Organization),
+		TenantTeam:         handlers.NewTenantTeamHandler(services.Organization),
+		NotifRecipients:    handlers.NewNotificationRecipientsHandler(repositories.NewNotificationRecipientRepository(infra.DB.Pool, infra.EncryptionService), services.AuthzEngine),
 		Auth:               authHandler,
 		User:               userHandler,
 		UserPreferences:    userPreferencesHandler,
 		Role:               roleHandler,
+		SoD:                sodHandler,
 		SocialAuth:         socialAuthHandler,
 		Admin:              adminHandler,
 		MFA:                mfaHandler,
@@ -729,6 +820,8 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		AD:                 adHandler,
 		Settings:           settingsHandler,
 		APIKey:             apiKeyHandler,
+		TenantAPIKey:       tenantAPIKeyHandler,
+		TenantAPIKeyLimit:  tenantAPIKeyLimit,
 		ServiceAccount:     serviceAccountHandler,
 		OAuthProvider:      oauthProviderHandler,
 		SAML:               samlHandler,
@@ -746,8 +839,10 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		Risk:               riskHandler,
 		Policy:             policyHandler,
 		Tenant:             tenantHandler,
+		Entitlement:        entitlementHandler,
 		FeatureFlag:        featureFlagHandler,
 		Permission:         permissionHandler,
+		RoleTemplate:       roleTemplateHandler,
 		ADSync:             adSyncHandler,
 		Context:            contextHandler,
 		PlatformManagement: platformManagementHandler,
@@ -782,6 +877,9 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		Delegation:        delegationHandler,
 		GuestUser:         guestUserHandler,
 		JITAccess:         jitAccessHandler,
+		PlatformJIT:       platformJITHandler,
+		PlatformAuth:      platformAuthHandler,
+		Ops:               initOpsConsole(services, repos, infra),
 		AccessReview:      accessReviewHandler,
 		EmailDomain:       emailDomainHandler,
 		TenantBranding:    tenantBrandingHandler,
@@ -789,6 +887,7 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		IDPRouting:        idpRoutingHandler,
 		IDPTenantOverride: idpTenantOverrideHandler,
 		WebAuthn:          webAuthnHandler,
+		WitnessTOTP:       witnessTOTPHandler,
 		SCP:               scpHandler,
 		RealmDB:           realmDBHandler,
 		RealmFederation:   realmFederationHandler,
@@ -817,8 +916,11 @@ func initHandlers(services *Services, repos *Repositories, infra *Infrastructure
 		AgentIdentity:       agentIdentityHandler,
 		ComplianceEvidence:  complianceEvidenceHandler,
 		TenantTransfer:      tenantTransferHandler,
-		TenantSettings:      handlers.NewTenantSettingsHandler(repos.Tenant, logger.Log),
+		TenantSettings:      tenantSettingsHandler,
+		TenantWorkspaceName: handlers.NewTenantWorkspaceNameHandler(services.TenantWorkspaceName, logger.Log),
 		TeamInvitation:      teamInvitationHandler,
+		SeatLimit:           seatLimitHandler,
+		HREmploymentSync:    hrEmploymentSyncHandler,
 		Catalog:             catalogHandler,
 		RoutingWebhook:      routingWebhookHandler,
 		Hooks:               hooksHandler,

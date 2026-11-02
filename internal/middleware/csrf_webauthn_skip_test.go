@@ -54,3 +54,30 @@ func TestCSRF_ExemptPath_WebAuthnConditionalBegin_SkipsValidation(t *testing.T) 
 		})
 	}
 }
+
+// TestCSRF_ExemptPath_InvitationRegister_SkipsValidation locks the pre-auth
+// invitation onboarding endpoint. The invitee has no session, so no
+// session-bound CSRF token can exist; the single-use invitation token is the
+// credential. Regression: invited-member signup returned 403 on preview
+// (2026-10-14) because the route was not on the skip list.
+func TestCSRF_ExemptPath_InvitationRegister_SkipsValidation(t *testing.T) {
+	for _, path := range []string{
+		"/api/auth/invitations/register",
+		"/api/v1/auth/invitations/register",
+	} {
+		t.Run(path, func(t *testing.T) {
+			m := NewCSRFMiddlewareWithConfig(newCSRFConfig())
+
+			w := httptest.NewRecorder()
+			_, router := gin.CreateTestContext(w)
+			router.POST(path, m.CSRF(), func(c *gin.Context) {
+				c.Status(http.StatusOK)
+			})
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, nil)
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusOK, w.Code, "invitation register %q MUST skip CSRF", path)
+		})
+	}
+}

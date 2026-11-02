@@ -39,10 +39,12 @@ type StartImpersonationRequest struct {
 }
 
 // ImpersonationResponse is returned when starting impersonation
+// ImpersonationResponse deliberately has NO refresh token: an impersonation
+// credential is a single non-refreshable access token (<= 15 min, act claim);
+// to continue, the operator ends the session and starts a new one.
 type ImpersonationResponse struct {
 	ImpersonationSessionID string `json:"impersonation_session_id"`
 	AccessToken            string `json:"access_token"`
-	RefreshToken           string `json:"refresh_token,omitempty"`
 	ExpiresIn              int    `json:"expires_in"`
 	TokenType              string `json:"token_type"`
 	TargetUser             *User  `json:"target_user"`

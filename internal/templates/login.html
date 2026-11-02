@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign in — Falcon ID</title>
+    <title>Sign in — {{.Brand}}</title>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -98,25 +98,103 @@
         }
         button:hover { background: #1d4ed8; }
         button:active { background: #1e40af; }
+        .continue { margin-bottom: 16px; padding: 12px; border: 1px solid #e4e4e7; border-radius: 8px; font-size: 14px; }
+        .continue-status { margin-top: 4px; font-size: 13px; color: #71717a; }
+        .continue-switch { display: inline-block; margin-top: 8px; font-size: 13px; }
+        html { color-scheme: light dark; }
+        body { padding: 16px; font-family: Inter, system-ui, sans-serif; }
+        [data-brand="AcmeApp"] .logo-mark, [data-brand="AcmeApp"] button { background: #594ce7; }
+        @media (prefers-color-scheme: dark) {
+            body { background: #09090b; color: #fafafa; }
+            .card { background: #18181b; border-color: #3f3f46; }
+            .logo-word, label { color: #fafafa; }
+            .subtitle { color: #a1a1aa; }
+            input[type="text"], input[type="password"] { background: #27272a; color: #fafafa; border-color: #3f3f46; }
+        }
     </style>
 </head>
-<body>
+<body data-brand="{{.Brand}}">
     <div class="card">
-        <div class="logo"><span class="logo-mark"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="logo-word">Falcon ID</span></div>
+        <div class="logo">{{if eq .Brand "AcmeApp"}}{{template "acmeapp-mark"}}<span class="logo-word">AcmeApp</span>{{else}}<span class="logo-mark"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="logo-word">Falcon ID</span>{{end}}</div>
         <div class="subtitle">Sign in to continue</div>
         {{if .Error}}
         <div class="error">{{.Error}}</div>
+        {{end}}
+        {{if .LoginHint}}
+        <div class="continue" id="continue-as">
+            <div class="continue-label">Continue as <strong id="hint-text">{{.LoginHint}}</strong></div>
+            <div class="continue-status" id="passkey-status" role="status"></div>
+            <a class="continue-switch" id="use-different" href="{{.ChangeAccountURL}}">Use a different account</a>
+        </div>
         {{end}}
         <form method="POST" action="/oauth/login">
             <input type="hidden" name="redirect" value="{{.Redirect}}">
             <input type="hidden" name="tenant_id" value="{{.TenantID}}">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
             <label for="username">Email or username</label>
-            <input type="text" id="username" name="username" required autocomplete="username" autofocus>
+            <input type="text" id="username" name="username" required autocomplete="username"{{if .LoginHint}} value="{{.LoginHint}}"{{else}} autofocus{{end}}>
             <label for="password">Password</label>
             <input type="password" id="password" name="password" required autocomplete="current-password">
             <button type="submit">Sign in</button>
         </form>
     </div>
+    {{if and .LoginHint .TenantID}}
+    <script>
+    // "Continue as <login_hint>": immediately offer the passkey. The discoverable
+    // (usernameless) ceremony is used so nothing about the hinted account is
+    // looked up or revealed; any failure leaves the password form usable.
+    (function () {
+        var tenantID = {{.TenantID}};
+        var redirectTo = {{.Redirect}} || "/";
+        var statusEl = document.getElementById("passkey-status");
+        function b64uToBuf(v) {
+            v = v.replace(/-/g, "+").replace(/_/g, "/");
+            while (v.length % 4) { v += "="; }
+            var bin = atob(v), out = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+            return out.buffer;
+        }
+        function bufToB64u(b) {
+            var bytes = new Uint8Array(b), s = "";
+            for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+            return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        }
+        function fallback() { if (statusEl) { statusEl.textContent = "Passkey not used. Sign in below."; } }
+        if (!window.PublicKeyCredential || !navigator.credentials) { return; }
+        var q = "?tenant_id=" + encodeURIComponent(tenantID);
+        fetch("/api/v1/auth/webauthn/conditional/begin" + q, {
+            method: "POST", credentials: "same-origin",
+            headers: {"Content-Type": "application/json"}, body: "{}"
+        }).then(function (r) {
+            if (!r.ok) { throw new Error("begin"); }
+            return r.json();
+        }).then(function (ch) {
+            var o = ch.publicKey.publicKey || ch.publicKey;
+            o.challenge = b64uToBuf(o.challenge);
+            (o.allowCredentials || []).forEach(function (c) { c.id = b64uToBuf(c.id); });
+            if (statusEl) { statusEl.textContent = "Waiting for your passkey..."; }
+            return navigator.credentials.get({publicKey: o}).then(function (cred) {
+                var body = {
+                    id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type,
+                    response: {
+                        authenticatorData: bufToB64u(cred.response.authenticatorData),
+                        clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+                        signature: bufToB64u(cred.response.signature),
+                        userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null
+                    }
+                };
+                return fetch("/api/v1/auth/webauthn/conditional/complete" + q +
+                    "&wa_session_id=" + encodeURIComponent(ch.wa_session_id), {
+                    method: "POST", credentials: "same-origin",
+                    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+                });
+            });
+        }).then(function (r) {
+            if (!r.ok) { throw new Error("complete"); }
+            window.location.replace(redirectTo);
+        }).catch(fallback);
+    })();
+    </script>
+    {{end}}
 </body>
 </html>

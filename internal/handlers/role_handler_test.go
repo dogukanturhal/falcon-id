@@ -54,6 +54,12 @@ func (m *mockRoleHandlerRoleRepo) AssignPermissions(ctx context.Context, roleID 
 	return args.Error(0)
 }
 
+// GrantPermissionsByName is a no-op stub: no test in this file exercises the
+// AcmeApp reconcile path.
+func (m *mockRoleHandlerRoleRepo) GrantPermissionsByName(ctx context.Context, roleID uuid.UUID, permissionNames []string) error {
+	return nil
+}
+
 func (m *mockRoleHandlerRoleRepo) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]models.Permission, error) {
 	args := m.Called(ctx, roleID)
 	if args.Get(0) == nil {
@@ -160,6 +166,14 @@ func (m *mockRoleHandlerPermRepo) GetUserPermissionNames(ctx context.Context, us
 		return nil, args.Error(1)
 	}
 	return args.Get(0).([]string), args.Error(1)
+}
+
+func (m *mockRoleHandlerPermRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Permission, error) {
+	args := m.Called(ctx, id)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*models.Permission), args.Error(1)
 }
 
 func (m *mockRoleHandlerPermRepo) GetPermissionNamesByIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
@@ -288,6 +302,50 @@ func TestRoleHandler_List_ReturnsPaginatedRoles(t *testing.T) {
 	assert.Contains(t, resp, "roles")
 	total := resp["total"].(float64)
 	assert.Equal(t, float64(1), total)
+}
+
+// TestRoleHandler_List_SucceedsWithNilPermissions_V2Token is a control for
+// the 2026-09-18 fix: v2 (SpiceDB) tokens always carry CurrentUser.Permissions
+// == nil (see token_service.go/GenerateAccessTokenV2 and
+// token_service_validation.go/extractSpiceDBClaims — "Permissions: nil, //
+// Resolved via SpiceDB"). Route-level authorization for GET /api/v1/roles is
+// authMiddleware.RequirePermission(permCoreRolesRead) in cmd/routes.go, which
+// is SpiceDB-backed and already ran by the time this handler executes; the
+// handler itself must not re-deny based on the (always-nil-for-v2) static
+// Permissions claim.
+//
+// Before the fix this test fails with 403 {"error":"forbidden"} because
+// RoleHandler.List called currentUser.HasPermission("core:roles:read"),
+// which iterates a nil slice and always returns false — denying every
+// v2-token caller regardless of their real SpiceDB grants or platform-admin
+// status.
+func TestRoleHandler_List_SucceedsWithNilPermissions_V2Token(t *testing.T) {
+	tenantID := uuid.New()
+	r := makeTestRole(tenantID, false)
+	roleRepo := new(mockRoleHandlerRoleRepo)
+	permRepo := new(mockRoleHandlerPermRepo)
+	roleRepo.On("GetMaxPriorityForUser", mock.Anything, mock.AnythingOfType("uuid.UUID"), tenantID).Return(100, nil)
+	roleRepo.On("ListForModules", mock.Anything, tenantID, 1, 100, "", []string{"core", "iam"}).Return([]models.Role{*r}, int64(1), nil)
+	roleRepo.On("GetRolePermissions", mock.Anything, r.ID).Return([]models.Permission{}, nil)
+	svc := newTestRoleSvc(t, roleRepo, permRepo)
+	h := NewRoleHandler(svc)
+
+	// Shape of a v2-token CurrentUser: Permissions is nil. IsPlatformAdmin is
+	// false here on purpose — this is a regular tenant user whose access was
+	// already decided by the SpiceDB-backed middleware, not a platform-admin
+	// bypass case, to prove the handler itself isn't the thing deciding.
+	v2User := &models.CurrentUser{
+		ID:              uuid.New(),
+		TenantID:        tenantID,
+		Username:        "v2-user",
+		Roles:           []string{"member"},
+		Permissions:     nil,
+		IsPlatformAdmin: false,
+	}
+
+	router := setupRoleHandlerRouter(h, tenantID, v2User)
+	w := doRequest(router, http.MethodGet, "/api/roles", "")
+	assert.Equal(t, http.StatusOK, w.Code, "handler must not re-deny core:roles:read locally; that decision belongs to the SpiceDB-backed RequirePermission middleware which already ran")
 }
 
 func TestRoleHandler_List_EmptyResult(t *testing.T) {
@@ -731,6 +789,12 @@ func TestRoleHandler_AssignPermissions_Returns200(t *testing.T) {
 		Return([]string{"crm:*:*"}, nil)
 	permRepo.On("GetPermissionNamesByIDs", mock.Anything, mock.Anything).
 		Return(map[uuid.UUID]string{permID: "crm:contacts:read"}, nil)
+	// ADR-A10 boundary check (checkGrantBoundaryForIDs): no
+	// entitlementChecker is wired in this test, so EntitledModules fails
+	// closed to UniversalModules (core, iam) — use a core permission so
+	// the boundary passes.
+	permRepo.On("GetByID", mock.Anything, permID).
+		Return(&models.Permission{ID: permID, Name: "core:contacts:read", Module: "core"}, nil)
 
 	svc := newTestRoleSvc(t, roleRepo, permRepo)
 	h := NewRoleHandler(svc)
@@ -761,4 +825,36 @@ func TestRoleHandler_AssignPermissions_NotFound_Returns404(t *testing.T) {
 	w := doRequest(router, http.MethodPut, "/api/roles/"+targetID.String()+"/permissions", body)
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+type fakeRoleAPIKeyUsage struct{ n int }
+
+func (f fakeRoleAPIKeyUsage) CountActiveTenantKeysByRole(context.Context, uuid.UUID, uuid.UUID) (int, error) {
+	return f.n, nil
+}
+
+func TestRoleHandler_AssignPermissions_ForbiddenForAPIKeyRole_Returns409(t *testing.T) {
+	tenantID := uuid.New()
+	r := makeTestRole(tenantID, false)
+	permID := uuid.New()
+
+	roleRepo := new(mockRoleHandlerRoleRepo)
+	permRepo := new(mockRoleHandlerPermRepo)
+	roleRepo.On("GetByID", mock.Anything, r.ID).Return(r, nil)
+	roleRepo.On("GetRolePermissions", mock.Anything, r.ID).Return([]models.Permission{}, nil)
+	permRepo.On("GetPermissionNamesByIDs", mock.Anything, mock.Anything).
+		Return(map[uuid.UUID]string{permID: "iam:users:manage"}, nil)
+
+	svc := newTestRoleSvc(t, roleRepo, permRepo)
+	svc.SetAPIKeyRoleUsage(fakeRoleAPIKeyUsage{n: 2})
+	h := NewRoleHandler(svc)
+	router := setupRoleHandlerRouter(h, tenantID, makeAdminCtx(tenantID))
+
+	body := fmt.Sprintf(`{"permission_ids":[%q]}`, permID.String())
+	w := doRequest(router, http.MethodPut, "/api/roles/"+r.ID.String()+"/permissions", body)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.EqualValues(t, 2, resp["key_count"])
 }

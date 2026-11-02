@@ -43,7 +43,7 @@ func sampleOutboxRow(t *testing.T) *OAuthLogoutOutboxRow {
 		LogoutTokenJTI: "jti-test-12345",
 		Sub:            &sub,
 		Sid:            &sid,
-		TargetURI:      "https://internal.example.com/auth/backchannel-logout",
+		TargetURI:      "https://auth.internal.example.com/auth/backchannel-logout",
 		Payload:        "eyJhbGciOiJSUzI1NiJ9.fake-jwt",
 		Status:         OAuthLogoutOutboxPending,
 		AttemptCount:   0,
@@ -225,7 +225,7 @@ func TestOAuthLogoutOutboxRepository_SelectPendingForDelivery(t *testing.T) {
 		"last_error", "created_at", "delivered_at",
 	}).
 		AddRow(id1, "svc-talon", "jti-1", &sub, &sid,
-			"https://internal.example.com/auth/backchannel-logout",
+			"https://auth.internal.example.com/auth/backchannel-logout",
 			"eyJ.fake1", "pending", 0, now, (*string)(nil), now, (*time.Time)(nil)).
 		AddRow(id2, "svc-accounts", "jti-2", &sub, &sid,
 			"https://accounts.hexxlock.com/api/auth/backchannel-logout",

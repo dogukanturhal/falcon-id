@@ -41,23 +41,26 @@ type TenantListResponse struct {
 
 // TenantResponse represents tenant data for API responses
 type TenantResponse struct {
-	ID            uuid.UUID  `json:"id"`
-	Name          string     `json:"name"`
-	Slug          string     `json:"slug"`
-	DisplayName   string     `json:"display_name"`
-	Domain        *string    `json:"domain,omitempty"`
-	Status        string     `json:"status"`
-	Type          string     `json:"type,omitempty"`
-	Plan          string     `json:"plan"`
-	BillingEmail  *string    `json:"billing_email,omitempty"`
-	BillingExempt bool       `json:"billing_exempt"`
-	MaxUsers      int        `json:"max_users"`
-	MaxStorage    int64      `json:"max_storage"`
-	TrialEndsAt   *time.Time `json:"trial_ends_at,omitempty"`
-	SuspendedAt   *time.Time `json:"suspended_at,omitempty"`
-	CancelledAt   *time.Time `json:"cancelled_at,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	DisplayName string    `json:"display_name"`
+	// NamePlaceholder is true while the workspace still carries the signup
+	// placeholder name, so admin lists can tell "never named" from a real name.
+	NamePlaceholder bool       `json:"name_placeholder"`
+	Domain          *string    `json:"domain,omitempty"`
+	Status          string     `json:"status"`
+	Type            string     `json:"type,omitempty"`
+	Plan            string     `json:"plan"`
+	BillingEmail    *string    `json:"billing_email,omitempty"`
+	BillingExempt   bool       `json:"billing_exempt"`
+	MaxUsers        int        `json:"max_users"`
+	MaxStorage      int64      `json:"max_storage"`
+	TrialEndsAt     *time.Time `json:"trial_ends_at,omitempty"`
+	SuspendedAt     *time.Time `json:"suspended_at,omitempty"`
+	CancelledAt     *time.Time `json:"cancelled_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 
 	// Owner info (populated in ListAll via JOIN)
 	OwnerEmail *string `json:"owner_email,omitempty"`

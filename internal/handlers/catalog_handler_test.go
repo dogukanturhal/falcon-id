@@ -98,7 +98,7 @@ func TestListProducts_ReturnsActiveOnly(t *testing.T) {
 	router := newCatalogTestRouter(h)
 
 	product1 := sampleProduct("Example Suite", "examplesuite")
-	product2 := sampleProduct("HexxLock Hotel PMS", "hexxlock-hotel-pms")
+	product2 := sampleProduct("HexxLock Example PMS", "example-pms")
 	product2.ID = uuid.MustParse("00000000-0000-0000-0000-000000000002")
 
 	repo.On("ListActive", mock.Anything, 1, 20).

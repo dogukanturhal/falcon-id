@@ -1,15 +1,12 @@
+# Local development stack: Postgres, Redis and SpiceDB, plus the service itself
+# behind the "app" profile.
+#
+#   docker compose up -d                # dependencies only
+#   docker compose --profile app up -d  # dependencies + falcon-id
+#
+# Read "Status and limitations" in README.md before starting the app profile:
+# the base database schema is not part of this repository yet.
 services:
-  falcon-id:
-    build: .
-    ports:
-      - "8010:8010"
-    env_file: .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
   postgres:
     image: postgres:16-alpine
     environment:
@@ -20,11 +17,12 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./deploy/dev/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U falcon"]
+      test: ["CMD-SHELL", "pg_isready -U falcon -d falcon_id"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
@@ -34,7 +32,35 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  # In-memory datastore: relationships are lost when the container stops.
+  # Fine for development, not for anything you want to keep.
+  spicedb:
+    image: authzed/spicedb:v1.44.4
+    command: ["serve", "--grpc-preshared-key", "falcon-dev-preshared-key", "--datastore-engine", "memory"]
+    ports:
+      - "50051:50051"
+
+  falcon-id:
+    profiles: ["app"]
+    build: .
+    ports:
+      - "8010:8010"
+    env_file: .env
+    environment:
+      # Inside the compose network the dependencies are reachable by service name.
+      DATABASE_URL: postgres://falcon:falcon_dev@postgres:5432/falcon_id?sslmode=disable
+      CONTROL_PLANE_DATABASE_URL: postgres://falcon:falcon_dev@postgres:5432/falcon_id_control?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      SPICEDB_ENDPOINT: spicedb:50051
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      spicedb:
+        condition: service_started
 
 volumes:
   pgdata:

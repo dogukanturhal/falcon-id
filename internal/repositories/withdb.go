@@ -34,8 +34,12 @@ func (r *RoleRepository) WithDB(pool DBTX) *RoleRepository {
 	return &clone
 }
 
-// WithDBPool returns a shallow clone of SessionRepository using the given pool.
-func (r *SessionRepository) WithDBPool(pool *pgxpool.Pool) *SessionRepository {
+// WithDB returns a shallow clone of SessionRepository using the given
+// DBTX (e.g. the request-scoped *pgx.Tx stashed by RLSMiddleware under the
+// "pgx_tx" gin context key), so its queries run inside the transaction that
+// has app.current_tenant_id / app.current_realm_id set via SET LOCAL,
+// instead of against the raw pool (which has no RLS context at all).
+func (r *SessionRepository) WithDB(pool DBTX) *SessionRepository {
 	clone := *r
 	clone.db = pool
 	return &clone
@@ -207,5 +211,26 @@ func (r *AppRegistrationRepository) WithDBPool(pool *pgxpool.Pool) *AppRegistrat
 func (r *IAMDevicesRepository) WithDB(pool DBTX) *IAMDevicesRepository {
 	clone := *r
 	clone.pool = pool
+	return &clone
+}
+
+// WithDB returns a shallow clone of UserMembershipRepository using the given
+// pool (e.g. a request-scoped *pgx.Tx so membership upserts/deactivations
+// land inside the same transaction as the invitation/seat-counter mutation
+// they accompany).
+func (r *UserMembershipRepository) WithDB(pool DBTX) *UserMembershipRepository {
+	clone := *r
+	clone.db = pool
+	return &clone
+}
+
+// WithDB returns a shallow clone of SeatCounterRepository using the given
+// pool. Callers MUST pass the enclosing transaction when calling
+// ReserveSeat/ConfirmSeat/ReleaseReservation together with the invitation or
+// membership mutation they guard — see seat_counter_repository.go's
+// concurrency-model doc comment.
+func (r *SeatCounterRepository) WithDB(pool DBTX) *SeatCounterRepository {
+	clone := *r
+	clone.db = pool
 	return &clone
 }

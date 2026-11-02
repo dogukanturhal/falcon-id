@@ -247,7 +247,7 @@ func validateSignatureAlgorithmsInElement(el *etree.Element) error {
 	}
 	signedInfo := findChildByTag(sig, "SignedInfo")
 	if signedInfo == nil {
-		return fmt.Errorf("Signature has no SignedInfo")
+		return fmt.Errorf("signature has no SignedInfo")
 	}
 	method := findChildByTag(signedInfo, "SignatureMethod")
 	if method == nil {
@@ -266,7 +266,7 @@ func validateSignatureAlgorithmsInElement(el *etree.Element) error {
 		}
 		dm := findChildByTag(ref, "DigestMethod")
 		if dm == nil {
-			return fmt.Errorf("Reference has no DigestMethod")
+			return fmt.Errorf("reference has no DigestMethod")
 		}
 		digestAlg := dm.SelectAttrValue("Algorithm", "")
 		if rejectedAlgorithms[digestAlg] {

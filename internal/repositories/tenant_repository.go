@@ -269,6 +269,59 @@ func (r *TenantRepository) UpdateSettings(ctx context.Context, tenant *models.Te
 	).Scan(&tenant.UpdatedAt)
 }
 
+// TenantNameState is the slice of an iam_tenants row the workspace-name
+// backfill reads: enough to decide whether a tenant still carries the signup
+// placeholder, nothing more.
+type TenantNameState struct {
+	ID          uuid.UUID
+	Slug        string
+	DisplayName string
+}
+
+// RenameDisplayNameIfPlaceholder sets display_name to name only while it is
+// still the signup placeholder. The check lives in the UPDATE's WHERE clause so
+// two racing callers (the first-run form and the legal-entity hook) cannot
+// overwrite a name a user just chose. Reports whether a row changed; false means
+// the tenant is missing or already has a real name. iam_tenants.name stays the
+// immutable identifier and is never touched.
+func (r *TenantRepository) RenameDisplayNameIfPlaceholder(ctx context.Context, id uuid.UUID, name string) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE iam_tenants SET
+			display_name = $1,
+			updated_at   = NOW()
+		WHERE id = $2 AND LOWER(BTRIM(display_name)) = LOWER($3)`,
+		name, id, models.PlaceholderTenantName,
+	)
+	if err != nil {
+		return false, fmt.Errorf("RenameDisplayNameIfPlaceholder: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// ListNameStates returns id, slug and display_name of every live tenant
+// (cancelled ones excluded), oldest first, for the placeholder-name backfill.
+func (r *TenantRepository) ListNameStates(ctx context.Context) ([]TenantNameState, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, slug, display_name
+		FROM iam_tenants
+		WHERE cancelled_at IS NULL
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("ListNameStates: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TenantNameState
+	for rows.Next() {
+		var t TenantNameState
+		if err := rows.Scan(&t.ID, &t.Slug, &t.DisplayName); err != nil {
+			return nil, fmt.Errorf("ListNameStates scan: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ErrTenantSlugTaken is returned by UpdateSlug when the requested slug
 // collides with another tenant's iam_tenants_slug_key unique index entry.
 // Callers must surface this as a distinct "slug unavailable" condition,

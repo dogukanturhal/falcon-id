@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -22,10 +23,11 @@ const (
 type SignupServiceInterface interface {
 	SignupPasswordPolicy() services.SignupPasswordPolicy
 	InitiateSignup(ctx context.Context, input *models.CreateSignupRequestInput, ipAddress, userAgent string) (*models.SignupRequest, error)
-	VerifyEmail(ctx context.Context, token string) (*models.SignupRequest, error)
+	VerifyEmail(ctx context.Context, input *models.VerifySignupEmailInput) (*models.SignupRequest, error)
 	CompleteSignup(ctx context.Context, input *models.CompleteSignupInput, ipAddress, userAgent string) (*services.CompleteSignupResult, error)
 	CheckUsernameAvailable(ctx context.Context, username string) (bool, string, error)
 	CheckSlugAvailable(ctx context.Context, slug string) (bool, error)
+	SuggestSlug(ctx context.Context, name string) (string, bool)
 }
 
 // PasswordPolicy exposes only the effective local-signup requirements.
@@ -75,6 +77,24 @@ func (h *SignupHandler) CheckSlug(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"available": available})
 }
 
+// suggestSlugMaxName caps the name read by SuggestSlug (runes, not bytes).
+const suggestSlugMaxName = 255
+
+// SuggestSlug handles GET /api/v1/auth/signup/suggest-slug?name=X.
+//
+// Returns the first available subdomain slug for a company name, so the
+// company step can prefill it. Same discipline as CheckSlug: always 200,
+// and "taken", "reserved" and "cannot verify" are not told apart (available
+// is simply false), so it is no slug-enumeration oracle.
+func (h *SignupHandler) SuggestSlug(c *gin.Context) {
+	name := []rune(c.Query("name"))
+	if len(name) > suggestSlugMaxName {
+		name = name[:suggestSlugMaxName]
+	}
+	slug, available := h.service.SuggestSlug(c.Request.Context(), string(name))
+	c.JSON(http.StatusOK, gin.H{"slug": slug, "available": available})
+}
+
 // NewSignupHandler creates a SignupHandler wired to the given service.
 func NewSignupHandler(service SignupServiceInterface, logger *zap.Logger) *SignupHandler {
 	return &SignupHandler{service: service, logger: logger}
@@ -105,6 +125,15 @@ func (h *SignupHandler) InitiateSignup(c *gin.Context) {
 
 	req, err := h.service.InitiateSignup(c.Request.Context(), &input, ipAddress, userAgent)
 	if err != nil {
+		var stateErr *services.SignupStateError
+		if errors.As(err, &stateErr) && stateErr.Code == "invalid_continuation" {
+			c.JSON(http.StatusBadRequest, gin.H{"code": stateErr.Code, "error": stateErr.Error()})
+			return
+		}
+		if errors.As(err, &stateErr) && stateErr.Code == "resend_throttled" {
+			c.JSON(http.StatusTooManyRequests, gin.H{"code": stateErr.Code, "error": stateErr.Error()})
+			return
+		}
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
@@ -132,16 +161,30 @@ func (h *SignupHandler) VerifySignupEmail(c *gin.Context) {
 		return
 	}
 
-	req, err := h.service.VerifyEmail(c.Request.Context(), input.Token)
+	if strings.TrimSpace(input.Code) == "" && strings.TrimSpace(input.Token) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgSignupInvalidRequest})
+		return
+	}
+
+	req, err := h.service.VerifyEmail(c.Request.Context(), &input)
 	if err != nil {
+		var stateErr *services.SignupStateError
+		if errors.As(err, &stateErr) {
+			c.JSON(http.StatusBadRequest, gin.H{"code": stateErr.Code, "error": stateErr.Error()})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	// completion_secret is returned only here, to the holder of the emailed
+	// token, and must accompany signup/complete. Never cache it.
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
-		"message":   "Email verified successfully.",
-		"signup_id": req.ID,
-		"verified":  true,
+		"message":           "Email verified successfully.",
+		"signup_id":         req.ID,
+		"verified":          true,
+		"completion_secret": req.CompletionSecret,
 	})
 }
 
@@ -183,6 +226,14 @@ func (h *SignupHandler) CompleteSignup(c *gin.Context) {
 		}
 		var stateErr *services.SignupStateError
 		if errors.As(err, &stateErr) {
+			if stateErr.Code == "TRIAL_ALREADY_CONSUMED" {
+				c.JSON(http.StatusConflict, gin.H{"code": stateErr.Code, "recovery_url": "/app/billing"})
+				return
+			}
+			if stateErr.Code == "slug_unavailable" {
+				c.JSON(http.StatusConflict, gin.H{"code": stateErr.Code})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"code": stateErr.Code})
 			return
 		}
@@ -211,6 +262,9 @@ func (h *SignupHandler) CompleteSignup(c *gin.Context) {
 		"user_id":     result.User.ID,
 		"email":       result.User.Email,
 		"tenant_slug": result.TenantSlug,
+	}
+	if result.RedirectURL != "" {
+		resp["redirect_url"] = result.RedirectURL
 	}
 
 	// Session is best-effort (see CompleteSignupResult / IssueSessionForNewUser

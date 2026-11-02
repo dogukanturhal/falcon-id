@@ -114,6 +114,16 @@ func (m *MockOAuthClientRepo) RevokeOAuthToken(ctx context.Context, tokenHash st
 	return args.Error(0)
 }
 
+func (m *MockOAuthClientRepo) SetTokenReplacedBy(ctx context.Context, tokenID, successorID uuid.UUID) error {
+	args := m.Called(ctx, tokenID, successorID)
+	return args.Error(0)
+}
+
+func (m *MockOAuthClientRepo) RefreshSuccessorUnused(ctx context.Context, successorID uuid.UUID) (bool, error) {
+	args := m.Called(ctx, successorID)
+	return args.Bool(0), args.Error(1)
+}
+
 func (m *MockOAuthClientRepo) ConsumeRefreshToken(ctx context.Context, tokenID uuid.UUID) (bool, error) {
 	args := m.Called(ctx, tokenID)
 	return args.Bool(0), args.Error(1)
@@ -122,6 +132,17 @@ func (m *MockOAuthClientRepo) ConsumeRefreshToken(ctx context.Context, tokenID u
 func (m *MockOAuthClientRepo) RevokeRefreshTokenFamily(ctx context.Context, familyID uuid.UUID) (int64, error) {
 	args := m.Called(ctx, familyID)
 	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockOAuthClientRepo) RevokeTokensBySession(ctx context.Context, sessionID, userID uuid.UUID) (int64, error) {
+	args := m.Called(ctx, sessionID, userID)
+	return args.Get(0).(int64), args.Error(1)
+}
+
+func (m *MockOAuthClientRepo) ListSessionIDsByIdpSession(ctx context.Context, idpSessionID, userID uuid.UUID) ([]uuid.UUID, error) {
+	args := m.Called(ctx, idpSessionID, userID)
+	ids, _ := args.Get(0).([]uuid.UUID)
+	return ids, args.Error(1)
 }
 
 func (m *MockOAuthClientRepo) RevokeAllClientTokens(ctx context.Context, clientID uuid.UUID) error {
@@ -868,6 +889,51 @@ func TestOAuthProviderService_UpdateClient_Success(t *testing.T) {
 	assert.Equal(t, newName, updated.Name)
 	assert.Equal(t, &updaterID, updated.UpdatedBy)
 	mockClientRepo.AssertExpectations(t)
+}
+
+// The native-app relaxation (private-use scheme URIs) is decided on the
+// merged client traits: a request that makes the client native may use it,
+// one that strips a trait may not.
+func TestOAuthProviderService_UpdateClient_NativeAppUsesMergedTraits(t *testing.T) {
+	ctx := context.Background()
+	updaterID := uuid.New()
+	uri := "com.example.app:/logout"
+	yes, no := true, false
+
+	run := func(t *testing.T, existing *models.OAuthClient, req *models.UpdateOAuthClientRequest) error {
+		t.Helper()
+		mockClientRepo := new(MockOAuthClientRepo)
+		svc := newTestOAuthProviderService(t, mockClientRepo, new(MockOAuthUserRepo))
+		svc.cfg.NativeAppSchemeDomains = []string{"example.com"}
+		// Native apps are public, which cannot hold client_credentials.
+		existing.GrantTypes = []string{"authorization_code", "refresh_token"}
+		mockClientRepo.On("GetByID", ctx, existing.ID).Return(existing, nil)
+		mockClientRepo.On("Update", ctx, mock.AnythingOfType("*models.OAuthClient")).Return(nil).Maybe()
+		_, err := svc.UpdateClient(ctx, existing.ID, req, &updaterID)
+		return err
+	}
+
+	t.Run("request makes client native", func(t *testing.T) {
+		existing := buildActiveOAuthClient(uuid.New())
+		err := run(t, existing, &models.UpdateOAuthClientRequest{
+			IsPublic: &yes, RequirePKCE: &yes, IsFirstParty: &yes,
+			PostLogoutRedirectURIs: []string{uri},
+		})
+		require.NoError(t, err)
+	})
+	t.Run("request strips a native trait", func(t *testing.T) {
+		existing := buildActiveOAuthClient(uuid.New())
+		existing.IsPublic, existing.RequirePKCE, existing.IsFirstParty = true, true, true
+		err := run(t, existing, &models.UpdateOAuthClientRequest{
+			IsPublic: &no, PostLogoutRedirectURIs: []string{uri},
+		})
+		require.Error(t, err)
+	})
+	t.Run("stored non-native stays non-native", func(t *testing.T) {
+		existing := buildActiveOAuthClient(uuid.New())
+		err := run(t, existing, &models.UpdateOAuthClientRequest{PostLogoutRedirectURIs: []string{uri}})
+		require.Error(t, err)
+	})
 }
 
 // ---------------------------------------------------------------------------

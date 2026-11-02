@@ -210,7 +210,7 @@ func (m *TenantOwnershipMiddleware) isPlatformAdmin(c *gin.Context) bool {
 
 	// Check for platform admin role in current user
 	if user := GetCurrentUser(c); user != nil {
-		return user.HasRole("platform_admin") || user.HasRole("super_admin")
+		return holdsPlatformAdminRole(user)
 	}
 
 	return false
@@ -248,7 +248,7 @@ func RequireSameTenant() gin.HandlerFunc {
 		// SECURITY: Validate tenant matches
 		if requestTenantID != user.TenantID {
 			// Check if user is platform admin
-			if !user.HasRole("platform_admin") && !user.HasRole("super_admin") {
+			if !holdsPlatformAdminRole(user) {
 				logger.Log.Warn("Cross-tenant access denied",
 					zap.String("user_id", user.ID.String()),
 					zap.String("user_tenant_id", user.TenantID.String()),
@@ -277,7 +277,7 @@ func ValidateResourceTenantOwnership(c *gin.Context, resourceTenantID uuid.UUID)
 	}
 
 	// Platform admins can access any tenant's resources
-	if user.HasRole("platform_admin") || user.HasRole("super_admin") {
+	if holdsPlatformAdminRole(user) {
 		return true
 	}
 

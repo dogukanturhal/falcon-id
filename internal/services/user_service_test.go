@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -112,6 +113,29 @@ func (m *MockUserRepository) GetUserPermissions(ctx context.Context, userID uuid
 func (m *MockUserRepository) UnlockUser(ctx context.Context, id uuid.UUID) error {
 	args := m.Called(ctx, id)
 	return args.Error(0)
+}
+
+func (m *MockUserRepository) SetDeletionState(ctx context.Context, userID uuid.UUID, activationStatus string, deletionScheduledAt, deletionGracePeriodEndsAt *time.Time, deletionReason *string) error {
+	args := m.Called(ctx, userID, activationStatus, deletionScheduledAt, deletionGracePeriodEndsAt, deletionReason)
+	return args.Error(0)
+}
+
+func (m *MockUserRepository) CountActiveOwners(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	args := m.Called(ctx, tenantID)
+	return args.Int(0), args.Error(1)
+}
+
+func (m *MockUserRepository) HasRole(ctx context.Context, userID uuid.UUID, roleName string) (bool, error) {
+	args := m.Called(ctx, userID, roleName)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *MockUserRepository) HardDeleteUser(ctx context.Context, userID uuid.UUID) (map[string]int, error) {
+	args := m.Called(ctx, userID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(map[string]int), args.Error(1)
 }
 
 // MockRoleRepository mocks the role repository

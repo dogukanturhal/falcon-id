@@ -137,7 +137,7 @@ Response:
 
 | Client type                     | Recommended `access_token_lifetime` |
 | ------------------------------- | ----------------------------------- |
-| First-party (HexxLock products) | 3600 (1 hour)                       |
+| First-party (platform products) | 3600 (1 hour)                       |
 | Confidential third-party        | 300–900 (5–15 minutes)              |
 | Public third-party (browser)    | 300 (5 minutes)                     |
 

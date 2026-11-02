@@ -6,6 +6,9 @@ package handlers
 //   - POST /api/v1/auth/webauthn/witness/begin
 //   - POST /api/v1/auth/webauthn/witness/finish?wa_session_id=<id>
 //
+// including the P0 hardening: platform-admin only, begin persists
+// {device_uuid, ek_pubkey_hash, state} and finish trusts only that.
+//
 // Testing approach: white-box (package handlers) so we can inject the
 // witnessWebAuthnService stub via the unexported witnessService field without
 // exporting test-only constructors. Token signing uses NewJWTKeyProvider with
@@ -70,7 +73,31 @@ const (
 	witnessTestUserIDStr  = "11111111-1111-1111-1111-111111111111"
 	witnessTestSessionID  = "22222222-2222-2222-2222-222222222222"
 	witnessTestDeviceUUID = "33333333-3333-3333-3333-333333333333"
+	witnessTestEKHash     = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
+
+// fakeWitnessState is an in-memory witnessStateService.
+type fakeWitnessState struct {
+	m map[string]services.WitnessBinding
+}
+
+func newFakeWitnessState() *fakeWitnessState {
+	return &fakeWitnessState{m: map[string]services.WitnessBinding{}}
+}
+
+func (f *fakeWitnessState) SavePasskeyBinding(_ context.Context, id string, b services.WitnessBinding) error {
+	f.m[id] = b
+	return nil
+}
+
+func (f *fakeWitnessState) TakePasskeyBinding(_ context.Context, id string, userID uuid.UUID) (*services.WitnessBinding, error) {
+	b, ok := f.m[id]
+	delete(f.m, id)
+	if !ok || b.UserID != userID {
+		return nil, &services.WitnessError{Status: http.StatusGone, Code: services.WitnessErrExpired, Message: "expired"}
+	}
+	return &b, nil
+}
 
 // newWitnessTokenService builds a TokenService backed by an ephemeral RSA key.
 // Unsets JWT_PRIVATE_KEY env so the provider generates a fresh key each call.
@@ -93,28 +120,38 @@ func newWitnessTokenService(t *testing.T) *services.TokenService {
 	return svc
 }
 
-// newWitnessHandler builds a WebAuthnHandler with an injected ceremony stub
-// and optionally a token service.
+// newWitnessHandler builds a WebAuthnHandler with an injected ceremony stub,
+// an in-memory binding store and optionally a token service.
 func newWitnessHandler(t *testing.T, waStub *witnessWebAuthnStub, tokenSvc *services.TokenService) *WebAuthnHandler {
 	t.Helper()
 	return &WebAuthnHandler{
 		witnessService: waStub,
+		witnessState:   newFakeWitnessState(),
 		tokenService:   tokenSvc,
 		logger:         zap.NewNop(),
 	}
 }
 
 // witnessTestEngine wires the two witness routes under a gin engine that injects
-// a CurrentUser and session_id into every request context.
+// a platform-admin CurrentUser and session_id into every request context.
 func witnessTestEngine(h *WebAuthnHandler, userID, sessionID uuid.UUID) *gin.Engine {
+	return witnessTestEngineAs(h, userID, sessionID, true)
+}
+
+func witnessTestEngineAs(h *WebAuthnHandler, userID, sessionID uuid.UUID, admin bool) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	injectUser := func(c *gin.Context) {
+		tenant := uuid.MustParse("44444444-4444-4444-4444-444444444444")
+		if admin {
+			tenant = uuid.MustParse(models.HexxlockInternalTenantID)
+		}
 		c.Set(middleware.CurrentUserKey, &models.CurrentUser{
-			ID:       userID,
-			TenantID: uuid.MustParse("44444444-4444-4444-4444-444444444444"),
-			Username: "testoperator",
-			Email:    "ops@example.com",
+			ID:              userID,
+			TenantID:        tenant,
+			Username:        "testoperator",
+			Email:           "ops@example.com",
+			IsPlatformAdmin: admin,
 		})
 		c.Set("session_id", sessionID)
 		c.Next()
@@ -137,55 +174,56 @@ func witnessPost(t *testing.T, r *gin.Engine, path string, body any) *httptest.R
 	return w
 }
 
+func witnessBeginBody() map[string]string {
+	return map[string]string{
+		"device_uuid":    witnessTestDeviceUUID,
+		"ek_pubkey_hash": witnessTestEKHash,
+		"state":          "st4te",
+	}
+}
+
+// witnessBegun runs a begin so a binding exists under the stub's "stub-session".
+func witnessBegun(t *testing.T, r *gin.Engine) {
+	t.Helper()
+	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", witnessBeginBody())
+	if w.Code != http.StatusOK {
+		t.Fatalf("begin: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+const witnessFinishPath = "/api/v1/auth/webauthn/witness/finish?wa_session_id=stub-session"
+
 // ── begin tests ───────────────────────────────────────────────────────────────
 
-func TestBeginWitnessEnroll_HappyPath(t *testing.T) {
+func TestBeginWitnessEnroll_HappyPathPersistsBinding(t *testing.T) {
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	uid := uuid.MustParse(witnessTestUserIDStr)
+	r := witnessTestEngine(h, uid, uuid.MustParse(witnessTestSessionID))
 
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", map[string]string{
-		"device_uuid":    witnessTestDeviceUUID,
-		"ek_pubkey_hash": "deadbeef0123456789ab",
-	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	witnessBegun(t, r)
+	b := h.witnessState.(*fakeWitnessState).m["stub-session"]
+	if b.UserID != uid || b.DeviceUUID != witnessTestDeviceUUID || b.EKPubkeyHash != witnessTestEKHash || b.State != "st4te" {
+		t.Fatalf("binding not persisted as sent: %+v", b)
 	}
 }
 
-func TestBeginWitnessEnroll_MissingDeviceUUID(t *testing.T) {
-	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", map[string]string{
-		"ek_pubkey_hash": "deadbeef",
-	})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for missing device_uuid, got %d", w.Code)
-	}
-}
-
-func TestBeginWitnessEnroll_MissingEKHash(t *testing.T) {
-	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for missing ek_pubkey_hash, got %d", w.Code)
-	}
-}
-
-func TestBeginWitnessEnroll_InvalidDeviceUUID(t *testing.T) {
-	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", map[string]string{
-		"device_uuid":    "not-a-uuid",
-		"ek_pubkey_hash": "deadbeef",
-	})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for non-UUID device_uuid, got %d", w.Code)
+func TestBeginWitnessEnroll_BadInput(t *testing.T) {
+	for name, body := range map[string]map[string]string{
+		"missing device_uuid": {"ek_pubkey_hash": witnessTestEKHash},
+		"missing ek hash":     {"device_uuid": witnessTestDeviceUUID},
+		"non-uuid device":     {"device_uuid": "not-a-uuid", "ek_pubkey_hash": witnessTestEKHash},
+		"short ek hash":       {"device_uuid": witnessTestDeviceUUID, "ek_pubkey_hash": "deadbeef"},
+		"uppercase ek hash":   {"device_uuid": witnessTestDeviceUUID, "ek_pubkey_hash": strings.ToUpper(witnessTestEKHash)},
+		"oversize state":      {"device_uuid": witnessTestDeviceUUID, "ek_pubkey_hash": witnessTestEKHash, "state": strings.Repeat("a", 65)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
+			r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+			w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -194,12 +232,21 @@ func TestBeginWitnessEnroll_NoSession(t *testing.T) {
 	r := gin.New()
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
 	r.POST("/witness/begin", h.BeginWitnessEnroll) // no injectUser middleware
-	w := witnessPost(t, r, "/witness/begin", map[string]string{
-		"device_uuid":    witnessTestDeviceUUID,
-		"ek_pubkey_hash": "deadbeef",
-	})
+	w := witnessPost(t, r, "/witness/begin", witnessBeginBody())
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated caller, got %d", w.Code)
+	}
+}
+
+func TestBeginWitnessEnroll_NonPlatformAdminForbidden(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
+	r := witnessTestEngineAs(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID), false)
+	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", witnessBeginBody())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin, got %d", w.Code)
+	}
+	if len(h.witnessState.(*fakeWitnessState).m) != 0 {
+		t.Fatal("a binding was persisted for a non-admin")
 	}
 }
 
@@ -207,140 +254,161 @@ func TestBeginWitnessEnroll_BeginAuthFails(t *testing.T) {
 	stub := &witnessWebAuthnStub{beginErr: errors.New("ceremony store unavailable")}
 	h := newWitnessHandler(t, stub, nil)
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", map[string]string{
-		"device_uuid":    witnessTestDeviceUUID,
-		"ek_pubkey_hash": "deadbeef",
-	})
+	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", witnessBeginBody())
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 when BeginAuthentication fails, got %d", w.Code)
 	}
 }
 
+func TestBeginWitnessEnroll_StateStoreMissingFailsClosed(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
+	h.witnessState = nil
+	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/begin", witnessBeginBody())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
 // ── finish tests ──────────────────────────────────────────────────────────────
 
-// TestFinishWitnessEnroll_AssertionBodyReachesCeremony locks the body-restore
-// fix. The finish body carries BOTH device_uuid (read by the handler) AND the
-// W3C assertion (re-read by FinishAuthentication). If the handler consumes the
-// stream while reading device_uuid, the ceremony parser sees an empty body and
-// every finish 401s. We assert the stub's FinishAuthentication observed the full
-// body.
+// TestFinishWitnessEnroll_AssertionBodyReachesCeremony: the finish body is the
+// W3C assertion; FinishAuthentication must see it intact.
 func TestFinishWitnessEnroll_AssertionBodyReachesCeremony(t *testing.T) {
 	stub := &witnessWebAuthnStub{}
 	h := newWitnessHandler(t, stub, newWitnessTokenService(t))
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	witnessBegun(t, r)
 
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]any{
-		"device_uuid": witnessTestDeviceUUID,
-		"id":          "cred-id-xyz",
-		"type":        "public-key",
-		"response":    map[string]string{"signature": "sig-bytes"},
+	w := witnessPost(t, r, witnessFinishPath, map[string]any{
+		"id":       "cred-id-xyz",
+		"type":     "public-key",
+		"response": map[string]string{"signature": "sig-bytes"},
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if len(stub.finishBody) == 0 {
-		t.Fatal("FinishAuthentication received an EMPTY body — handler consumed it before the ceremony (body-restore regression)")
 	}
 	if !strings.Contains(string(stub.finishBody), `"id":"cred-id-xyz"`) {
 		t.Fatalf("ceremony body missing the W3C assertion payload; got %q", string(stub.finishBody))
 	}
 }
 
-func TestFinishWitnessEnroll_HappyPath(t *testing.T) {
+func TestFinishWitnessEnroll_HappyPathUsesStoredBinding(t *testing.T) {
 	tokenSvc := newWitnessTokenService(t)
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, tokenSvc)
-	userID := uuid.MustParse(witnessTestUserIDStr)
-	sessID := uuid.MustParse(witnessTestSessionID)
-	r := witnessTestEngine(h, userID, sessID)
+	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	witnessBegun(t, r)
 
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
+	// The request tries to smuggle a DIFFERENT device_uuid / ek hash: ignored.
+	w := witnessPost(t, r, witnessFinishPath, map[string]string{
+		"device_uuid":    "99999999-9999-9999-9999-999999999999",
+		"ek_pubkey_hash": strings.Repeat("f", 64),
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-
 	var resp witnessFinishResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp.SignedJWS == "" {
-		t.Fatal("signed_jws is empty")
+	if resp.SignedJWS == "" || resp.IssuedAt == "" || resp.ExpiresAt == "" {
+		t.Fatalf("incomplete response: %+v", resp)
 	}
 	if resp.AdminSub != witnessTestUserIDStr {
 		t.Errorf("admin_sub = %q, want %q", resp.AdminSub, witnessTestUserIDStr)
 	}
-	if resp.IssuedAt == "" {
-		t.Error("issued_at is empty")
-	}
-	if resp.ExpiresAt == "" {
-		t.Error("expires_at is empty")
+	if resp.State != "st4te" {
+		t.Errorf("state = %q, want the stored value", resp.State)
 	}
 
-	// Parse the JWS and check claims. We skip signature verification here —
-	// correctness is guaranteed by jwt.SignedString in signToken which errors
-	// on invalid keys, and the real RSA path is exercised by signToken itself.
 	tok, _, err := jwt.NewParser().ParseUnverified(resp.SignedJWS, jwt.MapClaims{})
 	if err != nil {
 		t.Fatalf("ParseUnverified: %v", err)
 	}
+	if kid, _ := tok.Header["kid"].(string); kid == "" {
+		t.Error("JWS header carries no kid")
+	}
 	claims := tok.Claims.(jwt.MapClaims)
-
 	checkStr := func(key, want string) {
 		t.Helper()
-		got, _ := claims[key].(string)
-		if got != want {
+		if got, _ := claims[key].(string); got != want {
 			t.Errorf("JWS[%q] = %q, want %q", key, got, want)
 		}
 	}
 	checkStr("iss", witnessTestIssuer)
 	checkStr("sub", witnessTestUserIDStr)
 	checkStr("device_uuid", witnessTestDeviceUUID)
-
-	// aud may be string or []interface{}.
+	checkStr("ek_pubkey_hash", witnessTestEKHash)
+	checkStr("witness_method", "passkey")
+	if jti, _ := claims["jti"].(string); jti == "" {
+		t.Error("jti missing")
+	}
+	if amr, _ := claims["amr"].([]interface{}); len(amr) != 1 || fmt.Sprint(amr[0]) != "hwk" {
+		t.Errorf("amr = %v, want [hwk]", claims["amr"])
+	}
 	switch v := claims["aud"].(type) {
 	case string:
-		if v != "https://internal.example.com/device-attest" {
+		if v != "https://jess.internal.example.com/device-attest" {
 			t.Errorf("aud = %q", v)
 		}
 	case []interface{}:
-		if len(v) == 0 || fmt.Sprint(v[0]) != "https://internal.example.com/device-attest" {
+		if len(v) == 0 || fmt.Sprint(v[0]) != "https://jess.internal.example.com/device-attest" {
 			t.Errorf("aud = %v", v)
 		}
 	default:
 		t.Errorf("unexpected aud type %T", claims["aud"])
 	}
-
-	// exp must be ~10 minutes in the future (witnessFreshnessWindow = 10m).
 	expF, _ := claims["exp"].(float64)
-	expTime := time.Unix(int64(expF), 0)
-	delta := time.Until(expTime)
-	if delta < 9*time.Minute || delta > 11*time.Minute {
+	if delta := time.Until(time.Unix(int64(expF), 0)); delta < 9*time.Minute || delta > 11*time.Minute {
 		t.Errorf("exp delta = %s, want ~10m", delta.Round(time.Second))
+	}
+}
+
+func TestFinishWitnessEnroll_WithoutBeginIsRefused(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
+	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	w := witnessPost(t, r, witnessFinishPath, map[string]string{"device_uuid": witnessTestDeviceUUID})
+	if w.Code != http.StatusGone {
+		t.Fatalf("expected 410 without a begun session, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFinishWitnessEnroll_BindingIsSingleUse(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
+	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	witnessBegun(t, r)
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusOK {
+		t.Fatalf("first finish: %d %s", w.Code, w.Body.String())
+	}
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusGone {
+		t.Fatalf("replayed finish: expected 410, got %d", w.Code)
+	}
+}
+
+func TestFinishWitnessEnroll_OtherUsersSessionRefused(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
+	r1 := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
+	witnessBegun(t, r1)
+	r2 := witnessTestEngine(h, uuid.MustParse("55555555-5555-5555-5555-555555555555"), uuid.MustParse(witnessTestSessionID))
+	if w := witnessPost(t, r2, witnessFinishPath, map[string]string{}); w.Code != http.StatusGone {
+		t.Fatalf("expected 410 for another user's wa_session_id, got %d", w.Code)
+	}
+}
+
+func TestFinishWitnessEnroll_NonPlatformAdminForbidden(t *testing.T) {
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
+	r := witnessTestEngineAs(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID), false)
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-admin, got %d", w.Code)
 	}
 }
 
 func TestFinishWitnessEnroll_MissingWASessionID(t *testing.T) {
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	// No ?wa_session_id query param.
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
+	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish", map[string]string{})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing wa_session_id, got %d", w.Code)
-	}
-}
-
-func TestFinishWitnessEnroll_MissingDeviceUUID(t *testing.T) {
-	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]string{})
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for missing device_uuid, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -348,40 +416,27 @@ func TestFinishWitnessEnroll_AssertionFails(t *testing.T) {
 	stub := &witnessWebAuthnStub{finishErr: errors.New("signature mismatch")}
 	h := newWitnessHandler(t, stub, newWitnessTokenService(t))
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
-	if w.Code != http.StatusUnauthorized {
+	witnessBegun(t, r)
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when assertion fails, got %d", w.Code)
 	}
 }
 
 func TestFinishWitnessEnroll_TokenServiceNotWired(t *testing.T) {
-	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil) // nil tokenService
+	h := newWitnessHandler(t, &witnessWebAuthnStub{}, nil)
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
-	if w.Code != http.StatusServiceUnavailable {
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when TokenService not wired, got %d", w.Code)
 	}
 }
 
 func TestFinishWitnessEnroll_NoSigningKey(t *testing.T) {
-	// TokenService with NO key provider wired → useRS256() = false → ErrNoSigningKey → 503.
 	cfg := &config.Config{JWTIssuer: witnessTestIssuer, JWTSigningAlgorithm: "RS256"}
-	tokenSvc := services.NewTokenService(cfg, nil, nil)
-	// Deliberately skip SetJWTKeyProvider / SetKeyManager.
-
+	tokenSvc := services.NewTokenService(cfg, nil, nil) // no key provider -> ErrNoSigningKey
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, tokenSvc)
 	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=abc", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
-	if w.Code != http.StatusServiceUnavailable {
+	witnessBegun(t, r)
+	if w := witnessPost(t, r, witnessFinishPath, map[string]string{}); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 when no signing key, got %d: %s", w.Code, w.Body.String())
 	}
 }
@@ -391,38 +446,7 @@ func TestFinishWitnessEnroll_NoSession(t *testing.T) {
 	r := gin.New()
 	h := newWitnessHandler(t, &witnessWebAuthnStub{}, newWitnessTokenService(t))
 	r.POST("/witness/finish", h.FinishWitnessEnroll) // no injectUser middleware
-	w := witnessPost(t, r, "/witness/finish?wa_session_id=abc", map[string]string{
-		"device_uuid": witnessTestDeviceUUID,
-	})
-	if w.Code != http.StatusUnauthorized {
+	if w := witnessPost(t, r, "/witness/finish?wa_session_id=abc", map[string]string{}); w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for unauthenticated caller, got %d", w.Code)
-	}
-}
-
-// TestFinishWitnessEnroll_WaSessionIDReuse simulates wa_session_id replay.
-// The second call fails because FinishAuthentication consumes the challenge
-// on first use. We model this by programming the stub to fail on the second call.
-func TestFinishWitnessEnroll_WaSessionIDReuse(t *testing.T) {
-	stub := &witnessWebAuthnStub{}
-	tokenSvc := newWitnessTokenService(t)
-	h := newWitnessHandler(t, stub, tokenSvc)
-	r := witnessTestEngine(h, uuid.MustParse(witnessTestUserIDStr), uuid.MustParse(witnessTestSessionID))
-
-	for i, tc := range []struct {
-		setFinishErr bool
-		wantCode     int
-	}{
-		{false, http.StatusOK},
-		{true, http.StatusUnauthorized},
-	} {
-		if tc.setFinishErr {
-			stub.finishErr = errors.New("challenge not found: already consumed")
-		}
-		w := witnessPost(t, r, "/api/v1/auth/webauthn/witness/finish?wa_session_id=reused-id", map[string]string{
-			"device_uuid": witnessTestDeviceUUID,
-		})
-		if w.Code != tc.wantCode {
-			t.Errorf("call %d: expected %d, got %d: %s", i+1, tc.wantCode, w.Code, w.Body.String())
-		}
 	}
 }

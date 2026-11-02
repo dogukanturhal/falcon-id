@@ -5,6 +5,8 @@ package services
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -42,6 +44,12 @@ type tokenUserRepository interface {
 // tokenSessionRepository defines the session repository methods needed by TokenService.
 type tokenSessionRepository interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Session, error)
+	// GetByIDWithRealmContext is the RLS-bootstrap-safe lookup used by the
+	// session-blacklist database fallback (checkSessionActiveInDB). See
+	// internal/repositories/session_repository.go for why this needs realm
+	// (not tenant) context and why trusting the JWT's own rid claim here is
+	// safe.
+	GetByIDWithRealmContext(ctx context.Context, id uuid.UUID, realmID uuid.UUID) (*models.Session, error)
 }
 
 // tokenRealmPolicyReader is the narrow surface TokenService needs to let
@@ -60,6 +68,8 @@ type tokenRealmPolicyReader interface {
 // the concrete OAuthClientRepository type.
 type tokenOAuthClientRepo interface {
 	RevokeAllUserOAuthTokens(ctx context.Context, userID uuid.UUID, reason string) error
+	RevokeTokensBySession(ctx context.Context, sessionID, userID uuid.UUID) (int64, error)
+	GetOAuthTokenByHash(ctx context.Context, tokenHash string) (*models.OAuthToken, error)
 }
 
 // TokenService is an exported type.
@@ -90,6 +100,22 @@ type TokenService struct {
 	// unwired, RevokeAllUserOAuthTokens degrades to a no-op so password-
 	// change/logout/data-deletion paths continue to compile and run.
 	oauthClientRepo tokenOAuthClientRepo
+	// tenantSuspension denies token issue and token validation for suspended
+	// tenants (R1-GAPS row 27). Optional; nil disables enforcement.
+	tenantSuspension TenantSuspensionChecker
+	// platformAuthority decides the is_platform_admin claim. nil (or
+	// OPS_STRICT_PLATFORM_ROLES=false) keeps the legacy rule: internal-tenant
+	// membership.
+	platformAuthority *PlatformAuthority
+}
+
+// SetPlatformAuthority wires the strict platform-role model into token
+// issuance. Optional; nil keeps the legacy is_platform_admin derivation.
+func (s *TokenService) SetPlatformAuthority(pa *PlatformAuthority) { s.platformAuthority = pa }
+
+// SetTenantSuspensionChecker wires the tenant-suspension gate.
+func (s *TokenService) SetTenantSuspensionChecker(c TenantSuspensionChecker) {
+	s.tenantSuspension = c
 }
 
 // NewTokenService is an exported function.
@@ -131,6 +157,39 @@ func (s *TokenService) RevokeAllUserOAuthTokens(ctx context.Context, userID uuid
 		return nil
 	}
 	return s.oauthClientRepo.RevokeAllUserOAuthTokens(ctx, userID, reason)
+}
+
+// RevokeOAuthTokensBySession revokes only the tokens bound to one login
+// session (per-device sign-out). No-op when oauthClientRepo isn't wired or
+// sessionID is uuid.Nil.
+func (s *TokenService) RevokeOAuthTokensBySession(ctx context.Context, sessionID, userID uuid.UUID) error {
+	if s.oauthClientRepo == nil || sessionID == uuid.Nil {
+		return nil
+	}
+	_, err := s.oauthClientRepo.RevokeTokensBySession(ctx, sessionID, userID)
+	return err
+}
+
+// ResolveOAuthSession finds the login session an OAuth access token is bound
+// to via its iam_oauth_tokens row (session_id and idp_session_id). Used by
+// logout when the JWT carries no `sid`. Returns uuid.Nil for either id that
+// is unknown, and for tokens that belong to another user.
+func (s *TokenService) ResolveOAuthSession(ctx context.Context, rawAccessToken string, userID uuid.UUID) (sessionID, idpSessionID uuid.UUID) {
+	if s.oauthClientRepo == nil || rawAccessToken == "" {
+		return uuid.Nil, uuid.Nil
+	}
+	sum := sha256.Sum256([]byte(rawAccessToken))
+	row, err := s.oauthClientRepo.GetOAuthTokenByHash(ctx, base64.RawURLEncoding.EncodeToString(sum[:]))
+	if err != nil || row == nil || row.UserID == nil || *row.UserID != userID {
+		return uuid.Nil, uuid.Nil
+	}
+	if row.SessionID != nil {
+		sessionID = *row.SessionID
+	}
+	if row.IdpSessionID != nil {
+		idpSessionID = *row.IdpSessionID
+	}
+	return sessionID, idpSessionID
 }
 
 // SetTokenBlacklist sets the Redis token blacklist for fast token revocation checks
@@ -217,8 +276,19 @@ func (s *TokenService) signToken(claims jwt.Claims) (string, error) {
 		token.Header["kid"] = s.jwtKeyProvider.KeyID()
 		return token.SignedString(s.jwtKeyProvider.PrivateKey())
 	}
+	// HS256 is only a migration fallback. With it disabled, fail loudly rather
+	// than mint tokens this service's own validator would reject.
+	if !s.config.JWTHMACFallbackEnabled {
+		return "", fmt.Errorf("no RS256 signing key available and HS256 fallback is disabled")
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.config.JWTSecret))
+}
+
+// SignClaims signs arbitrary claims with the active access-token key (RS256 +
+// kid). Used by services that mint their own token shapes (service accounts).
+func (s *TokenService) SignClaims(claims jwt.Claims) (string, error) {
+	return s.signToken(claims)
 }
 
 // SignLogoutToken signs a JWT for back-channel logout notifications.
@@ -228,33 +298,74 @@ func (s *TokenService) SignLogoutToken(claims jwt.Claims) (string, error) {
 	return s.signToken(claims)
 }
 
-// witnessFreshnessWindow is the validity window stamped into every operator
+// witnessFreshnessWindow is the validity window stamped into every passkey
 // enrollment witness JWS. Must mirror the constant in jess's
 // devicepolicy.witnessFreshnessWindow so the freshness pre-check there
 // never rejects a JWS that Falcon-ID minted within the allowed window.
 const witnessFreshnessWindow = 10 * time.Minute
 
-// witnessAudience is the fixed aud claim stamped into every enrollment witness
-// JWS. Must match devicepolicy.witnessAudience in jess exactly — case-sensitive.
-const witnessAudience = "https://internal.example.com/device-attest"
+// witnessOTPFreshnessWindow is the (shorter) validity of an authenticator-app
+// (TOTP) witness JWS. A TOTP code is a weaker proof than a passkey assertion,
+// so the artefact must be spent quickly.
+const witnessOTPFreshnessWindow = 5 * time.Minute
+
+// witnessAudience is the fixed aud claim stamped into every passkey enrollment
+// witness JWS. Must match devicepolicy.witnessAudience in jess exactly —
+// case-sensitive.
+const witnessAudience = "https://jess.internal.example.com/device-attest"
+
+// witnessOTPAudience is the aud of an authenticator-app witness JWS. It is a
+// distinct audience so a jess that predates TOTP support rejects these
+// artefacts outright instead of treating them as passkey witnesses.
+const witnessOTPAudience = "https://jess.internal.example.com/device-attest/otp"
+
+// Witness methods as they appear in the witness_method claim (and the
+// iam_devices.witness_method column). The request-side name for the
+// authenticator-app flow is "totp"; the claim value is "otp".
+const (
+	WitnessMethodPasskey = "passkey"
+	WitnessMethodOTP     = "otp"
+)
 
 // witnessClaims is the JWT payload for an operator enrollment witness JWS.
-// All fields are required; absence of any is a sign-of-tampering or a bug.
+// device_uuid is always present; the remaining claims are additive and
+// omitted only for nothing but legacy-shaped test callers.
 type witnessClaims struct {
 	jwt.RegisteredClaims
 	// DeviceUUID binds the witness to exactly one device, defeating
 	// cross-device replay: an operator who witnesses device A cannot
 	// have that JWS accepted for device B.
 	DeviceUUID string `json:"device_uuid"`
+	// AMR is ["hwk"] for a passkey witness and ["otp"] for TOTP.
+	AMR []string `json:"amr,omitempty"`
+	// WitnessMethod is "passkey" or "otp"; must agree with AMR and aud.
+	WitnessMethod string `json:"witness_method,omitempty"`
+	// EKPubkeyHash is the lowercase-hex SHA-256 of the raw ek_pubkey_pem
+	// bytes the client sends to jess (64 chars) — the exact value jess
+	// computes and stores as iam_devices.ek_pubkey_hash. Binds the witness
+	// to one physical TPM.
+	EKPubkeyHash string `json:"ek_pubkey_hash,omitempty"`
+}
+
+// WitnessMintParams are the inputs of MintWitnessJWS.
+type WitnessMintParams struct {
+	AdminSub   string
+	DeviceUUID string
+	// EKPubkeyHash is the 64-char lowercase hex digest the operator is
+	// witnessing. Required for the OTP method; optional for passkey.
+	EKPubkeyHash string
+	// Method is WitnessMethodPasskey or WitnessMethodOTP.
+	Method string
 }
 
 // WitnessJWS is the signed artifact returned to the caller after a
-// successful WebAuthn step-up assertion in the witness flow.
+// successful passkey assertion or TOTP verification in the witness flow.
 type WitnessJWS struct {
 	SignedJWS string    // compact JWS string (header.payload.signature)
 	AdminSub  string    // operator's Falcon-ID sub (== JWS "sub" claim)
 	IssuedAt  time.Time // JWS iat
 	ExpiresAt time.Time // JWS exp
+	Method    string    // WitnessMethodPasskey | WitnessMethodOTP
 }
 
 // MintWitnessJWS mints a compact JWS signed with the existing RS256 issuer
@@ -262,34 +373,49 @@ type WitnessJWS struct {
 //
 // Claims stamped:
 //   - iss  = s.config.JWTIssuer   (e.g. "https://id.hexxlock.com")
-//   - aud  = witnessAudience       ("https://internal.example.com/device-attest")
-//   - sub  = adminSub              (caller's Falcon-ID user UUID string)
-//   - iat  = now
-//   - exp  = now + witnessFreshnessWindow (10 minutes)
-//   - device_uuid = deviceUUID     (cross-device replay defence)
+//   - aud  = witnessAudience (passkey) | witnessOTPAudience (otp)
+//   - sub  = AdminSub             (caller's Falcon-ID user UUID string)
+//   - iat  = now; exp = now + 10m (passkey) | 5m (otp)
+//   - jti  = random UUID
+//   - device_uuid, ek_pubkey_hash (cross-device / cross-TPM replay defence)
+//   - amr = ["hwk"] | ["otp"], witness_method = "passkey" | "otp"
 //
-// The JWS is verified by jess's WebAuthnWitnessVerifier via the existing
-// /.well-known/jwks.json endpoint — no new signing key or DB migration is
-// needed.
+// The JWS header carries the signing key's kid (signToken). It is verified
+// by jess via the existing /.well-known/jwks.json endpoint.
 //
 // Returns ErrNoSigningKey (503-worthy) when neither KeyManager nor
 // JWTKeyProvider is wired, so callers can map the error to the correct HTTP
 // status without string-matching.
-func (s *TokenService) MintWitnessJWS(adminSub, deviceUUID string) (*WitnessJWS, error) {
+func (s *TokenService) MintWitnessJWS(p WitnessMintParams) (*WitnessJWS, error) {
+	aud, window, amr := witnessAudience, witnessFreshnessWindow, "hwk"
+	switch p.Method {
+	case WitnessMethodPasskey:
+	case WitnessMethodOTP:
+		if p.EKPubkeyHash == "" {
+			return nil, fmt.Errorf("MintWitnessJWS: ek_pubkey_hash is required for the otp method")
+		}
+		aud, window, amr = witnessOTPAudience, witnessOTPFreshnessWindow, "otp"
+	default:
+		return nil, fmt.Errorf("MintWitnessJWS: unknown witness method %q", p.Method)
+	}
 	if !s.useRS256() {
 		return nil, ErrNoSigningKey
 	}
 	now := time.Now().UTC()
-	exp := now.Add(witnessFreshnessWindow)
+	exp := now.Add(window)
 	claims := witnessClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    s.config.JWTIssuer,
-			Audience:  jwt.ClaimStrings{witnessAudience},
-			Subject:   adminSub,
+			Audience:  jwt.ClaimStrings{aud},
+			Subject:   p.AdminSub,
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(exp),
+			ID:        uuid.NewString(),
 		},
-		DeviceUUID: deviceUUID,
+		DeviceUUID:    p.DeviceUUID,
+		AMR:           []string{amr},
+		WitnessMethod: p.Method,
+		EKPubkeyHash:  p.EKPubkeyHash,
 	}
 	signed, err := s.signToken(claims)
 	if err != nil {
@@ -297,9 +423,10 @@ func (s *TokenService) MintWitnessJWS(adminSub, deviceUUID string) (*WitnessJWS,
 	}
 	return &WitnessJWS{
 		SignedJWS: signed,
-		AdminSub:  adminSub,
+		AdminSub:  p.AdminSub,
 		IssuedAt:  now,
 		ExpiresAt: exp,
+		Method:    p.Method,
 	}, nil
 }
 
@@ -414,6 +541,9 @@ func (s *TokenService) GenerateAccessToken(ctx context.Context, user *models.Use
 // GenerateAccessTokenWithOptions creates a JWT access token with realm context
 // Supports both legacy (v0) and minimal (v1) token formats
 func (s *TokenService) GenerateAccessTokenWithOptions(ctx context.Context, user *models.User, sessionID uuid.UUID, roles []string, permissions []string, opts TokenGenerationOptions) (string, error) {
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+		return "", err
+	}
 	fillDPoPJKTFromContext(ctx, &opts)
 	s.fillAuthTimeFromSession(ctx, &opts, sessionID)
 	now := time.Now()
@@ -450,7 +580,7 @@ func (s *TokenService) GenerateAccessTokenWithOptions(ctx context.Context, user 
 
 // generateLegacyToken builds and signs a v0 legacy JWT with all claims embedded.
 func (s *TokenService) generateLegacyToken(user *models.User, sessionID uuid.UUID, roles, permissions []string, opts TokenGenerationOptions, now, expiresAt time.Time) (string, error) {
-	isPlatformAdmin := user.TenantID.String() == models.HexxlockInternalTenantID
+	isPlatformAdmin := s.platformAuthority.AdminClaim(context.Background(), user.ID, user.TenantID, user.Email)
 	// Multi-audience JWT (RFC 7519 §4.1.3) — see services/audience.go for the
 	// rationale. Default is [LegacyServiceMeshAudience, PlatformAPIAudienceURI].
 	// When the caller advertised a client_id, prepend it so receivers that
@@ -553,14 +683,7 @@ func (s *TokenService) generateMinimalToken(ctx context.Context, user *models.Us
 			)
 		} else {
 			productClaims = resolved
-			for _, pc := range productClaims {
-				minimalClaims.ProductSubscriptions = append(minimalClaims.ProductSubscriptions, models.ProductSubscriptionClaim{
-					ProductID:   pc.ProductID,
-					ProductSlug: pc.ProductSlug,
-					PlanID:      pc.PlanID,
-					State:       pc.State,
-				})
-			}
+			minimalClaims.ProductSubscriptions = toProductSubscriptionClaims(productClaims)
 		}
 	}
 	if s.sessionCache != nil {
@@ -572,7 +695,7 @@ func (s *TokenService) generateMinimalToken(ctx context.Context, user *models.Us
 		if opts.IPAddress != nil {
 			ipAddress = *opts.IPAddress
 		}
-		isPlatformAdmin := user.TenantID.String() == models.HexxlockInternalTenantID
+		isPlatformAdmin := s.platformAuthority.AdminClaim(ctx, user.ID, user.TenantID, user.Email)
 		var sessionProductSubs []redis.ProductSubscriptionClaim
 		for _, pc := range productClaims {
 			sessionProductSubs = append(sessionProductSubs, redis.ProductSubscriptionClaim{
@@ -622,11 +745,15 @@ func (s *TokenService) generateMinimalToken(ctx context.Context, user *models.Us
 
 // generateMinimalImpersonationToken builds and signs a v1 minimal JWT with impersonation context,
 // storing session data in Redis. Returns (signedToken, stillMinimal, error).
+// impersonationTokenTTL is the lifetime of an impersonation access token. There
+// is no refresh token: the operator ends the session and starts a new one.
+const impersonationTokenTTL = 15 * time.Minute
+
 func (s *TokenService) generateMinimalImpersonationToken(ctx context.Context, user *models.User, sessionID uuid.UUID, roles, permissions []string, opts TokenGenerationOptions, now, expiresAt time.Time, realmID uuid.UUID, impersonatorID, impersonationSessionID uuid.UUID) (string, bool, error) {
 	minimalClaims := models.MinimalClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    s.config.JWTIssuer,
-			Subject:   user.ID.String(),
+			Issuer:  s.config.JWTIssuer,
+			Subject: user.ID.String(),
 			// Multi-aud (impersonation tokens still need to land on
 			// every service in the mesh — see services/audience.go).
 			Audience:  jwt.ClaimStrings{LegacyServiceMeshAudience, PlatformAPIAudienceURI},
@@ -642,6 +769,10 @@ func (s *TokenService) generateMinimalImpersonationToken(ctx context.Context, us
 		Roles:           roles,
 		Scope:           opts.Scope,
 		Version:         models.TokenVersionMinimal,
+		// RFC 8693 act: the operator on whose behalf the token acts.
+		Act:                    &models.TokenActor{Sub: impersonatorID.String()},
+		ImpersonatorID:         impersonatorID.String(),
+		ImpersonationSessionID: impersonationSessionID.String(),
 	}
 	if s.sessionCache != nil {
 		deviceInfo := ""
@@ -652,7 +783,7 @@ func (s *TokenService) generateMinimalImpersonationToken(ctx context.Context, us
 		if opts.IPAddress != nil {
 			ipAddress = *opts.IPAddress
 		}
-		isPlatformAdmin := user.TenantID.String() == models.HexxlockInternalTenantID
+		isPlatformAdmin := s.platformAuthority.AdminClaim(ctx, user.ID, user.TenantID, user.Email)
 		sessionData := &redis.SessionData{
 			UserID:                 user.ID,
 			TenantID:               user.TenantID,
@@ -704,6 +835,9 @@ func (s *TokenService) generateMinimalImpersonationToken(ctx context.Context, us
 // Note: Session data is still stored in Redis for session management (logout, activity),
 // but NOT for permission resolution.
 func (s *TokenService) GenerateAccessTokenV2(ctx context.Context, user *models.User, sessionID uuid.UUID, roles []string, opts TokenGenerationOptions) (string, error) {
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+		return "", err
+	}
 	fillDPoPJKTFromContext(ctx, &opts)
 	// Resolve auth_time from the session row when the caller didn't
 	// pre-thread it. Mirrors the v1 mint path
@@ -772,14 +906,7 @@ func (s *TokenService) GenerateAccessTokenV2(ctx context.Context, user *models.U
 			)
 		} else {
 			productClaims = resolved
-			for _, pc := range productClaims {
-				spicedbClaims.ProductSubscriptions = append(spicedbClaims.ProductSubscriptions, models.ProductSubscriptionClaim{
-					ProductID:   pc.ProductID,
-					ProductSlug: pc.ProductSlug,
-					PlanID:      pc.PlanID,
-					State:       pc.State,
-				})
-			}
+			spicedbClaims.ProductSubscriptions = toProductSubscriptionClaims(productClaims)
 		}
 	}
 
@@ -801,7 +928,7 @@ func (s *TokenService) GenerateAccessTokenV2(ctx context.Context, user *models.U
 			ipAddress = *opts.IPAddress
 		}
 
-		isPlatformAdmin := user.TenantID.String() == models.HexxlockInternalTenantID
+		isPlatformAdmin := s.platformAuthority.AdminClaim(ctx, user.ID, user.TenantID, user.Email)
 		sessionData := &redis.SessionData{
 			UserID:          user.ID,
 			TenantID:        user.TenantID,
@@ -895,9 +1022,12 @@ func (s *TokenService) GenerateImpersonationAccessTokenWithOptions(
 	impersonationSessionID uuid.UUID,
 	opts TokenGenerationOptions,
 ) (string, error) {
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, user.TenantID); err != nil {
+		return "", err
+	}
 	now := time.Now()
 	// Impersonation tokens have shorter expiry (15 minutes)
-	expiresAt := now.Add(15 * time.Minute)
+	expiresAt := now.Add(impersonationTokenTTL)
 
 	// Use default realm if not set
 	realmID := opts.RealmID
@@ -927,7 +1057,7 @@ func (s *TokenService) GenerateImpersonationAccessTokenWithOptions(
 		claims := jwt.MapClaims{
 			"iss": s.config.JWTIssuer,
 			// Multi-aud (legacy impersonation fallback) — see services/audience.go.
-			"aud": []string{LegacyServiceMeshAudience, PlatformAPIAudienceURI},
+			"aud":                      []string{LegacyServiceMeshAudience, PlatformAPIAudienceURI},
 			"sub":                      user.ID.String(),
 			"tenant_id":                user.TenantID.String(),
 			"tid":                      user.TenantID.String(), // SECURITY: Tenant affinity claim for gateway-level validation
@@ -942,6 +1072,7 @@ func (s *TokenService) GenerateImpersonationAccessTokenWithOptions(
 			"nbf":                      now.Unix(),
 			"jti":                      uuid.New().String(),
 			"impersonator_id":          impersonatorID.String(),
+			"act":                      map[string]interface{}{"sub": impersonatorID.String()},
 			"impersonation_session_id": impersonationSessionID.String(),
 			"realm_id":                 realmID.String(),
 			"v":                        models.TokenVersionLegacy,

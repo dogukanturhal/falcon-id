@@ -42,6 +42,12 @@ func (m *mockRoleServiceRoleRepo) AssignPermissions(ctx context.Context, roleID 
 	return args.Error(0)
 }
 
+// GrantPermissionsByName is a no-op stub: no test in this file exercises the
+// AcmeApp reconcile path.
+func (m *mockRoleServiceRoleRepo) GrantPermissionsByName(ctx context.Context, roleID uuid.UUID, permissionNames []string) error {
+	return nil
+}
+
 func (m *mockRoleServiceRoleRepo) GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]models.Permission, error) {
 	args := m.Called(ctx, roleID)
 	if args.Get(0) == nil {
@@ -164,6 +170,14 @@ func (m *mockRoleServicePermissionRepo) GetPermissionNamesByIDs(ctx context.Cont
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(map[uuid.UUID]string), args.Error(1)
+}
+
+func (m *mockRoleServicePermissionRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Permission, error) {
+	args := m.Called(ctx, id)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*models.Permission), args.Error(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -821,13 +835,19 @@ func TestRoleService_AssignPermissions_Valid(t *testing.T) {
 	}
 
 	assignedPerms := []models.Permission{
-		{ID: permID, Name: "crm:contacts:read"},
+		{ID: permID, Name: "core:contacts:read", Module: "core"},
 	}
 
 	roleRepo.On("GetByID", ctx, roleID).Return(role, nil)
 	// checkCallerCoversPermissions: assigner has module wildcard covering all permissions
-	permRepo.On("GetUserPermissionNames", ctx, assignerID, tenantID).Return([]string{"crm:*:*"}, nil)
-	permRepo.On("GetPermissionNamesByIDs", ctx, []uuid.UUID{permID}).Return(map[uuid.UUID]string{permID: "crm:contacts:read"}, nil)
+	permRepo.On("GetUserPermissionNames", ctx, assignerID, tenantID).Return([]string{"core:*:*"}, nil)
+	permRepo.On("GetPermissionNamesByIDs", ctx, []uuid.UUID{permID}).Return(map[uuid.UUID]string{permID: "core:contacts:read"}, nil)
+	// ADR-A10 boundary check (checkGrantBoundaryForIDs): resolves the
+	// permission's module before deciding whether the grant is within the
+	// tenant's entitlement boundary. No entitlementChecker is wired in
+	// this test, so EntitledModules fails closed to UniversalModules
+	// (core, iam) — use a core permission so the boundary passes.
+	permRepo.On("GetByID", ctx, permID).Return(&models.Permission{ID: permID, Name: "core:contacts:read", Module: "core"}, nil)
 	roleRepo.On("AssignPermissions", ctx, roleID, []uuid.UUID{permID}, &assignerID).Return(nil)
 	roleRepo.On("GetRolePermissions", ctx, roleID).Return(assignedPerms, nil)
 
@@ -865,6 +885,9 @@ func TestRoleService_AssignPermissions_AssignError(t *testing.T) {
 
 	role := &models.Role{ID: roleID, TenantID: tenantID, Name: "editor"}
 	roleRepo.On("GetByID", ctx, roleID).Return(role, nil)
+	// ADR-A10 boundary check runs before the DB write regardless of
+	// assignedBy — see checkGrantBoundaryForIDs.
+	permRepo.On("GetByID", ctx, permID).Return(&models.Permission{ID: permID, Name: "core:contacts:read", Module: "core"}, nil)
 	roleRepo.On("AssignPermissions", ctx, roleID, []uuid.UUID{permID}, mock.Anything).Return(errors.New("invalid permission ID"))
 
 	err := svc.AssignPermissions(ctx, roleID, []uuid.UUID{permID}, nil)

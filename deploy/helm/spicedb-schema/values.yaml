@@ -1,0 +1,61 @@
+# deploy/helm/spicedb-schema/values.yaml
+#
+# Single environment (prod-eu-west-1-hub) — no per-env values overlay in
+# the GitOps repository. If a second environment ever needs this chart, add
+# a values file there and switch the Argo Application
+# (clusters/*/addons/spicedb-schema.yaml) to the multi-source
+# talon.yaml/falcon-id.yaml pattern (source[0] chart + source[1] ref: values).
+
+spicedb:
+  # In-cluster gRPC endpoint of the spicedb addon
+  # (clusters/prod-eu-west-1-hub/addons/spicedb.yaml). Only the host part is
+  # used by the Job — it derives the HTTP gateway URL (port 8443) from it.
+  endpoint: spicedb.spicedb.svc.cluster.local:50051
+  # spicedb's own `spicedb-psk` Secret (namespace: spicedb), created by an
+  # ExternalSecret in addons/spicedb.yaml. This chart deploys INTO the
+  # spicedb namespace, so it reads that Secret directly — no cross-namespace
+  # Reflector copy needed (unlike talon/falcon-id, which consume a mirrored
+  # copy in their own namespaces for their runtime CheckPermission calls).
+  pskSecret:
+    name: spicedb-psk
+    key: presharedkey
+
+image:
+  # Explicit `docker.io/` prefix required by the cluster's Kyverno
+  # restrict-image-registries policy — the implicit short form is rejected
+  # even though `docker.io/*` is allow-listed (matches on the literal image
+  # string, not the resolved canonical reference). See
+  # deploy/helm/falcon-id/values.yaml history (2026-04-26 → 28 incident)
+  # for the same gotcha hit previously by this exact class of Job.
+  repository: docker.io/curlimages/curl
+  tag: "8.10.1"
+  pullPolicy: IfNotPresent
+
+job:
+  # Bounded so a genuinely stuck write (SpiceDB down, network partition)
+  # fails loudly instead of hanging a sync forever — but sized so
+  # backoffLimit's own retries can actually exhaust FIRST in a real
+  # outage, rather than activeDeadlineSeconds cutting them off early.
+  # The container makes at most two network calls per attempt (write,
+  # --max-time 20; read-back, --max-time 15 — see
+  # templates/schema-write-job.yaml), so one pod attempt is bounded at
+  # ~35s even in the worst case (write completes just under its own
+  # timeout, then the read-back hangs for its full timeout too). With
+  # backoffLimit=3 (4 total pod attempts) and Kubernetes' own
+  # exponential backoff between attempts (10s, 20s, 40s), a genuine
+  # outage exhausts backoffLimit in ~4*35 + 70 =~ 210s worst case.
+  # activeDeadlineSeconds is set comfortably above that so a real
+  # outage is reported as a diagnosable `BackoffLimitExceeded` (with
+  # the last pod's actual failure logs still around, per the
+  # BeforeHookCreation/HookSucceeded hook-delete-policy) instead of an
+  # ambiguous `DeadlineExceeded` that gives no clue why — which is
+  # exactly the confusing secondary symptom the t-582 2026-09-08/09
+  # hook-ordering incident produced on top of its real cause (a missing
+  # ServiceAccount, not a SpiceDB outage — see
+  # templates/schema-write-job.yaml's header for the full writeup).
+  activeDeadlineSeconds: 300
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 64Mi}

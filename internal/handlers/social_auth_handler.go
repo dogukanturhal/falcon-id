@@ -173,6 +173,9 @@ func (h *SocialAuthHandler) HandleCallback(c *gin.Context) {
 
 	response, err := h.socialAuthService.HandleCallback(c.Request.Context(), tenantID, provider, code, state, ipAddress, userAgent, deviceID)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		h.logger.Error("OAuth callback failed",
 			zap.String("provider", provider),
 			zap.Error(err),
@@ -323,6 +326,9 @@ func (h *SocialAuthHandler) HandleAppleCallback(c *gin.Context) {
 
 	response, err := h.socialAuthService.HandleCallback(c.Request.Context(), tenantID, "apple", code, state, ipAddress, userAgent, deviceID)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		h.logger.Error("Apple callback failed",
 			zap.Error(err),
 		)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
@@ -225,6 +226,10 @@ func (h *UserHandler) Update(c *gin.Context) {
 
 	user, err := h.userService.Update(c.Request.Context(), id, &req, currentUserID)
 	if err != nil {
+		if errors.Is(err, repositories.ErrSeatLimitReached) {
+			c.JSON(http.StatusConflict, gin.H{"error": "seat limit reached", "code": errCodeSeatLimitReached})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

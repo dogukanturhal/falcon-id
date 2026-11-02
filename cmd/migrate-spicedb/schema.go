@@ -17,7 +17,13 @@ import (
 )
 
 const (
-	schemaPath                = "schemas/example.zed"
+	// D-68 (docs/adr/D-68-spicedb-schema-canonical.md): the previous
+	// default, "schemas/example.zed", referenced a directory that never
+	// existed in this repo — the Helm file is the single source of truth.
+	// Note: this is a CLI tool invoked from the repo root
+	// (`go run ./cmd/migrate-spicedb schema ...`), so the path below is
+	// relative to the repo root, not this package's directory.
+	schemaPath                = "deploy/helm/spicedb-schema/files/spicedb.zed"
 	msgRunMigrationLoadSchema = "RunMigration: LoadSchema failed: %w"
 	msgRunMigration           = "RunMigration: %w"
 )

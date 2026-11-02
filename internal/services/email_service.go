@@ -53,7 +53,132 @@ const (
 	// exactly this, never to a bare address, so a tenant configuring
 	// nothing sees no regression.
 	defaultSenderDisplayName = "Hexxlock Technologies Security"
+
 )
+
+// dkimSignableApexes lists the sending domains verified capable of DKIM
+// signing at rspamd-dkim-signer, checked live via rspamc against the
+// production signer (2026-09-24):
+//
+//   - hexxlock.com — selector "dkim", configured directly in Vault/rspamd.
+//     Not a row in hexxlock_domain_management.platform_email_domains; this
+//     is the original platform domain, provisioned before that self-serve
+//     table existed.
+//   - example.com — selector "s1". hexxlock_domain_management
+//     .platform_email_domains: dkim_status=verified, spf_status=verified,
+//     dmarc_status=verified, is_fully_authenticated=true.
+//
+// Sending a branded invitation From any OTHER domain would produce an
+// UNSIGNED message — worse than today's alignment problem, not better.
+// Extending this set requires provisioning a DKIM key + DNS record first
+// (an operator/infra step — see hexxlock_domain_management's onboarding
+// flow — never assumed here) and adding the domain to this map afterward.
+var dkimSignableApexes = map[string]struct{}{
+	"hexxlock.com": {},
+	"example.com":  {},
+}
+
+// invitationSenderFor picks the From address/display name for a branded
+// invitation email so it ALIGNS with emailLinkURL — the exact URL rendered
+// as the accept/setup link in the SAME email. Sender/link alignment, not
+// SPF/DKIM/DMARC pass/fail, is the anti-phishing signal this exists to
+// satisfy (see MR description).
+//
+// Callers pass the actual link they built (acceptURL / setupLink), not a
+// separately-resolved config value, so the sender can never drift from
+// what the recipient actually sees in the body — by construction, not by
+// convention. That link is itself built from ConfigProvider.FrontendURL,
+// resolved per tenant (local cache -> Redis -> DB -> static default, see
+// ResolveFrontendURL below), so a tenant — or a future product — that
+// configures its own frontend_url gets a correctly-aligned sender without
+// another code change here. Nothing product-specific is hardcoded.
+//
+// This does NOT resolve tenant-management's tenants.domain (a tenant's own
+// custom/reseller apex). That was considered and deliberately deferred:
+//
+//   - falcon-id has no synced, trustworthy copy of that field today. The
+//     Kafka tenant projection (tenantprojection/subscriber.go) does not
+//     carry domain; iam_tenants.domain is set only via falcon-id's own
+//     admin tenant-update endpoint and is never written by the projection,
+//     so it can silently drift from tenant-management (the ADR-0029
+//     source of truth) — using it here, in a control meant to prevent
+//     phishing-signal mismatches, risks introducing exactly the mismatch
+//     it exists to prevent.
+//   - A live lookup would need a tenant-management HTTP client + scope
+//     grant falcon-id does not currently have. payment-gateway hit the
+//     identical gap (`GetTenantDomain: unexpected status 403`) — a
+//     separate, already-tracked defect.
+//   - Even with a trustworthy live value, DKIM is provisioned for exactly
+//     the two apexes above, so sending From an arbitrary tenant domain
+//     would fail to sign.
+//
+// Wiring true per-tenant custom-domain sending is a larger, cross-service
+// change (tenant-management scope grant, plus DKIM provisioning per
+// customer domain via hexxlock_domain_management). This function stops at
+// deployment/product-level alignment, which is what the reported defect
+// actually requires.
+func invitationSenderFor(emailLinkURL string) (from, fromName string) {
+	apex := registrableApex(emailLinkURL)
+	if _, signable := dkimSignableApexes[apex]; signable {
+		return "noreply@" + apex, invitationSenderDisplayName(apex)
+	}
+	// Unrecognized or unsignable apex (e.g. defaultFrontendURL's
+	// "localhost" in local dev, or an apex we don't yet have DKIM for):
+	// fall back to the one sender identity guaranteed both configured and
+	// signable, rather than emitting mail under a domain that will fail
+	// authentication outright.
+	return "noreply@hexxlock.com", defaultSenderDisplayName
+}
+
+// invitationSenderDisplayName maps a signable apex to the brand name shown
+// in the From header. Kept separate from invitationSenderFor so adding a
+// third signable apex (once DKIM is provisioned for it) is a one-line
+// addition here rather than a change to the alignment logic itself.
+func invitationSenderDisplayName(apex string) string {
+	if apex == "example.com" {
+		return "AcmeApp"
+	}
+	return defaultSenderDisplayName
+}
+
+// registrableApex extracts the last two DNS labels of rawURL's host
+// ("app.example.com" -> "example.com"). This is intentionally NOT a
+// general public-suffix-list implementation — it only needs to work for
+// the small, known set of apexes this platform sends invitations under
+// (dkimSignableApexes above); a real multi-tenant custom-domain sender
+// would need the full PSL treatment, which is part of why that is deferred
+// (see invitationSenderFor).
+func registrableApex(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	host := u.Hostname()
+	labels := strings.Split(host, ".")
+	if len(labels) >= 2 {
+		return strings.Join(labels[len(labels)-2:], ".")
+	}
+	return host
+}
+
+// ResolveFrontendURL exposes the per-tenant frontend URL resolution
+// (ConfigProvider.FrontendURL — local cache -> Redis -> DB -> static
+// default) to callers outside this file, e.g. invitation_service.go's
+// sendInvitationEmail, so the accept/setup link and the sender-alignment
+// decision are computed from the SAME resolved value instead of two
+// separate config reads that could theoretically diverge mid-request.
+func (s *EmailService) ResolveFrontendURL(ctx context.Context, tenantID uuid.UUID) string {
+	frontendURL := s.config.FrontendURL
+	if s.configProvider != nil {
+		if resolved := s.configProvider.FrontendURL(ctx, tenantID); resolved != "" {
+			frontendURL = resolved
+		}
+	}
+	if frontendURL == "" {
+		frontendURL = defaultFrontendURL
+	}
+	return frontendURL
+}
 
 // EmailService is an exported type.
 type EmailService struct {
@@ -262,7 +387,7 @@ func (s *EmailService) SendVerificationEmail(tenantID uuid.UUID, to, code, usern
 </html>
 `, template.HTMLEscapeString(username), template.HTMLEscapeString(code))
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateVerificationCode, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateVerificationCode, to, subject, body, "")
 }
 
 // SendVerificationEmailLink sends an email verification link
@@ -301,7 +426,7 @@ func (s *EmailService) SendVerificationEmailLink(tenantID uuid.UUID, to, verific
 </html>
 `, template.HTMLEscapeString(username), verificationLink, verificationLink)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateVerificationLink, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateVerificationLink, to, subject, body, "")
 }
 
 // SendMFACode sends a one-time MFA code via email
@@ -353,7 +478,7 @@ func (s *EmailService) SendMFACode(tenantID uuid.UUID, to, code, username string
 </html>
 `, template.HTMLEscapeString(username), template.HTMLEscapeString(code))
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFACode, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFACode, to, subject, body, "")
 }
 
 // SendPasswordReset sends a password reset email
@@ -410,7 +535,7 @@ func (s *EmailService) SendPasswordReset(tenantID uuid.UUID, to, token, username
 </html>
 `, template.HTMLEscapeString(username), resetLink, resetLink)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplatePasswordReset, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplatePasswordReset, to, subject, body, "")
 }
 
 // SendMFAEnabled notifies user that MFA has been enabled
@@ -462,7 +587,7 @@ func (s *EmailService) SendMFAEnabled(tenantID uuid.UUID, to, username, mfaType 
 </html>
 `, template.HTMLEscapeString(username), mfaTypeDisplay)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFAEnabled, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMFAEnabled, to, subject, body, "")
 }
 
 // SendMagicLink sends a magic link for passwordless authentication
@@ -521,12 +646,12 @@ func (s *EmailService) SendMagicLink(tenantID uuid.UUID, to, magicLink, username
 </html>
 `, template.HTMLEscapeString(displayName), magicLink, magicLink)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMagicLink, to, subject, body)
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateMagicLink, to, subject, body, "")
 }
 
 // SendInvitation sends an invitation email for account setup
 func (s *EmailService) SendInvitation(tenantID uuid.UUID, to, setupLink, username, tenantName string) error {
-	subject := fmt.Sprintf("You've been invited to %s on ExampleSuite", tenantName)
+	subject := fmt.Sprintf("You've been invited to %s on AcmeApp", tenantName)
 
 	displayName := username
 	if displayName == "" {
@@ -560,11 +685,11 @@ func (s *EmailService) SendInvitation(tenantID uuid.UUID, to, setupLink, usernam
 <body>
     <div class="container">
         <div class="header">
-            <h1>Welcome to ExampleSuite</h1>
+            <h1>Welcome to AcmeApp</h1>
         </div>
         <div class="content">
             <p>Hello %s,</p>
-            <p>You have been invited to be the administrator of <strong>%s</strong> on ExampleSuite.</p>
+            <p>You have been invited to be the administrator of <strong>%s</strong> on AcmeApp.</p>
             <p>Click the button below to set up your password and activate your account:</p>
             <p style="text-align: center;">
                 <a href="%s" class="button">Set Up Your Account</a>
@@ -593,48 +718,132 @@ func (s *EmailService) SendInvitation(tenantID uuid.UUID, to, setupLink, usernam
 </html>
 `, template.HTMLEscapeString(displayName), template.HTMLEscapeString(tenantName), setupLink, setupLink)
 
-	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateInvitation, to, subject, body)
+	// Branded invitation — align the sender to setupLink itself (the exact
+	// URL rendered above), not a hardcoded domain. See invitationSenderFor.
+	return s.sendEmail(context.Background(), tenantID, metrics.EmailTemplateInvitation, to, subject, body, setupLink)
 }
 
 // SendTeamInvitation hands the credential-bearing invitation directly to the
 // relay. The rendered token must never be persisted in the durable outbox.
-func (s *EmailService) SendTeamInvitation(ctx context.Context, tenantID uuid.UUID, to, token string) error {
-	baseURL := defaultFrontendURL
-	if s.config.FrontendURL != "" {
-		baseURL = strings.TrimRight(s.config.FrontendURL, "/")
-	}
+// existingAccount only adapts the wording ("sign in to accept" instead of
+// "create your account"); the link and subject are identical either way.
+func (s *EmailService) SendTeamInvitation(ctx context.Context, tenantID uuid.UUID, to, token string, existingAccount bool) error {
+	baseURL := strings.TrimRight(s.ResolveFrontendURL(ctx, tenantID), "/")
 	acceptURL := baseURL + "/invitations/accept?token=" + url.QueryEscape(token)
+	// Branded invitation — align the sender to acceptURL itself (the exact
+	// URL rendered below), not a hardcoded domain. See invitationSenderFor.
 	return s.sendEmail(ctx, tenantID, TeamInvitationEmailTemplate, to,
-		"You've been invited to join a team on ExampleSuite",
-		fmt.Sprintf(`<html><body><p>You have been invited to join a team on ExampleSuite.</p><p><a href="%s">Accept invitation</a></p><p>This invitation expires in 7 days.</p></body></html>`, acceptURL))
+		"You've been invited to join a team on AcmeApp",
+		teamInvitationHTMLBody(acceptURL, existingAccount), acceptURL)
 }
 
-// SendSignupVerificationEmail sends a signup email verification message.
-// The token is embedded in a link that the user clicks to verify ownership.
+// teamInvitationHTMLBody renders the team-invitation email HTML.
+//
+// The accept link is deliberately rendered TWICE: once as the <a href>
+// button, and once as plain visible text under "Or copy and paste this
+// link into your browser" (the same pattern every other templated email in
+// this file already follows — see SendVerificationEmailLink,
+// SendPasswordReset, SendMagicLink, SendInvitation). That second copy is
+// load-bearing, not decorative: sendEmail's htmlToPlainText derives the
+// multipart text/plain alternative by stripping HTML TAGS, which discards
+// an <a href="..."> attribute entirely and keeps only its link text
+// ("Accept invitation"). Without a plain-text copy of the URL, a recipient
+// reading the plain-text part of this email (any client that prefers or
+// only renders text/plain) sees an invitation with no way to act on it —
+// the HTML part remains clickable, but the plain-text part does not
+// degrade to a usable link the way it should.
+//
+// The product name is AcmeApp. "ExampleSuite" is an internal platform name and
+// must never reach a customer's inbox.
+func teamInvitationHTMLBody(acceptURL string, existingAccount bool) string {
+	escapedURL := template.HTMLEscapeString(acceptURL)
+	intro := "You have been invited to join a team on AcmeApp."
+	if existingAccount {
+		intro = "You have been invited to join a team on AcmeApp. You already have a AcmeApp account: sign in with this email address to accept the invitation."
+	}
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Team Invitation</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background-color: #f4f4f5; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #3b82f6, #6366f1); padding: 30px; text-align: center; }
+        .header h1 { color: white; margin: 0; font-size: 24px; }
+        .content { padding: 30px; }
+        .button { display: inline-block; background: linear-gradient(135deg, #3b82f6, #6366f1); color: white; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; margin: 20px 0; }
+        .footer { padding: 20px 30px; background: #f8fafc; color: #64748b; font-size: 12px; text-align: center; }
+        p { color: #475569; line-height: 1.6; }
+        .link { word-break: break-all; color: #3b82f6; }
+        @media only screen and (max-width: 480px) {
+            body { padding: 8px; }
+            .content { padding: 20px; }
+            .button { display: block; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>AcmeApp</h1>
+        </div>
+        <div class="content">
+            <p>Hello,</p>
+            <p>%s</p>
+            <p style="text-align: center;">
+                <a href="%s" class="button">Accept invitation</a>
+            </p>
+            <p>Or copy and paste this link into your browser:</p>
+            <p class="link">%s</p>
+            <p>This invitation expires in 7 days. If you did not expect this invitation, you can safely ignore this email.</p>
+        </div>
+        <div class="footer">
+            <p>AcmeApp</p>
+        </div>
+    </div>
+</body>
+</html>`, template.HTMLEscapeString(intro), escapedURL, escapedURL)
+}
+
+// formatSignupCode renders a 6-digit code as "482 913" for readability.
+func formatSignupCode(code string) string {
+	if len(code) == 6 {
+		return code[:3] + " " + code[3:]
+	}
+	return code
+}
+
+// SendSignupVerificationEmail sends the signup email verification message with
+// the 6-digit one-time code (valid for 15 minutes). The email is English-only:
+// the service has no email i18n mechanism and the signup locale is not passed.
 // Because signup happens before a tenant exists, this uses uuid.Nil as the
 // tenant ID so the system-level SMTP configuration is used.
-func (s *EmailService) SendSignupVerificationEmail(ctx context.Context, email, token, name string) error {
+func (s *EmailService) SendSignupVerificationEmail(ctx context.Context, email, code, name string) error {
 	displayName := name
 	if displayName == "" {
 		displayName = emailDefaultDisplayName
 	}
 
-	subject := "Verify your email address - HexxLock"
+	// The subject deliberately omits the code: subjects land in lock-screen
+	// previews, mail logs and relay traces.
+	subject := "Your AcmeApp verification code"
 
 	body := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Verify Your Email</title>
+    <title>Your verification code</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background-color: #f4f4f5; margin: 0; padding: 20px; }
         .container { max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .header { background: linear-gradient(135deg, #4F46E5, #6366f1); padding: 30px; text-align: center; }
         .header h1 { color: white; margin: 0; font-size: 24px; }
         .content { padding: 30px; }
-        .token-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; }
-        .token { font-family: monospace; font-size: 14px; word-break: break-all; color: #4F46E5; }
+        .code-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0; }
+        .code { font-family: 'SFMono-Regular', Menlo, Consolas, monospace; font-size: 36px; font-weight: bold; letter-spacing: 6px; color: #4F46E5; margin: 0; }
         .footer { padding: 20px 30px; background: #f8fafc; color: #64748b; font-size: 12px; text-align: center; }
         p { color: #475569; line-height: 1.6; }
     </style>
@@ -642,29 +851,28 @@ func (s *EmailService) SendSignupVerificationEmail(ctx context.Context, email, t
 <body>
     <div class="container">
         <div class="header">
-            <h1>Verify Your Email</h1>
+            <h1>AcmeApp</h1>
         </div>
         <div class="content">
             <p>Hello %s,</p>
-            <p>Thank you for signing up for HexxLock. Please verify your email address using the token below:</p>
-            <div class="token-box">
-                <p style="margin: 0 0 8px 0; font-weight: bold; color: #1e293b;">Your verification token:</p>
-                <p class="token">%s</p>
+            <p>Thank you for signing up for AcmeApp. Enter this code to verify your email address:</p>
+            <div class="code-box">
+                <p class="code">%s</p>
             </div>
-            <p>This token will expire in 24 hours. If you did not request this, you can safely ignore this email.</p>
+            <p>This code expires in 15 minutes. Never share it with anyone. If you did not request it, you can safely ignore this email.</p>
         </div>
         <div class="footer">
-            <p>&copy; 2024 HexxLock Corporation. All rights reserved.</p>
+            <p>AcmeApp</p>
             <p>This is an automated message - please do not reply.</p>
         </div>
     </div>
 </body>
 </html>
-`, template.HTMLEscapeString(displayName), template.HTMLEscapeString(token))
+`, template.HTMLEscapeString(displayName), template.HTMLEscapeString(formatSignupCode(code)))
 
 	// Signup happens before a tenant is known — use uuid.Nil to fall back to
 	// the system-level SMTP configuration.
-	return s.sendEmail(ctx, uuid.Nil, metrics.EmailTemplateSignupVerification, email, subject, body)
+	return s.sendEmail(ctx, uuid.Nil, metrics.EmailTemplateSignupVerification, email, subject, body, "")
 }
 
 // sendEmail is the internal method to send emails using per-tenant SMTP config.
@@ -685,12 +893,17 @@ func (s *EmailService) SendSignupVerificationEmail(ctx context.Context, email, t
 // development it stays non-fatal — otherwise every local signup breaks —
 // but it is logged at ERROR and counted, so it can never again pass as
 // success.
-func (s *EmailService) sendEmail(ctx context.Context, tenantID uuid.UUID, template, to, subject, htmlBody string) error {
+// alignSenderToLink, when non-empty, is the exact accept/setup link URL
+// rendered in htmlBody for a branded invitation template — see
+// invitationSenderFor. Every other template passes "" and keeps the
+// tenant's normal resolved sender untouched.
+func (s *EmailService) sendEmail(ctx context.Context, tenantID uuid.UUID, template, to, subject, htmlBody, alignSenderToLink string) error {
 	start := time.Now()
 	observe := func(outcome string) {
 		metrics.EmailSendDuration.WithLabelValues(template, outcome).Observe(time.Since(start).Seconds())
 		metrics.EmailSendTotal.WithLabelValues(template, outcome).Inc()
 	}
+
 
 	dialer, from, fromName, err := s.getOrCreateDialer(ctx, tenantID)
 	if err != nil {
@@ -723,6 +936,15 @@ func (s *EmailService) sendEmail(ctx context.Context, tenantID uuid.UUID, templa
 		return nil
 	}
 
+	// Align the sender to the invitation's own accept/setup link — but ONLY
+	// when `from` is still the system default (config.SMTPFrom). A tenant
+	// that configured its own SMTP sender has a legitimate reason for that
+	// address, and overriding it here would ship mail under a domain the
+	// tenant never chose and may have no authentication set up for.
+	if alignSenderToLink != "" && from == s.config.SMTPFrom {
+		from, fromName = invitationSenderFor(alignSenderToLink)
+	}
+
 	m := gomail.NewMessage()
 
 	// Set required headers to avoid spam filters. fromName is already
@@ -736,8 +958,17 @@ func (s *EmailService) sendEmail(ctx context.Context, tenantID uuid.UUID, templa
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", subject)
 
-	// Generate proper Message-ID to avoid spam score penalty
-	messageID := fmt.Sprintf("<%d.%s@hexxlock.com>", time.Now().UnixNano(), generateRandomString(16))
+	// Generate proper Message-ID to avoid spam score penalty. The RHS must
+	// match the From domain (rspamd scores MID_RHS_MATCH_FROM as a
+	// legitimacy signal, and its absence is one more small mismatch a
+	// filter can add up) — a literal "@hexxlock.com" here would silently
+	// reintroduce that mismatch for mail now sent as example.com (see
+	// alignSenderToLink above).
+	messageIDDomain := "hexxlock.com"
+	if idx := strings.LastIndex(from, "@"); idx != -1 && idx+1 < len(from) {
+		messageIDDomain = from[idx+1:]
+	}
+	messageID := fmt.Sprintf("<%d.%s@%s>", time.Now().UnixNano(), generateRandomString(16), messageIDDomain)
 	m.SetHeader("Message-ID", messageID)
 
 	// Set other headers that help with spam filtering
@@ -790,7 +1021,7 @@ func (s *EmailService) SendTestEmail(ctx context.Context, tenantID uuid.UUID, to
 <p>If you received this message, your email settings are correctly configured.</p>
 <p style="color:#64748b;font-size:12px;">Sent at: ` + time.Now().UTC().Format(time.RFC3339) + `</p>
 </body></html>`
-	return s.sendEmail(ctx, tenantID, metrics.EmailTemplateSMTPTest, to, subject, body)
+	return s.sendEmail(ctx, tenantID, metrics.EmailTemplateSMTPTest, to, subject, body, "")
 }
 
 // htmlToPlainText converts HTML to plain text (basic implementation)

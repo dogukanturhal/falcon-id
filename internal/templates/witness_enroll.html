@@ -215,7 +215,7 @@
 <body>
     <div class="card" id="card">
         <div class="logo"><span class="logo-mark"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></span><span class="logo-word">Falcon ID</span></div>
-        <div class="subtitle">Witness device enrollment with your security key.</div>
+        <div class="subtitle" id="subtitle">Witness device enrollment with your security key.</div>
 
         <div class="operator">
             Signing as <strong id="operator-email">{{.OperatorEmail}}</strong>
@@ -260,13 +260,23 @@
             <span class="value" title="{{.CallbackURL}}">{{.CallbackURL}}</span>
         </div>
 
-        <div class="actions">
+        <div class="actions" id="passkey-actions">
             <button type="button" id="sign-btn">Sign with your security key</button>
         </div>
 
-        <div class="footer">
+        <form class="actions" id="totp-form" style="display:none" autocomplete="off">
+            <div class="fact">
+                <label class="label" for="totp-code">6-digit code from your authenticator app</label>
+                <input id="totp-code" name="totp-code" type="text" inputmode="numeric"
+                       pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"
+                       style="width:100%;padding:12px;font-size:20px;letter-spacing:6px;text-align:center;border:1px solid #cbd5e1;border-radius:8px">
+            </div>
+            <button type="submit" id="totp-btn">Verify code</button>
+        </form>
+
+        <div class="footer" id="footer-text">
             Witness JWS expires 10 minutes after signing. <br>
-            Audience: internal.example.com / device-attest
+            Audience: jess.internal.example.com / device-attest
         </div>
     </div>
 
@@ -301,6 +311,12 @@
         var fallback = document.getElementById('fallback');
         var fallbackPayload = document.getElementById('fallback-payload');
         var successDetail = document.getElementById('success-detail');
+        var passkeyActions = document.getElementById('passkey-actions');
+        var totpForm = document.getElementById('totp-form');
+        var totpCode = document.getElementById('totp-code');
+        var totpBtn = document.getElementById('totp-btn');
+        var subtitle = document.getElementById('subtitle');
+        var footerText = document.getElementById('footer-text');
 
         function setVisible(el, visible) {
             if (visible) { el.classList.add('visible'); } else { el.classList.remove('visible'); }
@@ -444,6 +460,121 @@
 
         var lastDebug = null;
 
+        // Hand the minted witness to the desktop enrollment app over loopback
+        // (and show the copy/paste fallback when that fails). Shared by both
+        // methods. `state` is the value from the page URL, echoed verbatim so
+        // the client can constant-time compare it.
+        var lastJws = null;
+        async function deliver(jws) {
+            lastJws = jws;
+            var callbackPayload = {
+                signed_jws: jws.signed_jws,
+                admin_sub: jws.admin_sub,
+                issued_at: jws.issued_at,
+                expires_at: jws.expires_at,
+                device_uuid: data.deviceUUID,
+                state: data.state || ''
+            };
+            showInfo('Returning the witness to the enrollment app…');
+            try {
+                await postCallback(callbackPayload);
+            } catch (cbErr) {
+                lastDebug = { stage: 'callback', error: String(cbErr && cbErr.message || cbErr) };
+                showError(
+                    'Could not reach the enrollment app',
+                    'Copy the witness payload below and paste it into the enrollment wizard.',
+                    { retryable: true, fallback: true, fallbackPayload: JSON.stringify(callbackPayload, null, 2) }
+                );
+                return;
+            }
+            showSuccess('You can close this window. Auto-closing in 3 seconds…');
+            setTimeout(function () {
+                try { window.close(); } catch (e) { /* ignore */ }
+                successDetail.textContent = 'You can close this window.';
+            }, 3000);
+        }
+
+        // ── authenticator-app (TOTP) method ─────────────────────────────
+        var totpChallenge = '';
+
+        function classifyTotpError(resp) {
+            var b = resp.body || {};
+            var code = b.code || '';
+            if (code === 'witness_code_invalid') {
+                var left = (typeof b.remaining_attempts === 'number') ? (' ' + b.remaining_attempts + ' attempt(s) left on this challenge.') : '';
+                return { title: 'Code not accepted', detail: 'Check the code in your authenticator app and try again.' + left, retryable: true, keep: true };
+            }
+            if (code === 'witness_challenge_expired' || code === 'witness_attempts_exhausted') {
+                return { title: 'Challenge expired', detail: 'Enter a fresh code to start a new challenge.', retryable: true, keep: false };
+            }
+            if (code === 'witness_locked') { return { title: 'Temporarily locked', detail: 'Too many failed attempts. Try again in about 15 minutes.', retryable: false, keep: false }; }
+            if (code === 'witness_passkey_required') { return { title: 'Use your passkey', detail: b.error || 'This account has a passkey; use it to witness the device.', retryable: false, keep: false }; }
+            if (code === 'witness_totp_too_new') { return { title: 'Authenticator app too new', detail: 'Your authenticator app was set up less than 24 hours ago. Try again later or use a passkey.', retryable: false, keep: false }; }
+            if (code === 'witness_totp_disabled' || code === 'witness_totp_policy_off') { return { title: 'Not available', detail: 'Authenticator-app witnessing is turned off. Use a passkey.', retryable: false, keep: false }; }
+            if (code === 'witness_totp_not_enrolled') { return { title: 'No authenticator app', detail: 'Set up an authenticator app in your Falcon ID account security settings, then retry after 24 hours.', retryable: false, keep: false }; }
+            if (resp.status === 401) { return { title: 'Sign-in required', detail: 'Your session expired. Sign in again to continue.', retryable: false, keep: false }; }
+            if (resp.status === 403) { return { title: 'Not a platform admin', detail: 'Only HexxLock platform admins can witness device enrollment.', retryable: false, keep: false }; }
+            return { title: 'Could not verify the code', detail: b.error || ('HTTP ' + resp.status), retryable: true, keep: false };
+        }
+
+        async function runTotp() {
+            var code = (totpCode.value || '').replace(/\s+/g, '');
+            if (!/^[0-9]{6}$/.test(code)) {
+                showError('Invalid code', 'Enter the 6-digit code from your authenticator app.', { retryable: false });
+                return;
+            }
+            totpBtn.disabled = true;
+            showInfo('Verifying code…');
+            try {
+                if (!totpChallenge) {
+                    var begin = await postJSON('/api/v1/auth/witness/totp/begin', {
+                        device_uuid: data.deviceUUID,
+                        ek_pubkey_hash: data.ekPubkeyHash,
+                        state: data.state || ''
+                    });
+                    if (!begin.ok) {
+                        var be = classifyTotpError(begin);
+                        lastDebug = { stage: 'totp-begin', status: begin.status, body: begin.raw };
+                        showError(be.title, be.detail, { retryable: false });
+                        return;
+                    }
+                    totpChallenge = begin.body.challenge_id;
+                }
+                var finish = await postJSON('/api/v1/auth/witness/totp/finish', {
+                    challenge_id: totpChallenge,
+                    code: code
+                });
+                totpCode.value = '';
+                if (!finish.ok) {
+                    var fe = classifyTotpError(finish);
+                    if (!fe.keep) { totpChallenge = ''; }
+                    lastDebug = { stage: 'totp-finish', status: finish.status, body: finish.raw };
+                    showError(fe.title, fe.detail, { retryable: false });
+                    return;
+                }
+                totpChallenge = '';
+                await deliver(finish.body);
+            } catch (err) {
+                lastDebug = { stage: 'totp-unknown', error: String(err && err.message || err) };
+                showError('Unexpected error', String(err && err.message || err), { retryable: false });
+            } finally {
+                totpBtn.disabled = false;
+            }
+        }
+
+        // ── method selection (decided server-side; see witnessPageBootstrap) ──
+        if (data.notice) {
+            passkeyActions.style.display = 'none';
+            showError(data.noticeTitle || 'Cannot witness with this account', data.notice, { retryable: false });
+        } else if (data.method === 'totp') {
+            subtitle.textContent = 'Witness device enrollment with your authenticator app.';
+            passkeyActions.style.display = 'none';
+            totpForm.style.display = 'flex';
+            footerText.innerHTML = 'Witness JWS expires 5 minutes after signing. <br>Audience: jess.internal.example.com / device-attest / otp';
+            totpForm.addEventListener('submit', function (ev) { ev.preventDefault(); runTotp(); });
+        }
+
+
         async function run() {
             signBtn.disabled = true;
             showInfo('Starting ceremony…');
@@ -482,7 +613,6 @@
                 showInfo('Verifying assertion…');
                 var finishPath = '/api/v1/auth/webauthn/witness/finish?wa_session_id=' + encodeURIComponent(sessionID);
                 var finishBody = assertionToBody(assertion);
-                finishBody.device_uuid = data.deviceUUID;
                 var finish = await postJSON(finishPath, finishBody);
                 if (!finish.ok) {
                     var f = classifyFinishError(finish);
@@ -490,32 +620,7 @@
                     showError(f.title, f.detail, { retryable: f.retryable });
                     return;
                 }
-                var jws = finish.body;
-                var callbackPayload = {
-                    signed_jws: jws.signed_jws,
-                    admin_sub: jws.admin_sub,
-                    issued_at: jws.issued_at,
-                    expires_at: jws.expires_at,
-                    device_uuid: data.deviceUUID,
-                    state: data.state || ''
-                };
-                showInfo('Returning the witness to the enrollment app…');
-                try {
-                    await postCallback(callbackPayload);
-                } catch (cbErr) {
-                    lastDebug = { stage: 'callback', error: String(cbErr && cbErr.message || cbErr) };
-                    showError(
-                        'Could not reach the enrollment app',
-                        'Copy the witness payload below and paste it into the enrollment wizard.',
-                        { retryable: true, fallback: true, fallbackPayload: JSON.stringify(callbackPayload, null, 2) }
-                    );
-                    return;
-                }
-                showSuccess('You can close this window. Auto-closing in 3 seconds…');
-                setTimeout(function () {
-                    try { window.close(); } catch (e) { /* ignore */ }
-                    successDetail.textContent = 'You can close this window.';
-                }, 3000);
+                await deliver(finish.body);
             } catch (err) {
                 lastDebug = { stage: 'unknown', error: String(err && err.message || err) };
                 showError('Unexpected error', String(err && err.message || err), { retryable: true });
@@ -523,7 +628,10 @@
         }
 
         signBtn.addEventListener('click', run);
-        retryBtn.addEventListener('click', run);
+        retryBtn.addEventListener('click', function () {
+            if (data.method === 'totp') { if (lastJws) { deliver(lastJws); } return; }
+            run();
+        });
         copyDebugBtn.addEventListener('click', function () {
             var blob = JSON.stringify({
                 debug: lastDebug,

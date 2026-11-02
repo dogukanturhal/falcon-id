@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 
 /*
 `grpc_kit` is a gRPC logging middleware backed by go-kit loggers

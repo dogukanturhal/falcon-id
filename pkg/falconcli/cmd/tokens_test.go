@@ -18,7 +18,7 @@ func TestTokensGenerateCmd_Success(t *testing.T) {
 	tokenResp := &client.TokenResponse{
 		ID:        "tok-123",
 		Name:      "my-key",
-		Key:       "sk_live_abcdefghijklmnop", // gitleaks:allow — test fixture, not a real credential
+		Key:       "sk_live_abcdefghijklmnop",
 		ExpiresAt: "2027-01-01T00:00:00Z",
 	}
 	mockClient.On("GenerateToken", mock.Anything, &client.GenerateTokenRequest{
@@ -41,7 +41,7 @@ func TestTokensGenerateCmd_Success(t *testing.T) {
 	assert.Contains(t, out, "[OK]")
 	assert.Contains(t, out, "my-key")
 	assert.Contains(t, out, "tok-123")
-	assert.Contains(t, out, "sk_live_abcdefghijklmnop") // gitleaks:allow — test fixture, not a real credential
+	assert.Contains(t, out, "sk_live_abcdefghijklmnop")
 	assert.Contains(t, out, "2027-01-01T00:00:00Z")
 	assert.Contains(t, out, "Store this key securely")
 

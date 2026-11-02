@@ -1,6 +1,5 @@
-# Compiled binaries. The `falcon` binary was committed at the first commit
-# and has been carried in every clone since, because this file did not exist.
-falcon
+# Compiled binaries (root-anchored so cmd/falcon, the CLI source, is not ignored).
+/falcon
 /falcon-id
 /bin/
 /dist/

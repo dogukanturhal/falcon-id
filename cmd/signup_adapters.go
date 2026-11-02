@@ -207,7 +207,32 @@ var orgAdminTeamPermissionNames = []string{
 	"iam:users:delete",
 	"iam:service_accounts:read",
 	"iam:service_principals:read",
+	// WO#20 developer access (tenant API keys + webhooks); registered by
+	// selfRegisterPermissions and backfilled for existing tenants by 0029.
+	"iam:api_keys:read",
+	"iam:api_keys:manage",
+	"iam:webhooks:read",
+	"iam:webhooks:manage",
 	"core:roles:read",
+	// core:users:read and core:permissions:read gate GET /users and
+	// GET /permissions (see cmd/routes.go permCoreUsersRead /
+	// permCorePermsRead) — the exact two endpoints Settings > Team's
+	// useTeamUsers()/useRoles() call alongside GET /roles (already covered
+	// by core:roles:read above). Without these, org_admin could see the
+	// roles list but Team page would 403 loading users/permissions.
+	//
+	// NOTE: before cmd/main.go's selfRegisterCorePermissions fix (t-acmeapp-
+	// rbac), NONE of the "core:*" names in this list existed in the
+	// iam_permissions catalog at all (only "iam:*" was self-registered at
+	// startup). GrantPermissionsByName is fail-closed on any unresolved
+	// name (see internal/repositories/role_repository.go), so this whole
+	// call — and therefore org_admin role creation/grant for EVERY
+	// business-account signup — has been failing (logged as a non-fatal
+	// Warn in PostSignupProvisioner, so no error surfaced to the founder or
+	// an operator) since "core:roles:read" was first added to this list.
+	// This is the actual root cause of "Settings > Team is unusable".
+	"core:users:read",
+	"core:permissions:read",
 }
 
 type founderRoleAssignerAdapter struct {

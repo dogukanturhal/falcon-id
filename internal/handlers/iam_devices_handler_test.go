@@ -711,3 +711,35 @@ func TestIAMDevicesHandler_GetByUUID_404_NotFound(t *testing.T) {
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Equal(t, "device_not_found", resp["error"])
 }
+
+func TestIAMDevicesHandler_WitnessMethodPersistedAndReturned(t *testing.T) {
+	repo := &iamDevicesRepoFake{}
+	r := newIAMDevicesTestRouter(repo)
+
+	body := validEnrollBody()
+	body["witness_method"] = "otp"
+	w := iamDoRequest(t, r, http.MethodPost, "/internal/v1/iam-devices/enroll", marshalBody(t, body))
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	require.Len(t, repo.registerCalls, 1)
+	assert.Equal(t, "otp", repo.registerCalls[0].WitnessMethod)
+
+	body = validEnrollBody()
+	body["witness_method"] = "carrier-pigeon"
+	w = iamDoRequest(t, r, http.MethodPost, "/internal/v1/iam-devices/enroll", marshalBody(t, body))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+
+	row := validDeviceRow()
+	row.WitnessMethod = "otp"
+	repo.getRow, repo.getUUIDRow = row, row
+	for _, path := range []string{
+		"/internal/v1/iam-devices/by-ek-hash/" + validEKHash(),
+		"/internal/v1/iam-devices/by-uuid/" + row.DeviceUUID.String(),
+	} {
+		w = iamDoRequest(t, r, http.MethodGet, path, nil)
+		require.Equal(t, http.StatusOK, w.Code, path)
+		var got map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		assert.Equal(t, "otp", got["witness_method"], path)
+		assert.NotEmpty(t, got["enrolled_at"], path)
+	}
+}

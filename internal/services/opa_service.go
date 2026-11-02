@@ -4,9 +4,11 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io/fs"
 	"strings"
 	"sync"
 	"time"
@@ -14,12 +16,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
-	"github.com/open-policy-agent/opa/v1/storage"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
+	"github.com/dogukanturhal/falcon-id/policies"
 )
 
 // AuthzInput represents the input for authorization decisions
@@ -66,26 +68,45 @@ type AuthzResult struct {
 	Reasons []string `json:"reasons,omitempty"`
 }
 
-// OPAService handles policy evaluation using Open Policy Agent
+// Deny is one reason the deny-only PDP policy refused a request.
+type Deny struct {
+	Rule   string         `json:"rule"`
+	Code   string         `json:"code"`
+	Params map[string]any `json:"params"`
+}
+
+// Decision is the PDP policy output. It never grants on its own: callers
+// combine it as `rebacAllow && len(Denies) == 0`.
+type Decision struct {
+	Allow       bool     `json:"allow"`
+	Denies      []Deny   `json:"denies"`
+	Obligations []string `json:"obligations"`
+	Revision    string   `json:"revision"`
+}
+
+// pdpDecisionQuery is the single entrypoint evaluated for every decision.
+const pdpDecisionQuery = "data.falcon.pdp.v1.decision"
+
+// OPAService handles policy evaluation using Open Policy Agent. Policies
+// come from the embedded set only; there is no disk loading and no
+// permissive fallback.
 type OPAService struct {
 	config       *config.Config
-	compiler     *ast.Compiler
-	store        storage.Store
 	preparedEval rego.PreparedEvalQuery
+	revision     string
 	logger       *zap.Logger
 	mu           sync.RWMutex
 	lastReload   time.Time
 }
 
-// NewOPAService creates a new OPA service instance
+// NewOPAService creates a new OPA service instance. It fails if the embedded
+// policies do not compile, so a broken policy set stops boot when OPA is on.
 func NewOPAService(cfg *config.Config) (*OPAService, error) {
 	s := &OPAService{
 		config: cfg,
-		store:  inmem.New(),
 		logger: logger.Log,
 	}
 
-	// Load policies on initialization
 	if err := s.LoadPolicies(context.Background()); err != nil {
 		return nil, fmt.Errorf("failed to load policies: %w", err)
 	}
@@ -93,168 +114,122 @@ func NewOPAService(cfg *config.Config) (*OPAService, error) {
 	return s, nil
 }
 
-// LoadPolicies loads all Rego policies from the configured path
-func (s *OPAService) LoadPolicies(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	policyPath := s.config.OPAPolicyPath
-
-	// Check if policy directory exists
-	if _, err := os.Stat(policyPath); os.IsNotExist(err) {
-		s.logger.Warn("Policy directory does not exist, using default allow-all policy",
-			zap.String("path", policyPath))
-		return s.loadDefaultPolicy()
+// embeddedModules returns the embedded non-test Rego modules and their
+// revision (short SHA-256 over file names and contents).
+func embeddedModules(includeTests bool) (map[string]string, string, error) {
+	entries, err := fs.ReadDir(policies.PDP, policies.PDPDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("read embedded policies: %w", err)
 	}
 
-	// Load all .rego files from the policy directory
 	modules := make(map[string]string)
-
-	err := filepath.Walk(policyPath, func(path string, info os.FileInfo, err error) error {
+	h := sha256.New()
+	for _, e := range entries { // ReadDir is sorted by name
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".rego") {
+			continue
+		}
+		isTest := strings.HasSuffix(name, "_test.rego")
+		if isTest && !includeTests {
+			continue
+		}
+		content, err := fs.ReadFile(policies.PDP, policies.PDPDir+"/"+name)
 		if err != nil {
-			return fmt.Errorf("LoadPolicies: Walk failed: %w", err)
+			return nil, "", fmt.Errorf("read embedded policy %s: %w", name, err)
 		}
-		if info.IsDir() || filepath.Ext(path) != ".rego" {
-			return nil
+		modules[name] = string(content)
+		if !isTest {
+			h.Write([]byte(name))
+			h.Write([]byte{0})
+			h.Write(content)
+			h.Write([]byte{0})
 		}
-
-		content, err := os.ReadFile(path) //nolint:gosec // path is validated before use
-		if err != nil {
-			return fmt.Errorf("failed to read policy file %s: %w", path, err)
-		}
-
-		moduleName := filepath.Base(path)
-		modules[moduleName] = string(content)
-		s.logger.Debug("Loaded policy file", zap.String("file", path))
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("failed to walk policy directory: %w", err)
 	}
-
 	if len(modules) == 0 {
-		s.logger.Warn("No policy files found, using default allow-all policy")
-		return s.loadDefaultPolicy()
+		return nil, "", fmt.Errorf("no embedded policies found")
 	}
 
-	// Compile policies
+	return modules, hex.EncodeToString(h.Sum(nil))[:12], nil
+}
+
+// LoadPolicies compiles the embedded Rego policies and prepares the decision
+// query. On failure the previously prepared policy set stays active.
+func (s *OPAService) LoadPolicies(ctx context.Context) error {
+	modules, revision, err := embeddedModules(false)
+	if err != nil {
+		return err
+	}
+
 	compiler, err := ast.CompileModules(modules)
 	if err != nil {
-		return fmt.Errorf("failed to compile policies: %w", err)
+		return fmt.Errorf("failed to compile embedded policies: %w", err)
 	}
 
-	s.compiler = compiler
-
-	// Prepare the evaluation query (convert slashes to dots for Rego path)
-	decisionPath := strings.ReplaceAll(s.config.OPADecisionPath, "/", ".")
-	query := fmt.Sprintf("data.%s", decisionPath)
-	r := rego.New(
-		rego.Query(query),
+	prepared, err := rego.New(
+		rego.Query(pdpDecisionQuery),
 		rego.Compiler(compiler),
-		rego.Store(s.store),
-	)
-
-	preparedEval, err := r.PrepareForEval(ctx)
+		rego.Store(inmem.New()),
+	).PrepareForEval(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to prepare evaluation: %w", err)
+		return fmt.Errorf("failed to prepare policy evaluation: %w", err)
 	}
 
-	s.preparedEval = preparedEval
+	s.mu.Lock()
+	s.preparedEval = prepared
+	s.revision = revision
 	s.lastReload = time.Now()
+	s.mu.Unlock()
 
-	s.logger.Info("OPA policies loaded successfully",
+	s.logger.Info("OPA policies loaded",
 		zap.Int("policy_count", len(modules)),
-		zap.String("decision_path", s.config.OPADecisionPath))
-
+		zap.String("revision", revision))
 	return nil
 }
 
-// loadDefaultPolicy loads a permissive default policy when no policies are found
-func (s *OPAService) loadDefaultPolicy() error {
-	defaultPolicy := `
-package falcon.authz
-
-default allow := false
-
-# Super admin has all access
-allow if {
-    "*" in input.user.permissions
-}
-
-# Direct permission match
-allow if {
-    input.action in input.user.permissions
-}
-
-# Admin role has full access
-allow if {
-    "admin" in input.user.roles
-}
-`
-
-	modules := map[string]string{
-		"default.rego": defaultPolicy,
-	}
-
-	compiler, err := ast.CompileModules(modules)
-	if err != nil {
-		return fmt.Errorf("failed to compile default policy: %w", err)
-	}
-
-	s.compiler = compiler
-
-	decisionPath := strings.ReplaceAll(s.config.OPADecisionPath, "/", ".")
-	query := fmt.Sprintf("data.%s", decisionPath)
-	r := rego.New(
-		rego.Query(query),
-		rego.Compiler(compiler),
-		rego.Store(s.store),
-	)
-
-	preparedEval, err := r.PrepareForEval(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to prepare default evaluation: %w", err)
-	}
-
-	s.preparedEval = preparedEval
-	s.lastReload = time.Now()
-
-	s.logger.Info("Loaded default OPA policy")
-	return nil
-}
-
-// Evaluate evaluates the authorization decision for the given input
-func (s *OPAService) Evaluate(ctx context.Context, input *AuthzInput) (*AuthzResult, error) {
+// Decide evaluates the PDP decision for a v1 input document.
+func (s *OPAService) Decide(ctx context.Context, input map[string]any) (*Decision, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	prepared, revision := s.preparedEval, s.revision
+	s.mu.RUnlock()
 
-	// Build input map
-	inputMap := map[string]interface{}{
+	results, err := prepared.Eval(ctx, rego.EvalInput(input))
+	if err != nil {
+		return nil, fmt.Errorf("policy evaluation failed: %w", err)
+	}
+	if len(results) == 0 || len(results[0].Expressions) == 0 {
+		return nil, fmt.Errorf("policy returned no decision")
+	}
+
+	raw, err := json.Marshal(results[0].Expressions[0].Value)
+	if err != nil {
+		return nil, fmt.Errorf("encode policy decision: %w", err)
+	}
+	var d Decision
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, fmt.Errorf("decode policy decision: %w", err)
+	}
+	d.Revision = revision
+	return &d, nil
+}
+
+// Evaluate evaluates the policy for the given input. Allowed means "no deny
+// rule fired"; it is never a grant. Reasons carries the deny codes.
+func (s *OPAService) Evaluate(ctx context.Context, input *AuthzInput) (*AuthzResult, error) {
+	d, err := s.Decide(ctx, map[string]any{
 		"user":     toMap(input.User),
 		"resource": toMap(input.Resource),
 		"action":   input.Action,
 		"context":  toMap(input.Context),
-	}
-
-	// Evaluate the policy
-	results, err := s.preparedEval.Eval(ctx, rego.EvalInput(inputMap))
+	})
 	if err != nil {
-		return nil, fmt.Errorf("policy evaluation failed: %w", err)
+		return nil, err
 	}
 
-	if len(results) == 0 {
-		return &AuthzResult{Allowed: false, Reasons: []string{"no policy result"}}, nil
+	res := &AuthzResult{Allowed: d.Allow}
+	for _, dn := range d.Denies {
+		res.Reasons = append(res.Reasons, dn.Code)
 	}
-
-	// Extract the allow decision
-	allowed := false
-	if len(results) > 0 && len(results[0].Expressions) > 0 {
-		if val, ok := results[0].Expressions[0].Value.(bool); ok {
-			allowed = val
-		}
-	}
-
-	return &AuthzResult{Allowed: allowed}, nil
+	return res, nil
 }
 
 // EvaluatePermission is a convenience method that builds AuthzInput from common parameters

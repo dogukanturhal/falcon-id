@@ -38,7 +38,7 @@ func TestFrontchannelLogout_BuildIFrames_HappyPath_SessionRequired(t *testing.T)
 		clients: []FrontchannelLogoutClient{
 			{
 				ClientID:              "svc-talon",
-				FrontchannelLogoutURI: "https://internal.example.com/auth/frontchannel-logout",
+				FrontchannelLogoutURI: "https://auth.internal.example.com/auth/frontchannel-logout",
 				SessionRequired:       true,
 			},
 		},
@@ -52,7 +52,7 @@ func TestFrontchannelLogout_BuildIFrames_HappyPath_SessionRequired(t *testing.T)
 	u, err := url.Parse(frames[0].Src)
 	require.NoError(t, err)
 	assert.Equal(t, "https", u.Scheme)
-	assert.Equal(t, "internal.example.com", u.Host)
+	assert.Equal(t, "auth.internal.example.com", u.Host)
 	assert.Equal(t, "/auth/frontchannel-logout", u.Path)
 	q := u.Query()
 	assert.Equal(t, "https://id.hexxlock.com", q.Get("iss"), "iss MUST match OAUTH_ISSUER")
@@ -107,7 +107,7 @@ func TestFrontchannelLogout_BuildIFrames_RebuildsQueryDroppingExtraParams(t *tes
 		clients: []FrontchannelLogoutClient{
 			{
 				ClientID:              "svc-talon",
-				FrontchannelLogoutURI: "https://internal.example.com/auth/frontchannel-logout?token=abc&trick=xyz",
+				FrontchannelLogoutURI: "https://auth.internal.example.com/auth/frontchannel-logout?token=abc&trick=xyz",
 				SessionRequired:       true,
 			},
 		},

@@ -54,7 +54,7 @@ const (
 	kubectlNoHeaders          = "--no-headers"
 	kubectlOverwrite          = "--overwrite"
 	msgNodePoolNotFound       = "node pool not found: "
-	fmtNodePoolLabelSelector  = "hexxlock.io/node-pool=%s"
+	fmtNodePoolLabelSelector  = "example.com/node-pool=%s"
 
 	nodeStatusUnknown     = "Unknown"
 	nodeStatusReady       = "Ready"
@@ -282,7 +282,7 @@ func deployableGroups() map[string]deployGroupSpec {
 				},
 				{
 					Name:     "Wave 4 — Vertical product modules",
-					Services: []string{"ecommerce", "hotel-pms", "car-rental", "travel-agency"},
+					Services: []string{"ecommerce", "example-pms", "car-rental", "travel-agency"},
 					Status:   "pending",
 				},
 			},
@@ -686,7 +686,7 @@ func (h *NodeProvisioningHandler) runProvisioningAsync(job *ProvisioningJob) {
 			cmd:  "kubectl",
 			args: []string{
 				"label", "node", fmt.Sprintf("k3d-%s-0", job.NodeName),
-				fmt.Sprintf("hexxlock.io/node-role=%s", job.NodeRole),
+				fmt.Sprintf("example.com/node-role=%s", job.NodeRole),
 				kubectlOverwrite,
 			},
 		},
@@ -1372,8 +1372,8 @@ func buildNodePoolLabels(base map[string]string, poolID, role, tier string) map[
 	for k, v := range base {
 		labels[k] = v
 	}
-	labels["hexxlock.io/node-pool"] = poolID
-	labels["hexxlock.io/node-role"] = role
+	labels["example.com/node-pool"] = poolID
+	labels["example.com/node-role"] = role
 	labels["hexxlock.io/isolation-tier"] = tier
 	return labels
 }
@@ -1493,7 +1493,7 @@ func applyNodePoolUpdates(pool *NodePool, req *updateNodePoolRequest) bool {
 		if r := strings.TrimSpace(*req.Role); r != "" {
 			if _, ok := validNodeRoles[r]; ok {
 				pool.Role = r
-				pool.Labels["hexxlock.io/node-role"] = r
+				pool.Labels["example.com/node-role"] = r
 			}
 		}
 	}
@@ -1837,7 +1837,7 @@ type k8sNodeListFull struct {
 // GetNodePoolNodes handles GET /api/v1/platform/node-pools/:pool_id/nodes.
 //
 // Returns a simplified list of nodes that belong to the pool (identified by
-// the hexxlock.io/node-pool label). Falls back gracefully when kubectl is
+// the example.com/node-pool label). Falls back gracefully when kubectl is
 // unavailable.
 func (h *NodeProvisioningHandler) GetNodePoolNodes(c *gin.Context) {
 	poolID := c.Param("pool_id")
@@ -2090,7 +2090,7 @@ func (h *NodeProvisioningHandler) countNodesWorkloads(ctx context.Context, nodeN
 	return count
 }
 
-// findUnassignedNodes returns the names of all cluster nodes that have no hexxlock.io/node-pool label.
+// findUnassignedNodes returns the names of all cluster nodes that have no example.com/node-pool label.
 func (h *NodeProvisioningHandler) findUnassignedNodes(ctx context.Context) []string {
 	cmd := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "json")
 	out, err := cmd.Output()
@@ -2103,7 +2103,7 @@ func (h *NodeProvisioningHandler) findUnassignedNodes(ctx context.Context) []str
 	}
 	var unassigned []string
 	for _, item := range raw.Items {
-		if _, assigned := item.Metadata.Labels["hexxlock.io/node-pool"]; !assigned {
+		if _, assigned := item.Metadata.Labels["example.com/node-pool"]; !assigned {
 			unassigned = append(unassigned, item.Metadata.Name)
 		}
 	}
@@ -2213,7 +2213,7 @@ func (h *NodeProvisioningHandler) applyNodeLabels(ctx context.Context, pool *Nod
 	labelArgs := []string{
 		"label", "node", nodeName,
 		fmt.Sprintf(fmtNodePoolLabelSelector, pool.ID),
-		fmt.Sprintf("hexxlock.io/node-role=%s", pool.Role),
+		fmt.Sprintf("example.com/node-role=%s", pool.Role),
 		fmt.Sprintf("hexxlock.io/isolation-tier=%s", pool.IsolationTier),
 		kubectlOverwrite,
 	}

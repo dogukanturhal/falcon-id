@@ -33,8 +33,8 @@ func TestNew(t *testing.T) {
 			resourceID:   "12345",
 		},
 		{
-			name:         "Hotel PMS reservation resource",
-			product:      "hotel-pms",
+			name:         "Example PMS reservation resource",
+			product:      "example-pms",
 			tenantID:     knownTenantID,
 			resourceType: "reservation",
 			resourceID:   "res-9a2f",
@@ -81,9 +81,9 @@ func TestParse_Valid(t *testing.T) {
 			wantResID:    "12345",
 		},
 		{
-			name:         "Hotel PMS reservation with UUID resource ID",
-			input:        "hrn:hexxlock:hotel-pms:550e8400-e29b-41d4-a716-446655440000:reservation/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-			wantProduct:  "hotel-pms",
+			name:         "Example PMS reservation with UUID resource ID",
+			input:        "hrn:hexxlock:example-pms:550e8400-e29b-41d4-a716-446655440000:reservation/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+			wantProduct:  "example-pms",
 			wantTenantID: knownTenantID,
 			wantResType:  "reservation",
 			wantResID:    "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
@@ -215,8 +215,8 @@ func TestString_RoundTrip(t *testing.T) {
 			input: "hrn:hexxlock:erp:550e8400-e29b-41d4-a716-446655440000:contact/12345",
 		},
 		{
-			name:  "Hotel PMS reservation",
-			input: "hrn:hexxlock:hotel-pms:550e8400-e29b-41d4-a716-446655440000:reservation/res-9a2f",
+			name:  "Example PMS reservation",
+			input: "hrn:hexxlock:example-pms:550e8400-e29b-41d4-a716-446655440000:reservation/res-9a2f",
 		},
 		{
 			name:  "Car rental vehicle with UUID resource ID",
@@ -265,11 +265,11 @@ func TestToSpiceDBID(t *testing.T) {
 			want:         "erp:contact:12345",
 		},
 		{
-			name:         "Hotel PMS reservation",
-			product:      "hotel-pms",
+			name:         "Example PMS reservation",
+			product:      "example-pms",
 			resourceType: "reservation",
 			resourceID:   "res-9a2f",
-			want:         "hotel-pms:reservation:res-9a2f",
+			want:         "example-pms:reservation:res-9a2f",
 		},
 		{
 			name:         "Car rental vehicle with UUID",
@@ -307,8 +307,8 @@ func TestValidate_Valid(t *testing.T) {
 			hrn:  New("erp", knownTenantID, "contact", "12345"),
 		},
 		{
-			name: "Hotel PMS with UUID resource ID",
-			hrn:  New("hotel-pms", uuid.New(), "reservation", uuid.New().String()),
+			name: "Example PMS with UUID resource ID",
+			hrn:  New("example-pms", uuid.New(), "reservation", uuid.New().String()),
 		},
 		{
 			name: "Minimal valid HRN – single-char fields",
@@ -375,7 +375,7 @@ func TestValidate_Invalid(t *testing.T) {
 func TestParse_ThenValidate(t *testing.T) {
 	inputs := []string{
 		"hrn:hexxlock:erp:550e8400-e29b-41d4-a716-446655440000:contact/12345",
-		"hrn:hexxlock:hotel-pms:550e8400-e29b-41d4-a716-446655440000:reservation/res-9a2f",
+		"hrn:hexxlock:example-pms:550e8400-e29b-41d4-a716-446655440000:reservation/res-9a2f",
 		"hrn:hexxlock:car-rental:550e8400-e29b-41d4-a716-446655440000:vehicle/a1b2c3d4-e5f6-7890-abcd-ef1234567890",
 	}
 

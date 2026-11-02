@@ -17,7 +17,7 @@ func validManifest() *models.ProductManifest {
 		Database: &models.DatabaseSpec{
 			Type:               "postgresql",
 			IsolationDefault:   "pool",
-			MigrationSource:    "business-modules/hotel-pms-service/migrations",
+			MigrationSource:    "business-modules/example-pms-service/migrations",
 			RequiredExtensions: []string{"pgcrypto"},
 			SchemaPrefix:       "hotel_",
 		},

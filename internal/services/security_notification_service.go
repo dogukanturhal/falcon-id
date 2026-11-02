@@ -61,6 +61,7 @@ type securityEventMailer interface {
 	SendNewDeviceSignIn(tenantID uuid.UUID, to, username string, evtCtx securityEventContext) error
 	SendAccountLocked(tenantID uuid.UUID, to, username, reason string, unlockAt *time.Time, evtCtx securityEventContext) error
 	SendSuspiciousLogin(tenantID uuid.UUID, to, username string, riskFactors []string, evtCtx securityEventContext) error
+	SendDeviceEnrolledViaAuthenticator(tenantID uuid.UUID, to, username, deviceUUID string, evtCtx securityEventContext) error
 }
 
 // NewSecurityNotificationService builds the service. optIn may be nil
@@ -209,6 +210,22 @@ func (s *SecurityNotificationService) NotifySuspiciousLogin(ctx context.Context,
 		},
 		zap.String("user_id", user.ID.String()),
 		zap.Int("risk_factors", len(riskFactors)),
+	)
+}
+
+// NotifyDeviceEnrolledViaAuthenticator fires after the ZTNA enrollment witness
+// was minted from an authenticator-app code. Security-critical: never silenced.
+func (s *SecurityNotificationService) NotifyDeviceEnrolledViaAuthenticator(ctx context.Context, user *models.User, deviceUUID string, evtCtx securityEventContext) {
+	if user == nil || !s.shouldSend(ctx, user.ID, "") || user.Email == "" {
+		return
+	}
+	s.fireAndLog(
+		"device_witness.totp",
+		func() error {
+			return s.emailService.SendDeviceEnrolledViaAuthenticator(user.TenantID, user.Email, user.Username, deviceUUID, evtCtx)
+		},
+		zap.String("user_id", user.ID.String()),
+		zap.String("device_uuid", deviceUUID),
 	)
 }
 

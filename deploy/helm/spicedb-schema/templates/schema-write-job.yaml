@@ -1,0 +1,331 @@
+{{- /*
+  spicedb-schema-write — the cluster's ONLY SpiceDB WriteSchema caller.
+
+  Why this chart exists (t-582)
+  ==============================
+  SpiceDB's `WriteSchema` RPC REPLACES the entire schema, not merges it.
+  Before this chart, THREE independent actors called it against the same
+  global SpiceDB instance: falcon-id's own PostSync hook, Talon's PreSync
+  hook, and — the one that actually bit us — Talon's `EnsureSchema()` call
+  baked into every pod's startup path via `//go:embed`, using a schema
+  copy that had gone stale relative to the Helm chart's. Whichever call
+  landed last won, silently destroying whatever the others had written.
+  Root-caused via Loki + SpiceDB's own relation_tuple_transaction table:
+  a routine HPA scale-up of talon-talon at 2026-09-07 19:55:08 UTC reverted
+  a 45-definition schema that had been live for only 1h29m45s, back down
+  to Talon's own original 3-definition schema — with zero ArgoCD sync or
+  CI pipeline involved on either side. See board row t-582.
+
+  Fix: exactly one writer for this global resource. Talon's PreSync hook
+  and go-embed WriteSchema call are deleted; falcon-id's PostSync hook is
+  deleted; this chart — synced by its own independent Argo CD Application
+  (spicedb-schema, not owned by falcon-id or Talon) — is now the sole
+  place `WriteSchema` is ever called from. Talon still READS the schema
+  at startup (internal/spicedb/client.go EnsureSchema) to verify its
+  required definitions are live, but never writes.
+
+  Why curl against the HTTP gateway, not the zed CLI
+  ====================================================
+  Both prior hooks independently discovered problems with the plain
+  approach: the authzed/zed image is scratch/distroless (no /bin/sh), so
+  it can't run a verification step in the same container, and Talon's
+  team separately found `zed schema write` "fails silently on every
+  invocation" against ghcr.io/authzed/zed:v0.30.0 (see the now-deleted
+  talon/deploy/helm/talon/templates/spicedb-seed-job.yaml history).
+  curl against SpiceDB's plaintext HTTP gateway on :8443
+  (`HTTPGateway.HTTPTLSCertPath` is empty in the SpiceDB config) with a
+  real shell (curlimages/curl) lets write + self-verify run as one
+  auditable script in one container — proven working in this exact
+  cluster since the 2026-05-09 datastore-migration incident.
+
+  Self-verification (required — do not remove)
+  ==============================================
+  After WriteSchema, this Job calls ReadSchema and asserts every
+  definition name found in files/spicedb.zed is present in the response,
+  using a whitespace-tolerant regex grep (SpiceDB's own schema
+  pretty-printer does not guarantee byte-identical formatting on
+  read-back). Any missing definition fails the Job loudly — the PreSync
+  hook then fails, ArgoCD retries per syncPolicy.retry, and the sync
+  never reports Healthy on a partially-applied schema.
+
+  Lifecycle
+  =========
+  - argocd.argoproj.io/hook: PreSync — establishes the schema before any
+    other resource in this Application's sync (currently none besides
+    this ConfigMap+Job, but keeps the ordering contract explicit for
+    anything added later).
+  - hook-delete-policy: BeforeHookCreation,HookSucceeded — Argo recreates
+    the Job on every sync; deletes after success. HookFailed is
+    deliberately omitted so a failed write/verify leaves its Job + Pod
+    logs around for triage (same convention as falcon-id's former hook).
+
+  ServiceAccount / hook-ordering (t-582 follow-up, 2026-09-08/09)
+  ==================================================================
+  First deploy of this chart looped forever: `serviceaccount.yaml` was a
+  plain (non-hook) resource, but this Job is a PreSync hook — and ArgoCD
+  applies ALL PreSync hooks in a sync before it applies any regular
+  resource. The Job's Pod therefore tried to reference a ServiceAccount
+  that would not exist until later in the same sync
+  ("serviceaccount \"spicedb-schema-spicedb-schema\" not found"), the Pod
+  never got created, and the Job burned its activeDeadlineSeconds every
+  attempt purely on that admission-time "forbidden" — a
+  `DeadlineExceeded` that looked like a SpiceDB outage but had nothing
+  to do with SpiceDB. ArgoCD's own resource list confirmed it:
+  `ServiceAccount ... sync=OutOfSync` sitting next to
+  `Job ... sync=None`, i.e. never even attempted.
+
+  Turning the ServiceAccount into a hook too (lower sync-wave than this
+  Job) would fix the ordering but trade it for a narrower version of the
+  same race: `hook-delete-policy: HookSucceeded` deletes a hook resource
+  as soon as ArgoCD considers it succeeded, and a ServiceAccount (no
+  health check beyond "exists") can be judged succeeded and deleted
+  before this Job's Pod is admitted in the same sync.
+
+  Fixed instead by dropping the custom ServiceAccount entirely: this Job
+  makes zero Kubernetes API calls (only HTTP to SpiceDB's gateway with a
+  preshared key — see above), so it has no need of SA-derived credentials
+  at all. It now runs as the namespace's `default` ServiceAccount, which
+  Kubernetes creates at namespace-creation time — long before ArgoCD ever
+  touches this Application, so there is no ordering dependency left to
+  get wrong. The original `automountServiceAccountToken: false` intent
+  is preserved by setting it on the Pod spec instead of the SA (Pod-level
+  overrides the SA's own setting; confirmed live that the `default` SA in
+  ns `spicedb` has no such override of its own, i.e. would mount a token
+  by default without this). See _helpers.tpl for where the now-removed
+  `spicedb-schema.serviceAccountName` helper used to live.
+
+  Hook-only chart is invisible to sync-status diffing (t-582 follow-up,
+  2026-09-09)
+  ==================================================================
+  Dropping the ServiceAccount above left this chart with exactly two
+  resources, both PreSync hooks. That is a second, independent bug:
+  ArgoCD excludes hook-type resources from `status.sync.status`
+  computation entirely, so an Application whose resource set is ALL
+  hooks can read `Synced` forever regardless of whether a hook's
+  content changed or last actually ran — there is nothing non-hook left
+  for the diff to compare. This was not theoretical: the ServiceAccount
+  fix above sat stuck retrying its OWN pre-fix pinned revision in a live
+  cluster while `sync=Synced` the entire time, because a hook-only
+  resource set gave selfHeal nothing to react to. Left alone, a future
+  edit to files/spicedb.zed would hit the exact same blind spot: the
+  Job's PreSync hook would never be told anything changed, so it would
+  never re-run, and the schema would silently stop updating while the
+  Application sat at Synced/Healthy — worse than the original t-582
+  bug, which at least surfaced on a Talon pod restart.
+
+  Two independent, complementary fixes, not one:
+  1. `checksum/config` below, on this Job's own Pod template: hashes the
+     rendered schema content into the Pod spec, so ANY change to
+     files/spicedb.zed produces a different Job spec. This forces the
+     hook to actually re-run on the next sync — but by itself it is
+     silent at the Application level too, since the Job stays a hook and
+     hooks still aren't diffed for sync-status.
+  2. templates/schema-revision.yaml: a small, deliberately PLAIN (no
+     hook annotations) ConfigMap whose data is the same schema checksum,
+     computed the same way, at render time. Because it carries no hook
+     annotation it IS included in ArgoCD's normal diff — so the same
+     schema edit that changes fix #1's Pod spec also changes this
+     resource's desired manifest, which flips the Application to
+     OutOfSync the ordinary way. That restores an honest sync status at
+     the app level instead of relying on an operator remembering this
+     comment.
+  Fix #2 does NOT prove the write Job itself succeeded — that remains
+  ArgoCD's normal hook-phase accounting (Succeeded/Failed on this Job),
+  which the activeDeadlineSeconds/backoffLimit sizing above already
+  makes fail loudly. Deliberately not written back to by the Job at
+  runtime: doing so would need a ServiceAccount with RBAC to patch a
+  live object, reintroducing the exact class of same-sync ordering
+  hazard the ServiceAccount removal above fixed. It is a static,
+  git-rendered reflection of the desired schema's checksum, nothing
+  more — cheap, no new RBAC, no new dependency ordering.
+*/ -}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spicedb-schema.fullname" . }}
+  labels:
+    {{- include "spicedb-schema.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  # Raw schema text — mounted for the write call and for operator
+  # inspection / breakglass curl.
+  spicedb.zed: |-
+{{ .Files.Get "files/spicedb.zed" | indent 4 }}
+  # JSON-wrapped form — what curl POSTs to SpiceDB's HTTP gateway.
+  # Generated at chart-render time via Helm's `toJson` so the schema's
+  # newlines are properly JSON-escaped; hand-rolling this via shell
+  # heredoc quoting is exactly what bit the 2026-05-09 migration Job.
+  schema.json: |-
+    {{ dict "schema" (.Files.Get "files/spicedb.zed") | toJson }}
+  # One required definition name per line, extracted from the source
+  # file at render time. The verify step asserts each of these is
+  # present in the live schema read back after the write.
+  definitions.txt: |-
+{{- range regexFindAll "definition\\s+[A-Za-z_][A-Za-z0-9_]*\\s*\\{" (.Files.Get "files/spicedb.zed") -1 }}
+    {{ regexReplaceAll "definition\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\{" . "$1" }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "spicedb-schema.fullname" . }}-write
+  labels:
+    {{- include "spicedb-schema.labels" . | nindent 4 }}
+    app.kubernetes.io/component: schema-write
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    # sync-wave 1 = strictly after the ConfigMap (wave 0) is in place.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "spicedb-schema.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: schema-write
+      annotations:
+        # checksum/config (t-582 follow-up, 2026-09-09): hashes the raw
+        # schema content this Job writes, so any change to
+        # files/spicedb.zed changes this Pod template and forces a fresh
+        # PreSync execution on the next sync — see this file's header
+        # comment ("Hook-only chart is invisible to sync-status diffing")
+        # for why this alone is not sufficient at the Application level,
+        # and templates/schema-revision.yaml for the complementary fix.
+        checksum/config: {{ .Files.Get "files/spicedb.zed" | sha256sum | quote }}
+        # No mesh injection: the Job hits SpiceDB's plaintext HTTP
+        # gateway (:8443) and curlimages/curl has no linkerd-await
+        # binary to gate main-container start on sidecar readiness /
+        # signal the sidecar to exit after the main container completes
+        # — without this the Job's Pod never reaches Completed and
+        # burns activeDeadlineSeconds even on a successful write. Same
+        # pattern as both now-deleted predecessor hooks. The call is
+        # already authenticated via the SpiceDB PSK bearer token; the
+        # NetworkPolicy allow-spicedb overlay is the access control here.
+        linkerd.io/inject: disabled
+    spec:
+      # No serviceAccountName: runs as the namespace's built-in `default`
+      # ServiceAccount — deliberately, not an oversight. See this file's
+      # header comment (t-582 hook-ordering incident) for why a dedicated
+      # ServiceAccount doesn't work here, and _helpers.tpl for the same
+      # note where the old serviceAccountName helper used to live.
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: write-and-verify
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              ENDPOINT="{{ .Values.spicedb.endpoint }}"
+              GW_HOST="$(echo "$ENDPOINT" | cut -d: -f1)"
+              GW_URL="http://$GW_HOST:8443"
+
+              echo "==> POST $GW_URL/v1/schema/write"
+              # curl only exits non-zero on TRANSPORT failure (no --fail
+              # flag, deliberately — a non-200 still needs to reach the
+              # body-check below for diagnostics). The `|| { ...; exit 1; }`
+              # form is one of POSIX's documented exceptions to `set -e`
+              # aborting mid-expression, so a transport failure (SpiceDB
+              # unreachable) still gets our own loud message instead of
+              # silently dying inside the command substitution.
+              CODE=$(curl -sS -o /tmp/write-resp.json -w "%{http_code}" \
+                --max-time 20 -X POST \
+                -H "Authorization: Bearer $SPICEDB_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @/etc/spicedb-schema/schema.json \
+                "$GW_URL/v1/schema/write") || {
+                echo "==> curl transport failure calling WriteSchema — is SpiceDB ($GW_URL) up?"
+                exit 1
+              }
+              echo "    HTTP $CODE"
+              cat /tmp/write-resp.json; echo
+              if [ "$CODE" != "200" ]; then
+                echo "==> WriteSchema FAILED (HTTP $CODE) — schema NOT applied"
+                exit 1
+              fi
+
+              echo "==> POST $GW_URL/v1/schema/read (self-verification — required, do not skip)"
+              CODE=$(curl -sS -o /tmp/read-resp.json -w "%{http_code}" \
+                --max-time 15 -X POST \
+                -H "Authorization: Bearer $SPICEDB_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data '{}' \
+                "$GW_URL/v1/schema/read") || {
+                echo "==> curl transport failure calling ReadSchema — cannot verify the write, failing loudly"
+                exit 1
+              }
+              echo "    HTTP $CODE"
+              if [ "$CODE" != "200" ]; then
+                echo "==> ReadSchema FAILED (HTTP $CODE) — cannot verify the write, failing loudly"
+                exit 1
+              fi
+
+              echo "==> asserting every required definition is present in the live (read-back) schema"
+              MISSING=""
+              COUNT=0
+              while IFS= read -r NAME; do
+                [ -z "$NAME" ] && continue
+                COUNT=$((COUNT + 1))
+                # Whitespace-tolerant: SpiceDB's own schema pretty-printer
+                # does not guarantee byte-identical spacing on read-back.
+                if ! grep -qE "definition[[:space:]]+${NAME}[[:space:]]*\{" /tmp/read-resp.json; then
+                  MISSING="$MISSING $NAME"
+                fi
+              done < /etc/spicedb-schema/definitions.txt
+
+              if [ "$COUNT" -eq 0 ]; then
+                echo "==> BUG: definitions.txt was empty — refusing to report a false pass"
+                exit 1
+              fi
+
+              if [ -n "$MISSING" ]; then
+                echo "==> SCHEMA VERIFICATION FAILED — missing definition(s):$MISSING"
+                echo "==> live schema as read back (for triage):"
+                cat /tmp/read-resp.json; echo
+                exit 1
+              fi
+
+              echo "==> OK: all $COUNT required definitions verified present in the live schema"
+          env:
+            - name: SPICEDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.spicedb.pskSecret.name }}
+                  key: {{ .Values.spicedb.pskSecret.key }}
+          volumeMounts:
+            - name: schema
+              mountPath: /etc/spicedb-schema
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.job.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: schema
+          configMap:
+            name: {{ include "spicedb-schema.fullname" . }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

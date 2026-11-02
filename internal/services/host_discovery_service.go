@@ -212,10 +212,10 @@ var ErrHostPending = errors.New("host_discovery: pending verification")
 // NormalizeHost converts a raw Host header value into the canonical
 // lookup key:
 //
-//	1. Strip port suffix (":443", ":80", any explicit port)
-//	2. Trim whitespace + trailing dot (RFC 1034 absolute notation)
-//	3. Lowercase ASCII
-//	4. IDNA-encode (Unicode → xn--… punycode)
+//  1. Strip port suffix (":443", ":80", any explicit port)
+//  2. Trim whitespace + trailing dot (RFC 1034 absolute notation)
+//  3. Lowercase ASCII
+//  4. IDNA-encode (Unicode → xn--… punycode)
 //
 // Returns an error for empty / malformed values so callers can
 // reject with 400 BadRequest before hitting the DB.
@@ -395,7 +395,7 @@ func (s *HostDiscoveryService) DiscoverBySlug(ctx context.Context, rawSlug strin
 		if entry.notFound {
 			return nil, ErrTenantSlugNotFound
 		}
-		if entry.resp != nil && entry.resp.Status != tenantStatusActive && entry.resp.Status != tenantStatusTrial {
+		if entry.resp != nil && !slugLifecycleDiscoverable(entry.resp) {
 			return nil, ErrTenantSlugSuspended
 		}
 		return entry.resp, nil
@@ -417,12 +417,14 @@ func (s *HostDiscoveryService) DiscoverBySlug(ctx context.Context, rawSlug strin
 	}
 
 	resp := &models.TenantSlugDiscoveryResponse{
-		TenantID: tenant.ID,
-		Slug:     tenant.Slug,
-		Status:   tenant.Status,
+		TenantID:           tenant.ID,
+		Slug:               tenant.Slug,
+		Status:             tenant.Status,
+		TrialAccessExpired: tenant.Metadata["trial_access_expired"] == true,
+		RecoveryOnly:       tenant.Metadata["trial_access_expired"] == true && tenant.Metadata["has_independent_entitlements"] != true,
 	}
 
-	if tenant.Status != tenantStatusActive && tenant.Status != tenantStatusTrial {
+	if !slugLifecycleDiscoverable(resp) {
 		// Cache POSITIVELY here (unlike suspended hosts in Discover
 		// above): the slug genuinely belongs to a real, known tenant —
 		// only its serving status changed. Caching the fact avoids a
@@ -437,6 +439,17 @@ func (s *HostDiscoveryService) DiscoverBySlug(ctx context.Context, rawSlug strin
 
 	s.storePositiveSlug(slug, resp)
 	return resp, nil
+}
+
+// Discovery is routing, never authorization. A genuine expired-trial tenant
+// can still reach login/billing and independently active comp modules. Normal
+// operator suspensions/deletions remain non-discoverable without this Core
+// projection marker; module and tenant-status gates enforce actual access.
+func slugLifecycleDiscoverable(resp *models.TenantSlugDiscoveryResponse) bool {
+	if resp.Status == tenantStatusActive || resp.Status == tenantStatusTrial {
+		return true
+	}
+	return resp.TrialAccessExpired && (resp.Status == "suspended" || resp.Status == "canceled" || resp.Status == "cancelled")
 }
 
 func (s *HostDiscoveryService) storePositiveSlug(slug string, resp *models.TenantSlugDiscoveryResponse) {
@@ -477,10 +490,10 @@ func (s *HostDiscoveryService) InvalidateSlug(slug string) {
 // normalizes the host, generates a 64-char verification token, and
 // inserts a `pending_verification` row.
 type ClaimHostRequest struct {
-	TenantID        uuid.UUID `json:"-"`
-	Host            string    `json:"host" binding:"required"`
-	CanonicalURL    string    `json:"canonical_url" binding:"required,url"`
-	DefaultClientID *string   `json:"default_client_id,omitempty"`
+	TenantID         uuid.UUID       `json:"-"`
+	Host             string          `json:"host" binding:"required"`
+	CanonicalURL     string          `json:"canonical_url" binding:"required,url"`
+	DefaultClientID  *string         `json:"default_client_id,omitempty"`
 	BrandingOverride json.RawMessage `json:"branding_override,omitempty"`
 }
 

@@ -2,7 +2,15 @@
 
 package spicedb
 
-import "strings"
+import (
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// objectIDPattern is SpiceDB's ObjectId charset minus the lone-"*" alternative:
+// a permission name must never become the wildcard object id.
+var objectIDPattern = regexp.MustCompile(`^[a-zA-Z0-9/_|\-=+]{1,}$`)
 
 // PermissionToSpiceDBID translates an IAM permission name containing colons
 // into a SpiceDB-safe ObjectId.
@@ -28,4 +36,16 @@ func PermissionToSpiceDBID(permission string) string {
 //	"billing"             -> "billing"  (passthrough)
 func IDToPermission(spicedbID string) string {
 	return strings.ReplaceAll(spicedbID, "__", ":")
+}
+
+// PermissionToSpiceDBIDChecked is PermissionToSpiceDBID plus validation against
+// the SpiceDB ObjectId regex. Write paths must use it so a name that cannot be
+// an object id (e.g. an unexpanded wildcard "core:parties:*") fails loudly
+// instead of reaching SpiceDB as an InvalidArgument.
+func PermissionToSpiceDBIDChecked(permission string) (string, error) {
+	id := PermissionToSpiceDBID(permission)
+	if !objectIDPattern.MatchString(id) {
+		return "", fmt.Errorf("permission %q maps to invalid SpiceDB object id %q", permission, id)
+	}
+	return id, nil
 }

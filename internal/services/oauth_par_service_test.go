@@ -415,6 +415,11 @@ func (t *noopOAuthClientTx) MarkAuthorizationCodeUsedCAS(_ context.Context, _ uu
 func (t *noopOAuthClientTx) CreateOAuthToken(_ context.Context, _ *models.OAuthToken) error {
 	return nil
 }
+func (t *noopOAuthClientTx) LockRefreshRecovery(_ context.Context, _, _ uuid.UUID) (repositories.RefreshRecoveryOutcome, error) {
+	return repositories.RefreshRecoveryOK, nil
+}
+func (t *noopOAuthClientTx) SetTokenReplacedBy(_ context.Context, _, _ uuid.UUID) error { return nil }
+func (t *noopOAuthClientTx) RepointTokenReplacedBy(_ context.Context, _, _, _ uuid.UUID) error { return nil }
 func (t *noopOAuthClientTx) Commit(_ context.Context) error   { return nil }
 func (t *noopOAuthClientTx) Rollback(_ context.Context) error { return nil }
 
@@ -433,8 +438,20 @@ func (r *noopOAuthClientRepo) ConsumeRefreshToken(_ context.Context, _ uuid.UUID
 	return true, nil
 }
 
+func (r *noopOAuthClientRepo) SetTokenReplacedBy(_ context.Context, _, _ uuid.UUID) error {
+	return nil
+}
+func (r *noopOAuthClientRepo) RefreshSuccessorUnused(_ context.Context, _ uuid.UUID) (bool, error) {
+	return false, nil
+}
 func (r *noopOAuthClientRepo) RevokeRefreshTokenFamily(_ context.Context, _ uuid.UUID) (int64, error) {
 	return 0, nil
+}
+func (r *noopOAuthClientRepo) RevokeTokensBySession(_ context.Context, _, _ uuid.UUID) (int64, error) {
+	return 0, nil
+}
+func (r *noopOAuthClientRepo) ListSessionIDsByIdpSession(_ context.Context, _, _ uuid.UUID) ([]uuid.UUID, error) {
+	return nil, nil
 }
 func (r *noopOAuthClientRepo) RevokeAllClientTokens(_ context.Context, _ uuid.UUID) error { return nil }
 func (r *noopOAuthClientRepo) RevokeUserClientTokens(_ context.Context, _, _ uuid.UUID) error {

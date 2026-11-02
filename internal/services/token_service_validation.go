@@ -49,6 +49,12 @@ func (s *TokenService) ValidateAccessTokenWithContext(ctx context.Context, token
 	if !ok {
 		return nil, fmt.Errorf("invalid token claims")
 	}
+	// Tenant API key tokens are signed with the same provider key but are
+	// minted for the business API audience only; falcon-id is never their
+	// audience, so they must not authenticate its own /api/v1/* routes.
+	if typ, _ := mapClaims["type"].(string); typ == APIKeyTokenType {
+		return nil, fmt.Errorf("invalid token: API key tokens are not accepted here")
+	}
 
 	claims, err := s.extractClaimsByVersion(ctx, mapClaims)
 	if err != nil {
@@ -56,6 +62,12 @@ func (s *TokenService) ValidateAccessTokenWithContext(ctx context.Context, token
 	}
 
 	if err := s.enforceBlacklist(ctx, claims); err != nil {
+		return nil, err
+	}
+
+	// Tenant suspension gate (R1-GAPS row 27): an access token minted before
+	// the suspension must stop working immediately, not at natural expiry.
+	if err := checkTenantNotSuspended(ctx, s.tenantSuspension, claims.TenantID); err != nil {
 		return nil, err
 	}
 
@@ -357,7 +369,7 @@ func (s *TokenService) enforceBlacklist(ctx context.Context, claims *models.Clai
 		return nil
 	}
 
-	if err := s.checkSessionBlacklist(ctx, claims.SessionID); err != nil {
+	if err := s.checkSessionBlacklist(ctx, claims.SessionID, claims.RealmID); err != nil {
 		return err
 	}
 
@@ -366,7 +378,7 @@ func (s *TokenService) enforceBlacklist(ctx context.Context, claims *models.Clai
 
 // checkSessionBlacklist verifies the session has not been revoked.
 // Falls back to the database when Redis returns a non-availability error.
-func (s *TokenService) checkSessionBlacklist(ctx context.Context, sessionID uuid.UUID) error {
+func (s *TokenService) checkSessionBlacklist(ctx context.Context, sessionID uuid.UUID, realmID uuid.UUID) error {
 	blacklisted, reason, err := s.tokenBlacklist.IsSessionBlacklisted(ctx, sessionID)
 	if err == nil {
 		if blacklisted {
@@ -388,12 +400,12 @@ func (s *TokenService) checkSessionBlacklist(ctx context.Context, sessionID uuid
 		zap.String("session_id", sessionID.String()),
 	)
 
-	return s.checkSessionActiveInDB(ctx, sessionID)
+	return s.checkSessionActiveInDB(ctx, sessionID, realmID)
 }
 
 // checkSessionActiveInDB performs a database fallback when Redis is unavailable.
 // Fails closed when no database fallback is configured.
-func (s *TokenService) checkSessionActiveInDB(ctx context.Context, sessionID uuid.UUID) error {
+func (s *TokenService) checkSessionActiveInDB(ctx context.Context, sessionID uuid.UUID, realmID uuid.UUID) error {
 	if s.sessionRepo == nil {
 		logger.Error("SECURITY: No database fallback available for session verification - denying access",
 			zap.String("session_id", sessionID.String()),
@@ -401,7 +413,23 @@ func (s *TokenService) checkSessionActiveInDB(ctx context.Context, sessionID uui
 		return fmt.Errorf("unable to verify session status")
 	}
 
-	session, dbErr := s.sessionRepo.GetByID(ctx, sessionID)
+	// RLS bootstrap: iam_sessions' RLS policy (strict_realm_sessions) is
+	// realm-scoped. realmID comes from the already signature-verified JWT's
+	// `rid` claim. Without it, this lookup would run with no RLS context and
+	// either (a) return zero rows under FORCE RLS — silently treating a
+	// live, non-blacklisted session as inactive and denying a legitimate
+	// user, or (b) once RLS is force-enabled on this table, fail closed the
+	// same way. A missing/zero realmID is refused rather than silently
+	// falling back to the unscoped GetByID, because that fallback is
+	// exactly the shape of query this whole effort is trying to eliminate.
+	if realmID == uuid.Nil {
+		logger.Error("SECURITY: session blacklist DB fallback has no realm context - denying access (fail-closed)",
+			zap.String("session_id", sessionID.String()),
+		)
+		return fmt.Errorf("unable to verify session status")
+	}
+
+	session, dbErr := s.sessionRepo.GetByIDWithRealmContext(ctx, sessionID, realmID)
 	if dbErr != nil {
 		logger.Error("Database session check also failed during Redis error",
 			zap.Error(dbErr),

@@ -18,6 +18,7 @@ import (
 
 // AdminHandler is an exported type.
 type AdminHandler struct {
+	accessTerminator adminAccessTerminator
 	userService           *services.UserService
 	roleService           *services.RoleService
 	sessionRepo           *repositories.SessionRepository
@@ -30,6 +31,7 @@ type AdminHandler struct {
 	ipRuleService         *services.IPRuleService
 	deviceService         *services.DeviceService
 	ldapSyncHistoryRepo   *repositories.LDAPSyncHistoryRepository
+	tokenService          *services.TokenService
 	tokenBlacklist        *redis.TokenBlacklist
 	encryptionService     *crypto.EncryptionService
 	logger                *zap.Logger
@@ -56,6 +58,18 @@ func NewAdminHandler(
 	}
 }
 
+// adminAccessTerminator is the single access-termination path (satisfied by
+// *services.UserAccessTerminator).
+type adminAccessTerminator interface {
+	TerminateUserAccessWith(ctx context.Context, userID, tenantID uuid.UUID, reason string, opts services.TerminateOptions) error
+	TerminateSession(ctx context.Context, userID, tenantID, sessionID uuid.UUID, reason string) error
+}
+
+// SetAccessTerminator wires the access terminator used by session revoke endpoints.
+func (h *AdminHandler) SetAccessTerminator(t adminAccessTerminator) {
+	h.accessTerminator = t
+}
+
 // SetMFAService sets the MFA service (called after initialization)
 func (h *AdminHandler) SetMFAService(mfaService *services.MFAService) {
 	h.mfaService = mfaService
@@ -79,6 +93,12 @@ func (h *AdminHandler) SetIPRuleService(service *services.IPRuleService) {
 // SetDeviceService sets the device service (called after initialization)
 func (h *AdminHandler) SetDeviceService(service *services.DeviceService) {
 	h.deviceService = service
+}
+
+// SetTokenService wires the token service so admin session revocation also
+// revokes the refresh tokens bound to the revoked sessions (called after initialization)
+func (h *AdminHandler) SetTokenService(svc *services.TokenService) {
+	h.tokenService = svc
 }
 
 // SetTokenBlacklist sets the token blacklist for session revocation (called after initialization)

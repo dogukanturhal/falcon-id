@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -14,45 +15,107 @@ import (
 	"github.com/dogukanturhal/falcon-id/internal/models"
 )
 
-// TestSignupService_CompleteSignup_PlanRequired proves the commercial-gap
-// fix directly: an empty PlanCode is rejected with
-// SignupStateError{Code: "plan_required"} BEFORE any tenant/user
-// provisioning happens, for both business and personal account types.
-// This is the control for the enforcement claim — with the check removed,
-// this test fails (verified manually while developing the fix).
-func TestSignupService_CompleteSignup_PlanRequired(t *testing.T) {
-	for _, accountType := range []string{"business", "personal"} {
-		t.Run(accountType, func(t *testing.T) {
-			t.Parallel()
+// TestSignupService_CompleteSignup_PlanCodeOptional proves the signup
+// wizard's removed plan-selection step (2026-09-18, t-signup-no-plan-step)
+// cannot block signup: CompleteSignup with an empty PlanCode now succeeds
+// and provisions the tenant/user exactly like a populated PlanCode would,
+// for both business and personal account types.
+//
+// This is the CONTROL for "removing plan_required did not reopen the
+// original bug": e75eeb7 (2026-09-17) added a check that made this exact
+// call fail with SignupStateError{Code: "plan_required"}. If that check
+// were still present (or reintroduced), this test fails with a
+// *SignupStateError — run it against a checkout of e75eeb7 to see it fail.
+// What makes the ORIGINAL gap (empty plan -> no trial subscription row
+// ever created) safe to reopen here is verified separately in
+// TestSignupService_CompleteSignup_EmptyPlanCode_ReachesPlanAwareHook
+// (signup_service_hook_test.go): the empty PlanCode is forwarded, not
+// dropped, to the plan-aware post-signup hook, whose production
+// implementation calls subscription-management's StartTrial — which
+// resolves an empty PackageCode via packageRepo.FindDefault instead of
+// refusing (see platform-commerce trial.go's 2026-09-18
+// reverse-trial-redesign doc comment, verified live against
+// hexxlock_subscription_management.subscription_packages:
+// is_default=true, trial_enabled=true on package "scale").
+func TestSignupService_CompleteSignup_PlanCodeOptional(t *testing.T) {
+	t.Run("personal", func(t *testing.T) {
+		t.Parallel()
 
-			repo := &mockSignupRequestRepo{}
-			emailSvc := &mockSignupEmailSender{}
-			tenantSvc := &mockSignupTenantCreator{}
-			userSvc := &mockSignupUserCreator{}
-			lookup := &mockSignupUserLookup{}
+		repo := &mockSignupRequestRepo{}
+		emailSvc := &mockSignupEmailSender{}
+		tenantSvc := &mockSignupTenantCreator{}
+		userSvc := &mockSignupUserCreator{}
+		lookup := &mockSignupUserLookup{}
 
-			svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+		svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
 
-			req := verifiedRequest("plan-required@example.com", accountType)
-			repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
+		req := verifiedRequest("plan-optional-personal@example.com", "personal")
+		consumerTenant := &models.Tenant{
+			ID:   models.WellKnownTenantConsumer,
+			Slug: "hexxlock-consumer",
+			Type: models.TenantType("consumer"),
+		}
+		user := fakeUser(consumerTenant.ID, req.Email)
 
-			_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
-				SignupRequestID: req.ID,
-				Password:        "Sup3rSecure1!",
-				// PlanCode deliberately left empty.
-			}, "", "")
+		repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
+		tenantSvc.On("GetByID", mock.Anything, models.WellKnownTenantConsumer).Return(consumerTenant, nil)
+		userSvc.On("CreateForSignup", mock.Anything, mock.Anything, mock.Anything).Return(user, nil)
+		repo.On("MarkCompleted", mock.Anything, req.ID, consumerTenant.ID, user.ID).Return(nil)
 
-			require.Error(t, err)
-			var stateErr *SignupStateError
-			require.ErrorAs(t, err, &stateErr)
-			assert.Equal(t, "plan_required", stateErr.Code)
+		result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
+			SignupRequestID: req.ID,
+			Password:        "Sup3rSecure1!",
+			// PlanCode deliberately left empty — this is what the signup
+			// wizard now always sends, since it has no plan-selection step.
+		}, "", "")
 
-			tenantSvc.AssertNotCalled(t, "CreateTenant")
-			tenantSvc.AssertNotCalled(t, "GetByID")
-			userSvc.AssertNotCalled(t, "CreateForSignup")
-			repo.AssertNotCalled(t, "MarkCompleted")
-		})
-	}
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		repo.AssertExpectations(t)
+	})
+
+	t.Run("business", func(t *testing.T) {
+		t.Parallel()
+
+		repo := &mockSignupRequestRepo{}
+		emailSvc := &mockSignupEmailSender{}
+		tenantSvc := &mockSignupTenantCreator{}
+		userSvc := &mockSignupUserCreator{}
+		lookup := &mockSignupUserLookup{}
+
+		svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+
+		companyName := testAcmeCorpOrg
+		companySlug := testTenantSlugAcme
+		req := verifiedRequest("plan-optional-biz@acme.com", "business")
+		req.CompanyName = &companyName
+		req.CompanySlug = &companySlug
+
+		// stubTenantManagementRegistrar (wired by buildSignupService) mints
+		// its own random ID per call, so the tenant fixture just needs a
+		// fixed ID for CreateTenant to hand back — the real registrar ID
+		// isn't asserted here, only that provisioning completes.
+		tenant := &models.Tenant{ID: uuid.New(), Name: testAcmeCorpOrg, Type: "customer"}
+		user := fakeUser(tenant.ID, req.Email)
+
+		repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
+		repo.On("SetProvisionedTenant", mock.Anything, req.ID, mock.Anything, testTenantSlugAcme).Return(nil)
+		tenantSvc.On("CreateTenant", mock.Anything, mock.MatchedBy(func(r *models.CreateTenantRequest) bool {
+			return r.Slug == testTenantSlugAcme && r.ID != nil
+		})).Return(tenant, nil)
+		userSvc.On("CreateForSignup", mock.Anything, mock.Anything, mock.Anything).Return(user, nil)
+		repo.On("MarkCompleted", mock.Anything, req.ID, tenant.ID, user.ID).Return(nil)
+
+		result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
+			SignupRequestID: req.ID,
+			Password:        "AcmeSecure1!",
+			// PlanCode deliberately left empty.
+		}, "", "")
+
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		repo.AssertExpectations(t)
+	})
 }
 
 // TestSlugWordLists_ExcludeReserved is the control referenced by the doc

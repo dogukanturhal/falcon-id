@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/services"
 )
 
 const (
@@ -87,6 +89,21 @@ func (h *AdminHandler) RevokeSession(c *gin.Context) {
 		return
 	}
 
+	if h.accessTerminator != nil {
+		// Ends the row, the tokens bound to it (by row id and by its IdP SSO
+		// session id), the SSO cookie state and the session's access JWTs.
+		if err := h.accessTerminator.TerminateSession(c.Request.Context(), session.UserID, h.targetTenantID(c.Request.Context(), session.UserID, currentUser), sessionID, msgRevokedByAdmin); err != nil {
+			h.logger.Error("Failed to fully revoke session",
+				zap.String("session_id", sessionID.String()),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke session"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Session revoked successfully"})
+		return
+	}
+
 	err = h.sessionRepo.EndSession(c.Request.Context(), sessionID, msgRevokedByAdmin)
 	if err != nil {
 		h.logger.Error("Failed to revoke session",
@@ -96,6 +113,10 @@ func (h *AdminHandler) RevokeSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke session"})
 		return
 	}
+
+	// EndSession is idempotent and, for this explicit reason, also revoked the
+	// refresh tokens bound to the session (and their families) in the same
+	// statement, even when the row was already ended.
 
 	if h.tokenBlacklist != nil {
 		if err := h.tokenBlacklist.BlacklistSession(c.Request.Context(), sessionID, msgRevokedByAdmin, 24*time.Hour); err != nil {
@@ -140,6 +161,21 @@ func (h *AdminHandler) RevokeUserSessions(c *gin.Context) {
 		return
 	}
 
+	if h.accessTerminator != nil {
+		// Per-session blacklist only: the user-wide marker would block the
+		// user's next login (and lock an admin out when revoking themselves).
+		if err := h.accessTerminator.TerminateUserAccessWith(c.Request.Context(), userID, h.targetTenantID(c.Request.Context(), userID, currentUser), msgRevokedByAdmin, services.TerminateOptions{}); err != nil {
+			h.logger.Error("Failed to fully revoke user access",
+				zap.String("user_id", userID.String()),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke sessions"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "All user sessions revoked successfully"})
+		return
+	}
+
 	sessions, _ := h.sessionRepo.GetActiveSessions(c.Request.Context(), userID)
 
 	err = h.sessionRepo.EndAllUserSessions(c.Request.Context(), userID, msgRevokedByAdmin)
@@ -150,6 +186,17 @@ func (h *AdminHandler) RevokeUserSessions(c *gin.Context) {
 		)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke sessions"})
 		return
+	}
+
+	if h.tokenService != nil {
+		if err := h.tokenService.RevokeAllUserOAuthTokens(c.Request.Context(), userID, msgRevokedByAdmin); err != nil {
+			h.logger.Error("Failed to revoke user OAuth tokens",
+				zap.String("user_id", userID.String()),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke session tokens"})
+			return
+		}
 	}
 
 	if h.tokenBlacklist != nil {
@@ -211,4 +258,16 @@ func (h *AdminHandler) loadSessionResponses(c *gin.Context, currentUser *models.
 		responses[i] = *session.ToResponse(nil)
 	}
 	return responses, true
+}
+
+// targetTenantID resolves the tenant of the user whose access is being ended
+// (a platform admin may act across tenants, and back-channel logout fans out
+// per tenant). Falls back to the caller's tenant when the lookup fails.
+func (h *AdminHandler) targetTenantID(ctx context.Context, userID uuid.UUID, currentUser *models.CurrentUser) uuid.UUID {
+	if h.userService != nil {
+		if u, err := h.userService.GetByID(ctx, userID); err == nil && u != nil {
+			return u.TenantID
+		}
+	}
+	return currentUser.TenantID
 }

@@ -27,6 +27,12 @@ permissions:
   - resource: api-keys
     actions: [create, read, update, delete, rotate]
     description: API key management
+  - resource: api_keys
+    actions: [read, manage]
+    description: Tenant API keys (developer access)
+  - resource: webhooks
+    actions: [read, manage]
+    description: Tenant webhook endpoints (developer access)
   - resource: audit-logs
     actions: [read, export]
     description: Security audit trail

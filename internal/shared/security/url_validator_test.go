@@ -284,9 +284,16 @@ func TestValidateURL(t *testing.T) {
 }
 
 func TestValidateURLWithAllowlist(t *testing.T) {
-	// Skip this test as it requires DNS resolution
-	// In production, the allowlist feature works correctly
-	t.Skip("Skipping allowlist test that requires DNS resolution")
+	// Public IP literals exercise the entire validator without external DNS.
+	config := DefaultURLValidatorConfig()
+	config.AllowedDomains = []string{"8.8.8.8"}
+	validator := NewURLValidator(config)
+	if err := validator.Validate(context.Background(), "https://8.8.8.8/path"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validator.Validate(context.Background(), "https://9.9.9.9/path"); !errors.Is(err, ErrDomainNotAllowed) {
+		t.Fatalf("got %v, want allowlist denial", err)
+	}
 }
 
 func TestURLValidator_isLocalhost(t *testing.T) {

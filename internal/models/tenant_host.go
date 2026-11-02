@@ -110,14 +110,14 @@ type TenantHost struct {
 // payload only on the internal-cluster path; the SDK uses it to build
 // the OIDC authorize URL + branding without an extra trip to /tenants.
 type HostDiscoveryResponse struct {
-	TenantID        uuid.UUID         `json:"tenant_id"`
-	Host            string            `json:"host"`
-	CanonicalURL    string            `json:"canonical_url"`
-	Issuer          string            `json:"issuer"`
-	Status          TenantHostStatus  `json:"status"`
-	DefaultClientID *string           `json:"default_client_id,omitempty"`
-	Branding        map[string]any    `json:"branding,omitempty"`
-	VerifiedAt      *time.Time        `json:"verified_at,omitempty"`
+	TenantID        uuid.UUID        `json:"tenant_id"`
+	Host            string           `json:"host"`
+	CanonicalURL    string           `json:"canonical_url"`
+	Issuer          string           `json:"issuer"`
+	Status          TenantHostStatus `json:"status"`
+	DefaultClientID *string          `json:"default_client_id,omitempty"`
+	Branding        map[string]any   `json:"branding,omitempty"`
+	VerifiedAt      *time.Time       `json:"verified_at,omitempty"`
 }
 
 // TenantSlugDiscoveryResponse is the payload served by
@@ -139,7 +139,9 @@ type HostDiscoveryResponse struct {
 // the edge middleware, not a branding/OIDC payload, so it carries none
 // of HostDiscoveryResponse's canonical_url/issuer/branding fields.
 type TenantSlugDiscoveryResponse struct {
-	TenantID uuid.UUID `json:"tenant_id"`
-	Slug     string    `json:"slug"`
-	Status   string    `json:"status"`
+	TrialAccessExpired bool      `json:"trial_access_expired,omitempty"`
+	RecoveryOnly       bool      `json:"recovery_only,omitempty"`
+	TenantID           uuid.UUID `json:"tenant_id"`
+	Slug               string    `json:"slug"`
+	Status             string    `json:"status"`
 }

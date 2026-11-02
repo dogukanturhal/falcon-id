@@ -3,9 +3,35 @@
 package services
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+// ErrTenantSuspended is returned by login, session creation, token issue,
+// refresh and token validation when the caller's tenant has been suspended by
+// an operator (R1-GAPS row 27). Its message is the stable wire error code
+// `tenant_suspended`; handlers map it to HTTP 403 {"error":"tenant_suspended"}.
+var ErrTenantSuspended = errors.New("tenant_suspended")
+
+// TenantSuspensionChecker reports whether a tenant is currently suspended. The
+// implementation (internal/tenantstatus.Gate) fails OPEN: unknown tenants and
+// read errors are "not suspended". A nil checker disables enforcement.
+type TenantSuspensionChecker interface {
+	IsSuspended(ctx context.Context, tenantID uuid.UUID) bool
+}
+
+// checkTenantNotSuspended returns ErrTenantSuspended when checker reports
+// tenantID suspended; nil-safe on the checker.
+func checkTenantNotSuspended(ctx context.Context, checker TenantSuspensionChecker, tenantID uuid.UUID) error {
+	if checker != nil && checker.IsSuspended(ctx, tenantID) {
+		return ErrTenantSuspended
+	}
+	return nil
+}
 
 // AccountLockedError is returned by login-path pre-auth checks when
 // the user account is in the locked state. It carries the unlock

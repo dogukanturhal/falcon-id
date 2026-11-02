@@ -386,7 +386,7 @@ func TestLicense_ToResponse(t *testing.T) {
 			ID:          id,
 			ProductID:   productID,
 			TenantID:    tenantID,
-			LicenseKey:  "HEXX-ABCD-1234-EFGH-5678", // gitleaks:allow — test fixture, not a real credential
+			LicenseKey:  "HEXX-ABCD-1234-EFGH-5678",
 			Type:        LicenseTypeEnterprise,
 			Status:      LicenseStatusRevoked,
 			MaxSeats:    50,
@@ -631,7 +631,7 @@ func TestLicense_ToResponseWithKey(t *testing.T) {
 			ID:         uuid.New(),
 			ProductID:  uuid.New(),
 			TenantID:   uuid.New(),
-			LicenseKey: "HEXX-ABCD-1234-EFGH-5678", // gitleaks:allow — test fixture, not a real credential
+			LicenseKey: "HEXX-ABCD-1234-EFGH-5678",
 			Type:       LicenseTypeStandard,
 			Status:     LicenseStatusActive,
 			MaxSeats:   10,

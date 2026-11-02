@@ -13,7 +13,7 @@ import (
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
 
-// OnboardingVerifyHandler backs the Mearax onboarding wizard's contact-
+// OnboardingVerifyHandler backs the AcmeWeb onboarding wizard's contact-
 // verification steps ("Add your mobile number" / "Confirm your mobile
 // number" in the Brevo-mirrored flow). IMPORTANT: the code is delivered by
 // EMAIL, not SMS — see services.MFAService's onboarding-verify doc comment

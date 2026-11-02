@@ -74,6 +74,7 @@ type authorizationServiceAPI interface {
 	Authorize(ctx context.Context, req *models.AuthorizeRequest) (*models.AuthorizeResponse, error)
 	AuthorizeBatch(ctx context.Context, req *models.BatchAuthorizeRequest) (*models.BatchAuthorizeResponse, error)
 	GetEffectivePermissions(ctx context.Context, userID, tenantID uuid.UUID) (*models.EffectivePermissionsResponse, error)
+	Simulate(ctx context.Context, actorID, userID, tenantID uuid.UUID, permission string) (*models.SimulateResponse, error)
 }
 
 // userLookupAPI is the narrow slice of *services.UserService that
@@ -210,5 +211,76 @@ func (h *AuthorizationHandler) GetEffectivePermissions(c *gin.Context) {
 		return
 	}
 
+	c.JSON(http.StatusOK, result)
+}
+
+// sameTenantTarget resolves userID and proves it belongs to the caller's own
+// tenant. Fail closed: no user service, lookup error, or a user in another
+// tenant all answer 404 "User not found" (never confirming the id exists
+// elsewhere). Returns false once a response has been written.
+func (h *AuthorizationHandler) sameTenantTarget(c *gin.Context, caller *models.CurrentUser, userID uuid.UUID) bool {
+	if h.userService == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user lookup unavailable"})
+		return false
+	}
+	target, err := h.userService.GetByID(c.Request.Context(), userID)
+	if err != nil || target == nil || target.TenantID != caller.TenantID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return false
+	}
+	return true
+}
+
+// Simulate evaluates "can user X do Y, and why" as another user of the
+// caller's OWN tenant (policy simulator, spec 23 §7/§8 #18). Route-gated to
+// tenant admins; the tenant comes from the verified session, never the body,
+// and the target user must belong to it. Every simulation is audited.
+// @Router /api/v1/authorize/simulate [post]
+func (h *AuthorizationHandler) Simulate(c *gin.Context) {
+	var req models.SimulateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	caller := middleware.GetCurrentUser(c)
+	if caller == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	if !h.sameTenantTarget(c, caller, req.UserID) {
+		return
+	}
+	result, err := h.authorizationService.Simulate(c.Request.Context(), caller.ID, req.UserID, caller.TenantID, req.Permission)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetEffectivePermissionsByQuery is GET /api/v1/authorize/effective-permissions
+// ?userId=: the flattened effective-permission set of one user of the caller's
+// own tenant (user access detail screen + CSV export). Route-gated to tenant
+// admins; cross-tenant targets answer 404.
+// @Router /api/v1/authorize/effective-permissions [get]
+func (h *AuthorizationHandler) GetEffectivePermissionsByQuery(c *gin.Context) {
+	userID, err := uuid.Parse(c.Query("userId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid userId"})
+		return
+	}
+	caller := middleware.GetCurrentUser(c)
+	if caller == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	if !h.sameTenantTarget(c, caller, userID) {
+		return
+	}
+	result, err := h.authorizationService.GetEffectivePermissions(c.Request.Context(), userID, caller.TenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get effective permissions"})
+		return
+	}
 	c.JSON(http.StatusOK, result)
 }

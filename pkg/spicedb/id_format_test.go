@@ -85,3 +85,15 @@ func TestOutputMatchesSpiceDBRegex(t *testing.T) {
 		})
 	}
 }
+
+func TestPermissionToSpiceDBIDChecked(t *testing.T) {
+	id, err := PermissionToSpiceDBIDChecked("core:parties:read")
+	assert.NoError(t, err)
+	assert.Equal(t, "core__parties__read", id)
+	assert.True(t, spiceDBObjectIDRegex.MatchString(id))
+
+	for _, bad := range []string{"core:parties:*", "*", "", "core:parties:read write", "core:par*ties:read"} {
+		_, err := PermissionToSpiceDBIDChecked(bad)
+		assert.Error(t, err, bad)
+	}
+}

@@ -9,11 +9,11 @@
 //     enforces two invariants at write time: (1) the top-level value MUST
 //     be a JSON object, (2) writes to `products.<slug>.*` are gated on
 //     <slug> being in productRegistry. Everything else is opaque to
-//     falcon-id; product BFFs (Mearax, Hexx-Forge, …) own their subtree
+//     falcon-id; product BFFs (AcmeWeb, Hexx-Forge, …) own their subtree
 //     shape and bump products.<slug>.schema_version independently.
 //
 //   - JSON Merge Patch (RFC 7396) is the WRITE shape. PATCHing
-//     {"products":{"mearax":{"onboarding":{"tour_seen":true}}}} ONLY
+//     {"products":{"acmeweb":{"onboarding":{"tour_seen":true}}}} ONLY
 //     touches that leaf — siblings (global/locale, other products) are
 //     untouched. RFC 6902 JSON-Patch is out of scope: too easy to write
 //     a bad client that nukes the whole document.
@@ -45,23 +45,24 @@ import (
 // platform's role is to gate access to the namespace, not to enforce
 // inter-product contracts.
 var productRegistry = map[string]struct{}{
-	"mearax":              {},
-	"hexx_forge":          {},
-	"hexx_cloud":          {},
-	"hexx_ops":            {},
-	"hexx_shield":         {},
-	"accounts":            {},
-	"falcon_admin":        {},
-	"platform_admin":      {},
-	"unified_dashboard":   {},
-	"public_website":      {},
-	"landing_hexxlock":    {},
-	"login":               {},
+	"acmeweb":            {},
+	"acmeapp":           {}, // post-rename alias of acmeweb
+	"hexx_forge":        {},
+	"hexx_cloud":        {},
+	"hexx_ops":          {},
+	"hexx_shield":       {},
+	"accounts":          {},
+	"falcon_admin":      {},
+	"platform_admin":    {},
+	"unified_dashboard": {},
+	"public_website":    {},
+	"landing_hexxlock":  {},
+	"login":             {},
 }
 
 // Errors surfaced to handlers.
 var (
-	ErrPrefsNotObject     = errors.New("preferences must be a JSON object")
+	ErrPrefsNotObject      = errors.New("preferences must be a JSON object")
 	ErrPrefsUnknownProduct = errors.New("unknown product slug")
 	ErrPrefsInvalidShape   = errors.New("invalid preferences shape")
 )
@@ -117,11 +118,11 @@ func (s *UserPreferencesService) PatchProduct(ctx context.Context, userID uuid.U
 // the path — intermediate ancestors must already exist. Per the Postgres
 // docs: "All earlier steps in the path must exist, or the target is
 // returned unchanged." That means a fresh row with preferences = '{}'
-// silently no-ops on jsonb_set(preferences, ['products','mearax'], …)
+// silently no-ops on jsonb_set(preferences, ['products','acmeweb'], …)
 // because `products` doesn't exist yet — the UPDATE "succeeds" but the
 // column stays `{}`. This was the first-PATCH-loses-the-write bug observed
 // 2026-06-04 (welcome dialog stuck open even though /api/v1/users/me/
-// preferences/products/mearax returned 200).
+// preferences/products/acmeweb returned 200).
 //
 // Fix: split the apply into two nested jsonb_set calls — the inner one
 // pre-creates the parent path with an empty object if missing, the outer

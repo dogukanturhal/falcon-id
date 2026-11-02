@@ -88,6 +88,9 @@ template:
       - name: {{ .Values.global.imagePullSecret }}
     securityContext:
       {{- toYaml .Values.podSecurityContext | nindent 6 }}
+    {{- with .Values.terminationGracePeriodSeconds }}
+    terminationGracePeriodSeconds: {{ . }}
+    {{- end }}
     containers:
       - name: falcon-id
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -131,6 +134,10 @@ template:
           {{- toYaml .Values.livenessProbe | nindent 10 }}
         readinessProbe:
           {{- toYaml .Values.readinessProbe | nindent 10 }}
+        {{- with .Values.lifecycle }}
+        lifecycle:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
         volumeMounts:

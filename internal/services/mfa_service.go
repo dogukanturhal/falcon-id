@@ -5,8 +5,10 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"image/png"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
@@ -79,11 +82,50 @@ type MFAService struct {
 	// "recent verification"). Wired in cmd/services.go; nil-safe.
 	caeService *CAEService
 
+	// accessTerminator, when set, ends every session/token/SSO cookie of the
+	// user after an admin MFA reset (AdminDisableMFA). Nil-safe.
+	accessTerminator accessTerminator
+
 	// securityNotifier sends user-facing emails on MFA factor
 	// mutations (factor removed). Nil-safe — when unset, the email
 	// step is skipped but DB writes + CAE event remain authoritative.
 	// Phase C, 2026-05-26.
 	securityNotifier *SecurityNotificationService
+
+	// replay backs ClaimTOTP. Nil in unit tests that do not need replay
+	// protection; ClaimTOTP then fails closed.
+	replay redis.Cmdable
+}
+
+// SetAccessTerminator wires the single access-termination path used by AdminDisableMFA.
+func (s *MFAService) SetAccessTerminator(t accessTerminator) {
+	s.accessTerminator = t
+}
+
+// SetTOTPReplayStore wires the Redis client used by ClaimTOTP.
+func (s *MFAService) SetTOTPReplayStore(r redis.Cmdable) {
+	s.replay = r
+}
+
+// totpReplayTTL covers the verifier's 30-second period plus the +-1 step skew.
+const totpReplayTTL = 90 * time.Second
+
+// claimTOTPCode records "this user spent this code" with SETNX. It returns
+// false when the code was already claimed within totpReplayTTL.
+func claimTOTPCode(ctx context.Context, r redis.Cmdable, userID uuid.UUID, code string) (bool, error) {
+	hash := sha256.Sum256([]byte(code))
+	return r.SetNX(ctx, "mfa:totp-used:"+userID.String()+":"+hex.EncodeToString(hash[:]), "1", totpReplayTTL).Result()
+}
+
+// ClaimTOTP is the single replay guard for accepted TOTP codes. Login,
+// step-up and the device-enrollment witness all call it so a code spent on
+// one path cannot be replayed on another within the validity window. It
+// returns false when the code was already claimed.
+func (s *MFAService) ClaimTOTP(ctx context.Context, userID uuid.UUID, code string) (bool, error) {
+	if s == nil || s.replay == nil {
+		return false, fmt.Errorf("TOTP replay store not configured")
+	}
+	return claimTOTPCode(ctx, s.replay, userID, code)
 }
 
 // SetCAEService wires the CAEP publisher into MFAService. Safe to
@@ -278,6 +320,18 @@ func (s *MFAService) VerifyAndEnableTOTP(ctx context.Context, userID uuid.UUID, 
 
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return nil, fmt.Errorf("failed to enable MFA: %w", err)
+	}
+
+	// Restart the factor's age clock. The DB trigger covers false->true; this
+	// also covers re-enrolling (rotating) a secret while already enabled, so a
+	// hijacked session cannot swap in its own authenticator and immediately
+	// satisfy the >24h gate of the device-enrollment witness.
+	if st, ok := s.userRepo.(interface {
+		StampMFATOTPEnabledAt(ctx context.Context, userID uuid.UUID) error
+	}); ok {
+		if err := st.StampMFATOTPEnabledAt(ctx, userID); err != nil {
+			return nil, fmt.Errorf("failed to record TOTP enrollment time: %w", err)
+		}
 	}
 
 	// Auto-generate backup codes ONLY when the user has none yet —
@@ -676,6 +730,17 @@ func (s *MFAService) AdminDisableMFA(ctx context.Context, userID uuid.UUID) erro
 
 	s.publishMFARevoked(ctx, user, "admin_disabled")
 
+	// Sessions established with the removed factor must not survive an admin
+	// reset. The flat user blacklist stays off so the user can re-authenticate.
+	if s.accessTerminator != nil {
+		termCtx, cancel := detachedTerminationCtx()
+		defer cancel()
+		if err := s.accessTerminator.TerminateUserAccessWith(termCtx, userID, user.TenantID, "admin_mfa_disabled", TerminateOptions{}); err != nil {
+			logger.Error("AdminDisableMFA: access termination incomplete",
+				zap.String("user_id", userID.String()), zap.Error(err))
+		}
+	}
+
 	return nil
 }
 
@@ -798,6 +863,14 @@ func (s *MFAService) GetMFAStatus(ctx context.Context, userID uuid.UUID) (*model
 	}
 
 	backupCount, _ := s.GetBackupCodesCount(ctx, userID)
+	hasPasskey := false
+	if lookup, ok := s.userRepo.(interface {
+		HasActiveWebAuthnCredential(context.Context, uuid.UUID) (bool, error)
+	}); ok {
+		if has, err := lookup.HasActiveWebAuthnCredential(ctx, userID); err == nil {
+			hasPasskey = has
+		}
+	}
 
 	// Build list of available methods
 	var availableMethods []string
@@ -830,6 +903,9 @@ func (s *MFAService) GetMFAStatus(ctx context.Context, userID uuid.UUID) (*model
 		AvailableMethods: availableMethods,
 		PreferredMethod:  preferredMethod,
 		BackupCodesCount: backupCount,
+		MaskedEmail:      maskMFAEmail(user.Email),
+		EmailCodeTTL:     int64(s.config.MFAEmailCodeTTL.Seconds()),
+		PasskeyAvailable: hasPasskey,
 	}, nil
 }
 

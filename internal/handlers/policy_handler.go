@@ -3,7 +3,6 @@
 package handlers
 
 import (
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -22,6 +21,9 @@ const (
 	msgPolicyNotAuthenticated = "Not authenticated"
 	msgPolicyInvalidPolicyID  = "Invalid policy ID"
 	msgPolicyNotFound         = "Policy not found"
+
+	codeCustomRegoUnsupported = "custom_rego_unsupported"
+	msgCustomRegoUnsupported  = "Custom Rego is not supported; policies are shipped with the service"
 )
 
 // PolicyHandler handles ABAC policy management endpoints
@@ -93,6 +95,11 @@ func (h *PolicyHandler) Create(c *gin.Context) {
 	var req models.CreatePolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.RegoCode != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgCustomRegoUnsupported, "code": codeCustomRegoUnsupported})
 		return
 	}
 
@@ -181,6 +188,18 @@ func (h *PolicyHandler) Update(c *gin.Context) {
 		return
 	}
 
+	// Validate the body before touching the repository.
+	var req models.UpdatePolicyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.RegoCode != nil && *req.RegoCode != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": msgCustomRegoUnsupported, "code": codeCustomRegoUnsupported})
+		return
+	}
+
 	policy, err := h.policyRepo.GetByID(c.Request.Context(), id)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": msgPolicyNotFound})
@@ -193,12 +212,6 @@ func (h *PolicyHandler) Update(c *gin.Context) {
 	}
 	if !policy.IsGlobal && (policy.TenantID == nil || *policy.TenantID != user.TenantID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": msgPolicyNotFound})
-		return
-	}
-
-	var req models.UpdatePolicyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -402,12 +415,9 @@ func (h *PolicyHandler) GetABACStatus(c *gin.Context) {
 	// Check if OPA service is available
 	opaAvailable := h.opaService != nil
 
-	// Get ABAC enabled status from database settings
-	enabled := false
-	settings, err := h.settingsRepo.GetByTenantID(c.Request.Context(), user.TenantID)
-	if err == nil && settings != nil {
-		enabled = settings.ABACEnabled
-	}
+	// The per-tenant ABACEnabled setting is deprecated and ignored; the
+	// engine is enabled globally by USE_ABAC only.
+	enabled := h.opaService != nil && h.opaService.IsEnabled()
 
 	var lastReload string
 	if opaAvailable {
@@ -419,68 +429,6 @@ func (h *PolicyHandler) GetABACStatus(c *gin.Context) {
 		"opa_available": opaAvailable,
 		"policy_count":  policyCount,
 		"last_reload":   lastReload,
-	})
-}
-
-// ToggleABAC toggles the ABAC engine via database setting
-func (h *PolicyHandler) ToggleABAC(c *gin.Context) {
-	user := middleware.GetCurrentUser(c)
-	if user == nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": msgPolicyNotAuthenticated})
-		return
-	}
-
-	var req struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Check if OPA service is available
-	if h.opaService == nil && req.Enabled {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "OPA service is not available. Cannot enable ABAC.",
-		})
-		return
-	}
-
-	// Get current settings and update ABAC enabled
-	settings, err := h.settingsRepo.GetByTenantID(c.Request.Context(), user.TenantID)
-	if err != nil {
-		// Create new settings if not exist
-		settings = &models.IAMSettings{
-			TenantID:    user.TenantID,
-			ABACEnabled: req.Enabled,
-			UpdatedBy:   &user.ID,
-		}
-	} else {
-		settings.ABACEnabled = req.Enabled
-		settings.UpdatedBy = &user.ID
-	}
-
-	if err := h.settingsRepo.Upsert(c.Request.Context(), settings); err != nil {
-		h.logger.Error("Failed to update ABAC setting", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update ABAC setting"})
-		return
-	}
-
-	// Reload policies if enabling ABAC
-	if req.Enabled && h.opaService != nil {
-		if err := h.opaService.ReloadPolicies(c.Request.Context()); err != nil {
-			h.logger.Warn("Failed to reload policies after enabling ABAC", zap.Error(err))
-		}
-	}
-
-	status := "disabled"
-	if req.Enabled {
-		status = "enabled"
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("ABAC %s successfully", status),
-		"enabled": req.Enabled,
 	})
 }
 

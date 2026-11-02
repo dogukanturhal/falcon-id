@@ -402,7 +402,7 @@ func buildRouteURI(productSlug, epPath string) string {
 
 // defaultUpstreamHost returns a conventional Docker / Kubernetes service name
 // derived from the product slug.  The slug is used directly since HexxLock
-// names containers after their product slugs (e.g. "examplesuite", "hotel-pms").
+// names containers after their product slugs (e.g. "examplesuite", "example-pms").
 func defaultUpstreamHost(productSlug string) string {
 	return fmt.Sprintf("%s:8080", productSlug)
 }

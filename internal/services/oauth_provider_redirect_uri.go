@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
@@ -15,6 +16,8 @@ import (
 // redirectURIMaxLen mirrors the TEXT column allowance and aligns with
 // Microsoft Entra's documented per-URI cap of 1024 characters.
 const redirectURIMaxLen = 1024
+
+var privateUseSchemeRe = regexp.MustCompile(`^[a-z][a-z0-9.+-]*$`)
 
 // validateRedirectURIs runs validateRedirectURI on every URI in the
 // list and returns the first failure. An empty list is permitted —
@@ -31,9 +34,9 @@ const redirectURIMaxLen = 1024
 // and OAuth 2.1 §1.4.2 explicitly carves this out from the general
 // "no http://" rule. Non-native clients (services, server-side web
 // apps) continue to reject loopback on production tenants.
-func validateRedirectURIs(tenantType models.TenantType, uris []string, nativeApp bool) error {
+func validateRedirectURIs(tenantType models.TenantType, uris []string, nativeApp bool, schemeDomains []string) error {
 	for _, uri := range uris {
-		if err := validateRedirectURI(tenantType, uri, nativeApp); err != nil {
+		if err := validateRedirectURI(tenantType, uri, nativeApp, schemeDomains); err != nil {
 			return err
 		}
 	}
@@ -78,7 +81,7 @@ func validateRedirectURIs(tenantType models.TenantType, uris []string, nativeApp
 // policy applies. Callers compute nativeApp from the client's
 // registration metadata (IsPublic + RequirePKCE + IsFirstParty in the
 // CreateClient path).
-func validateRedirectURI(tenantType models.TenantType, raw string, nativeApp bool) error {
+func validateRedirectURI(tenantType models.TenantType, raw string, nativeApp bool, schemeDomains []string) error {
 	if raw == "" {
 		return errors.New("redirect_uri must not be empty")
 	}
@@ -97,6 +100,11 @@ func validateRedirectURI(tenantType models.TenantType, raw string, nativeApp boo
 	}
 	scheme := strings.ToLower(parsed.Scheme)
 	if scheme != "http" && scheme != "https" {
+		// RFC 8252 §7.1 private-use scheme: native clients only, and only
+		// when NATIVE_APP_SCHEME_DOMAINS enables the feature.
+		if nativeApp && len(schemeDomains) > 0 {
+			return validatePrivateUseScheme(raw, schemeDomains)
+		}
 		return fmt.Errorf("redirect_uri scheme %q is not permitted (http and https only)", parsed.Scheme)
 	}
 	if parsed.Host == "" {
@@ -231,4 +239,65 @@ func isLoopbackHost(host string) bool {
 		return true
 	}
 	return false
+}
+
+// validatePrivateUseScheme checks an RFC 8252 §7.1 private-use URI scheme
+// redirect (com.example.app:/oauth/callback). The scheme must be lowercase,
+// contain a dot, and be the reversed form of a domain that equals or sits
+// under an entry of schemeDomains. Both scheme:/path and scheme://host/path
+// are accepted; userinfo, port, fragment and wildcards are not.
+func validatePrivateUseScheme(raw string, schemeDomains []string) error {
+	scheme, _, _ := strings.Cut(raw, ":")
+	if !privateUseSchemeRe.MatchString(scheme) || !strings.Contains(scheme, ".") {
+		return fmt.Errorf("redirect_uri scheme %q is not a valid private-use scheme (lowercase reverse-DNS, RFC 8252 §7.1)", scheme)
+	}
+	if strings.ContainsAny(raw, "*#") {
+		return errors.New("redirect_uri must not contain wildcards or a fragment")
+	}
+	labels := strings.Split(scheme, ".")
+	for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
+		labels[i], labels[j] = labels[j], labels[i]
+	}
+	domain := strings.Join(labels, ".")
+	allowed := false
+	for _, d := range schemeDomains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d != "" && (domain == d || strings.HasSuffix(domain, "."+d)) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("redirect_uri scheme %q is not under an allowed native app domain", scheme)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("redirect_uri is not a valid URL: %w", err)
+	}
+	if parsed.User != nil || parsed.Port() != "" || strings.Contains(parsed.Host, ":") {
+		return errors.New("redirect_uri private-use scheme must not include userinfo or a port")
+	}
+	if !strings.HasPrefix(parsed.Path, "/") {
+		return errors.New("redirect_uri private-use scheme must have a path starting with '/'")
+	}
+	return nil
+}
+
+// validatePostLogoutRedirectURIs applies validatePrivateUseScheme to every
+// post-logout URI that is not http(s); http(s) entries are left to the
+// existing handling.
+func validatePostLogoutRedirectURIs(uris []string, nativeApp bool, schemeDomains []string) error {
+	for _, uri := range uris {
+		scheme, _, found := strings.Cut(uri, ":")
+		if !found || strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https") {
+			continue
+		}
+		if !nativeApp || len(schemeDomains) == 0 {
+			return fmt.Errorf("post_logout_redirect_uri scheme %q is not permitted", scheme)
+		}
+		if err := validatePrivateUseScheme(uri, schemeDomains); err != nil {
+			return fmt.Errorf("post_logout_redirect_uri: %w", err)
+		}
+	}
+	return nil
 }

@@ -500,6 +500,7 @@ func TestCVEHEXXIAM001_CrossTenantAdminAccessPrevention(t *testing.T) {
 			TenantID:        hexxlockInternal,
 			Username:        "platform-admin@example.com",
 			IsPlatformAdmin: true,
+			Roles:           []string{"platform_admin"},
 		}
 
 		router2 := gin.New()

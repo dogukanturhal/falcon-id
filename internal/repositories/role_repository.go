@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/productslug"
 	"github.com/dogukanturhal/falcon-id/pkg/crypto"
 )
 
@@ -123,6 +124,138 @@ func (r *RoleRepository) GetMaxPriorityForUser(ctx context.Context, userID, tena
 		return 0, fmt.Errorf("GetMaxPriorityForUser: %w", err)
 	}
 	return maxPriority, nil
+}
+
+// CreateFromTemplate is Create's role-template counterpart: it writes the
+// same columns as Create plus template_key/template_version/module, so the
+// resulting row is recognizable to ReconcileVersionBump and
+// DisableForModuleRevoke. Callers must not use Create for a template-derived
+// role — that would leave template_key NULL and make the role
+// indistinguishable from a tenant-custom role for reconciliation purposes.
+func (r *RoleRepository) CreateFromTemplate(ctx context.Context, role *models.Role) error {
+	query := `
+		INSERT INTO iam_roles (id, tenant_id, name, display_name, description, is_system, is_default, priority, created_by, template_key, template_version, module)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		RETURNING created_at, updated_at`
+
+	if role.ID == uuid.Nil {
+		role.ID = uuid.New()
+	}
+
+	return r.db.QueryRow(ctx, query,
+		role.ID, role.TenantID, role.Name, role.DisplayName, role.Description,
+		role.IsSystem, role.IsDefault, role.Priority, role.CreatedBy,
+		role.TemplateKey, role.TemplateVersion, role.Module,
+	).Scan(&role.CreatedAt, &role.UpdatedAt)
+}
+
+// GetByTemplateKeyForTenant returns the tenant's role instantiated from
+// templateKey (any version), or nil if the tenant never instantiated it.
+// Used by the instantiate handler/provisioner to stay idempotent — calling
+// instantiate twice for the same tenant+template must not create duplicate
+// roles.
+func (r *RoleRepository) GetByTemplateKeyForTenant(ctx context.Context, tenantID uuid.UUID, templateKey string) (*models.Role, error) {
+	role := &models.Role{}
+	query := `
+		SELECT id, tenant_id, name, display_name, description, is_system, is_default, priority,
+			   created_at, updated_at, created_by, updated_by, template_key, template_version, module
+		FROM iam_roles WHERE tenant_id = $1 AND template_key = $2`
+
+	err := r.db.QueryRow(ctx, query, tenantID, templateKey).Scan(
+		&role.ID, &role.TenantID, &role.Name, &role.DisplayName, &role.Description,
+		&role.IsSystem, &role.IsDefault, &role.Priority,
+		&role.CreatedAt, &role.UpdatedAt, &role.CreatedBy, &role.UpdatedBy,
+		&role.TemplateKey, &role.TemplateVersion, &role.Module,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetByTemplateKeyForTenant: %w", err)
+	}
+	return role, nil
+}
+
+// ListRolesByTemplateKey returns every tenant's role instantiated from
+// templateKey (any version, across all tenants). Used by
+// TemplateRoleProvisioner.ReconcileVersionBump to top up / trim permission
+// grants on every template-derived role when the template's owning module
+// publishes a new version.
+func (r *RoleRepository) ListRolesByTemplateKey(ctx context.Context, templateKey string) ([]models.Role, error) {
+	query := `
+		SELECT id, tenant_id, name, display_name, description, is_system, is_default, priority,
+			   created_at, updated_at, created_by, updated_by, template_key, template_version, module
+		FROM iam_roles WHERE template_key = $1`
+
+	rows, err := r.db.Query(ctx, query, templateKey)
+	if err != nil {
+		return nil, fmt.Errorf("ListRolesByTemplateKey: %w", err)
+	}
+	defer rows.Close()
+
+	var roles []models.Role
+	for rows.Next() {
+		var role models.Role
+		if err := rows.Scan(
+			&role.ID, &role.TenantID, &role.Name, &role.DisplayName, &role.Description,
+			&role.IsSystem, &role.IsDefault, &role.Priority,
+			&role.CreatedAt, &role.UpdatedAt, &role.CreatedBy, &role.UpdatedBy,
+			&role.TemplateKey, &role.TemplateVersion, &role.Module,
+		); err != nil {
+			return nil, fmt.Errorf("ListRolesByTemplateKey scan: %w", err)
+		}
+		roles = append(roles, role)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListRolesByTemplateKey rows: %w", err)
+	}
+	return roles, nil
+}
+
+// ListTemplateDerivedRolesByModule returns tenantID's template-derived roles
+// (template_key IS NOT NULL) for the given module. Used by
+// DisableForModuleRevoke to find exactly the roles a module-revoke should
+// strip grants from, never touching the tenant's custom roles.
+func (r *RoleRepository) ListTemplateDerivedRolesByModule(ctx context.Context, tenantID uuid.UUID, module string) ([]models.Role, error) {
+	query := `
+		SELECT id, tenant_id, name, display_name, description, is_system, is_default, priority,
+			   created_at, updated_at, created_by, updated_by, template_key, template_version, module
+		FROM iam_roles WHERE tenant_id = $1 AND module = ANY($2) AND template_key IS NOT NULL`
+
+	rows, err := r.db.Query(ctx, query, tenantID, productslug.Aliases(module))
+	if err != nil {
+		return nil, fmt.Errorf("ListTemplateDerivedRolesByModule: %w", err)
+	}
+	defer rows.Close()
+
+	var roles []models.Role
+	for rows.Next() {
+		var role models.Role
+		if err := rows.Scan(
+			&role.ID, &role.TenantID, &role.Name, &role.DisplayName, &role.Description,
+			&role.IsSystem, &role.IsDefault, &role.Priority,
+			&role.CreatedAt, &role.UpdatedAt, &role.CreatedBy, &role.UpdatedBy,
+			&role.TemplateKey, &role.TemplateVersion, &role.Module,
+		); err != nil {
+			return nil, fmt.Errorf("ListTemplateDerivedRolesByModule scan: %w", err)
+		}
+		roles = append(roles, role)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListTemplateDerivedRolesByModule rows: %w", err)
+	}
+	return roles, nil
+}
+
+// SetTemplateVersion bumps a template-derived role's recorded
+// template_version after ReconcileVersionBump has finished syncing its
+// permission grants to match the new version's catalog.
+func (r *RoleRepository) SetTemplateVersion(ctx context.Context, roleID uuid.UUID, version int) error {
+	_, err := r.db.Exec(ctx, `UPDATE iam_roles SET template_version = $2, updated_at = now() WHERE id = $1`, roleID, version)
+	if err != nil {
+		return fmt.Errorf("SetTemplateVersion: %w", err)
+	}
+	return nil
 }
 
 // GetByName is an exported function.
@@ -345,6 +478,28 @@ func (r *RoleRepository) HasOnlyPermissionsInModules(ctx context.Context, roleID
 	return allowed, nil
 }
 
+// HasOnlyReadPermissions reports whether the role grants at least one
+// permission and every permission it grants is a read action. External
+// (seat-free) invitations may only carry such roles, so a free seat can
+// never write. The one exception (LD-R3-GUEST-1) is creating and retrying
+// accountant exports: an export never changes the books, and the accountant
+// portal exists for it. reports:lock stays excluded (it changes period state).
+func (r *RoleRepository) HasOnlyReadPermissions(ctx context.Context, roleID uuid.UUID) (bool, error) {
+	var readOnly bool
+	err := r.db.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM iam_role_permissions rp WHERE rp.role_id = $1
+		) AND NOT EXISTS (
+			SELECT 1 FROM iam_role_permissions rp
+			JOIN iam_permissions p ON p.id = rp.permission_id
+			WHERE rp.role_id = $1 AND p.action <> 'read'
+			  AND NOT (p.module = 'preaccounting' AND p.resource = 'accountant-export' AND p.action IN ('create', 'retry'))
+		)`, roleID).Scan(&readOnly)
+	if err != nil {
+		return false, fmt.Errorf("HasOnlyReadPermissions: %w", err)
+	}
+	return readOnly, nil
+}
+
 // LockPermissionCatalogue serializes a final entitlement decision against
 // permission and role-permission writes for the enclosing transaction.
 func (r *RoleRepository) LockPermissionCatalogue(ctx context.Context) error {
@@ -451,6 +606,55 @@ func (r *RoleRepository) GrantPermissionsByName(ctx context.Context, roleID uuid
 		return fmt.Errorf("GrantPermissionsByName commit: %w", err)
 	}
 	return nil
+}
+
+// RevokePermissionsByName removes exactly the named permissions from a role's
+// grants (the inverse of GrantPermissionsByName). Names that are not granted
+// are ignored, so it is idempotent. Returns no error for an empty list.
+func (r *RoleRepository) RevokePermissionsByName(ctx context.Context, roleID uuid.UUID, permissionNames []string) error {
+	if len(permissionNames) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("RevokePermissionsByName begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	_, err = tx.Exec(ctx, `
+		DELETE FROM iam_role_permissions rp
+		USING iam_permissions p
+		WHERE rp.role_id = $1
+		  AND rp.permission_id = p.id
+		  AND p.name = ANY($2::text[])`, roleID, permissionNames)
+	if err != nil {
+		return fmt.Errorf("RevokePermissionsByName delete: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("RevokePermissionsByName commit: %w", err)
+	}
+	return nil
+}
+
+// GrantModulePermissionsToRole grants roleID every catalog permission of the
+// given modules, leaving grants it already holds untouched (never removes).
+// Returns the number of newly inserted iam_role_permissions rows.
+func (r *RoleRepository) GrantModulePermissionsToRole(ctx context.Context, roleID uuid.UUID, modules []string) (int64, error) {
+	if len(modules) == 0 {
+		return 0, nil
+	}
+	tag, err := r.db.Exec(ctx, `
+		INSERT INTO iam_role_permissions (role_id, permission_id)
+		SELECT $1, p.id
+		FROM iam_permissions p
+		WHERE p.module = ANY($2::text[])
+		ON CONFLICT (role_id, permission_id) DO NOTHING`, roleID, modules)
+	if err != nil {
+		return 0, fmt.Errorf("GrantModulePermissionsToRole: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // GetRolePermissions is an exported function.
@@ -627,4 +831,57 @@ func (r *RoleRepository) CreateSystemRoles(ctx context.Context, tenantID uuid.UU
 	}
 
 	return nil
+}
+
+// ListActiveHolderIDs returns the IDs of active users holding roleID through
+// a non-expired iam_user_roles assignment.
+func (r *RoleRepository) ListActiveHolderIDs(ctx context.Context, roleID uuid.UUID) ([]uuid.UUID, error) {
+	query := `
+		SELECT ur.user_id
+		FROM iam_user_roles ur
+		JOIN iam_users u ON u.id = ur.user_id
+		WHERE ur.role_id = $1
+		  AND u.is_active = true
+		  AND u.deletion_scheduled_at IS NULL
+		  AND (u.activation_status IS NULL OR u.activation_status NOT IN ('pending_deletion', 'admin_deleted'))
+		  AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+		ORDER BY ur.user_id`
+	rows, err := r.db.Query(ctx, query, roleID)
+	if err != nil {
+		return nil, fmt.Errorf("ListActiveHolderIDs: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("ListActiveHolderIDs scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListActiveHolderIDs rows: %w", err)
+	}
+	return ids, nil
+}
+
+// ListTenantIDsWithRoleName returns the IDs of every tenant that has a role
+// with the given name, in a stable order. Used to find the tenants that carry
+// the AcmeApp role catalog (via its "owner" role).
+func (r *RoleRepository) ListTenantIDsWithRoleName(ctx context.Context, name string) ([]uuid.UUID, error) {
+	rows, err := r.db.Query(ctx, `SELECT DISTINCT tenant_id FROM iam_roles WHERE name = $1 ORDER BY tenant_id`, name)
+	if err != nil {
+		return nil, fmt.Errorf("ListTenantIDsWithRoleName: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("ListTenantIDsWithRoleName scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

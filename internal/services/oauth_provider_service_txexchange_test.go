@@ -100,6 +100,13 @@ func (t *txExchangeFakeTx) CreateOAuthToken(_ context.Context, _ *models.OAuthTo
 	return nil
 }
 
+func (t *txExchangeFakeTx) LockRefreshRecovery(_ context.Context, _, _ uuid.UUID) (repositories.RefreshRecoveryOutcome, error) {
+	return repositories.RefreshRecoveryOK, nil
+}
+
+func (t *txExchangeFakeTx) SetTokenReplacedBy(_ context.Context, _, _ uuid.UUID) error { return nil }
+func (t *txExchangeFakeTx) RepointTokenReplacedBy(_ context.Context, _, _, _ uuid.UUID) error { return nil }
+
 func (t *txExchangeFakeTx) Commit(_ context.Context) error {
 	if t.staged {
 		t.repo.stateMu.Lock()

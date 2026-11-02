@@ -1,0 +1,50 @@
+{{- /*
+  Deliberately PLAIN (non-hook) resource — t-582 follow-up, 2026-09-09.
+
+  Every other resource in this chart is a PreSync hook, and ArgoCD
+  excludes hook-type resources from `status.sync.status` computation
+  entirely. A chart whose resources are ALL hooks can therefore read
+  `Synced` forever regardless of whether a hook's content has changed or
+  last actually run — there is nothing non-hook for the diff to compare
+  against. See schema-write-job.yaml's header comment ("Hook-only chart
+  is invisible to sync-status diffing") for the live incident that
+  exposed this and the full two-part fix this file is one half of.
+
+  This ConfigMap carries NO argocd.argoproj.io/hook annotation on
+  purpose, so ArgoCD diffs it the ordinary way. Its data is nothing but
+  the current schema's checksum and definition count, computed at
+  render time from the exact same files/spicedb.zed the write Job
+  hashes into its own Pod template (schema-write-job.yaml's
+  checksum/config annotation). Whenever that file changes, THIS
+  resource's desired manifest changes too — which flips the
+  Application to OutOfSync the normal way, restoring an honest sync
+  status at the app level instead of relying on an operator remembering
+  a comment.
+
+  What this deliberately does NOT do: prove the write Job succeeded.
+  That is still ArgoCD's normal PreSync hook-phase accounting
+  (Succeeded/Failed on the Job), which the activeDeadlineSeconds /
+  backoffLimit sizing in values.yaml already makes fail loudly rather
+  than ambiguously. This resource is also never written to at runtime
+  by the Job itself — only ever rendered by Helm from git — because
+  doing so would need a ServiceAccount with RBAC to patch a live
+  object, reintroducing exactly the same-sync ordering hazard that
+  removing the Job's ServiceAccount fixed (see schema-write-job.yaml).
+  It is a static reflection of the desired schema's checksum, nothing
+  more.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spicedb-schema.fullname" . }}-revision
+  labels:
+    {{- include "spicedb-schema.labels" . | nindent 4 }}
+    app.kubernetes.io/component: schema-revision
+data:
+  # Same hash, same input, as schema-write-job.yaml's checksum/config
+  # Pod-template annotation — kept as two separate computations of the
+  # same source file (rather than templating one from the other) so
+  # this file stays readable in isolation and `helm template` output
+  # for either resource is independently greppable.
+  schemaChecksum: {{ .Files.Get "files/spicedb.zed" | sha256sum | quote }}
+  definitionCount: {{ regexFindAll "definition\\s+[A-Za-z_][A-Za-z0-9_]*\\s*\\{" (.Files.Get "files/spicedb.zed") -1 | len | quote }}

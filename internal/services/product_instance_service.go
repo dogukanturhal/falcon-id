@@ -4,11 +4,13 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
 )
@@ -77,10 +79,20 @@ func (s *ProductInstanceService) Provision(ctx context.Context, productID uuid.U
 	}
 
 	// Check for existing instance (unique constraint: tenant_id + product_id).
-	existing, _ := s.instanceRepo.GetByTenantAndProduct(ctx, req.TenantID, productID)
+	existing, lookupErr := s.instanceRepo.GetByTenantAndProduct(ctx, req.TenantID, productID)
+	if lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("lookup existing product instance: %w", lookupErr)
+	}
 	if existing != nil {
 		if existing.ProvisioningState != models.ProvisioningStateDeleted && existing.ProvisioningState != models.ProvisioningStateFailed {
-			return nil, fmt.Errorf("tenant already has an instance of product %q (state=%s)", product.Slug, existing.ProvisioningState)
+			if existing.ProvisioningState == models.ProvisioningStateDeleting {
+				return nil, fmt.Errorf("product instance is being deleted")
+			}
+			// A trial root remains the app/recovery shell after module expiry.
+			// Paid/comp activation must reuse it, not fail as a duplicate or
+			// reset its databases/plan/provisioning history. Entitlement tiers
+			// come from canonical module snapshots, not this isolation hint.
+			return existing, nil
 		}
 		// Allow re-provisioning if previous attempt failed or was deleted.
 		if err := s.instanceRepo.ResetForReprovisioning(ctx, existing.ID); err != nil {

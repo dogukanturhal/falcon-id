@@ -3,13 +3,16 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // oauthTokenBurstConfig protects /oauth/token from a single misconfigured
@@ -41,6 +44,31 @@ var oauthTokenHourlyConfig = AuthRateLimitConfig{
 	BlockDuration: 5 * time.Minute,
 }
 
+// OAuthTokenPerUserClients (config OAUTH_TOKEN_PER_USER_CLIENT_IDS) lists
+// clients whose /oauth/token calls are bucketed per end user instead of per
+// client: confidential BFFs that call on behalf of every signed-in user
+// (acmeapp-bff) and public native clients, where every install shares one
+// client_id. A per-client key would put all users in one 60/min bucket, so
+// one busy minute would lock everyone out; these clients' burst/hourly
+// windows apply per end user instead (LD-R3-TX-3), under a client-wide
+// backstop.
+
+// oauthTokenPerUserClientBurstConfig / ...HourlyConfig cap a per-user
+// client as a whole. The per-user key is derived from the request before
+// client authentication, so a caller can vary it; the backstop keeps that
+// from becoming unbounded while leaving room for the whole user base.
+var oauthTokenPerUserClientBurstConfig = AuthRateLimitConfig{
+	MaxRequests:   3000,
+	WindowSeconds: 60,
+	BlockDuration: 1 * time.Minute,
+}
+
+var oauthTokenPerUserClientHourlyConfig = AuthRateLimitConfig{
+	MaxRequests:   60000,
+	WindowSeconds: 3600,
+	BlockDuration: 5 * time.Minute,
+}
+
 // OAuthTokenRateLimit returns gin middleware that rate-limits requests
 // to /oauth/token on a per-client_id key. The identifier is resolved
 // from (in order):
@@ -60,10 +88,34 @@ var oauthTokenHourlyConfig = AuthRateLimitConfig{
 // This is the cheapest DoS-prevention layer for /oauth/token, the
 // single endpoint with the heaviest cryptographic cost (RS256 sign +
 // DB write on every successful issuance) per request.
-func OAuthTokenRateLimit() gin.HandlerFunc {
+//
+// For the multi-user BFFs in oauthTokenPerUserClients the two windows are
+// keyed per end user (see resolveOAuthTokenUserKey) and the client as a
+// whole is held to the larger backstop windows.
+func OAuthTokenRateLimit(perUserClientIDs []string) gin.HandlerFunc {
+	perUserClients := make(map[string]bool, len(perUserClientIDs))
+	for _, id := range perUserClientIDs {
+		perUserClients[id] = true
+	}
 	return func(c *gin.Context) {
 		identifier := resolveOAuthTokenIdentifier(c)
 		now := time.Now()
+
+		if cid, ok := strings.CutPrefix(identifier, "cid:"); ok && perUserClients[cid] {
+			if _, blocked := checkAndRecordSlidingWindow(
+				"oauth_token_client_burst:"+identifier, now, oauthTokenPerUserClientBurstConfig,
+			); blocked {
+				abortOAuthTokenRateLimited(c, oauthTokenPerUserClientBurstConfig.BlockDuration)
+				return
+			}
+			if _, blocked := checkAndRecordSlidingWindow(
+				"oauth_token_client_hourly:"+identifier, now, oauthTokenPerUserClientHourlyConfig,
+			); blocked {
+				abortOAuthTokenRateLimited(c, oauthTokenPerUserClientHourlyConfig.BlockDuration)
+				return
+			}
+			identifier += "|" + resolveOAuthTokenUserKey(c)
+		}
 
 		burstRemaining, burstBlocked := checkAndRecordSlidingWindow(
 			"oauth_token_burst:"+identifier, now, oauthTokenBurstConfig,
@@ -107,6 +159,56 @@ func resolveOAuthTokenIdentifier(c *gin.Context) string {
 	// malformed request looks identical to those in dashboards.
 	host, _ := parseRemoteHost(c.Request.RemoteAddr)
 	return "ip:" + host
+}
+
+// resolveOAuthTokenUserKey derives the end-user half of a per-user client's
+// rate-limit key from the grant's own credential:
+//
+//   - token exchange: for a client that authenticates (client_secret,
+//     Basic, client_assertion) the subject token's sub, parsed WITHOUT
+//     verification (only a bucket name; the grant verifies the token); for a
+//     public client the subject token digest, because anyone can forge
+//     sub=<victim> and lock that user out;
+//   - refresh_token / authorization_code: digest of the credential (opaque
+//     values, so the digest is the stable per-session handle available here);
+//   - otherwise the remote IP.
+//
+// Raw credentials never become part of the key.
+func resolveOAuthTokenUserKey(c *gin.Context) string {
+	if st := c.PostForm("subject_token"); st != "" {
+		if oauthTokenClientAuthenticates(c) {
+			claims := jwt.MapClaims{}
+			if _, _, err := jwt.NewParser().ParseUnverified(st, claims); err == nil {
+				if sub, _ := claims["sub"].(string); sub != "" {
+					return "sub:" + sub
+				}
+			}
+		}
+		return "st:" + credentialDigest(st)
+	}
+	if rt := c.PostForm("refresh_token"); rt != "" {
+		return "rt:" + credentialDigest(rt)
+	}
+	if code := c.PostForm("code"); code != "" {
+		return "code:" + credentialDigest(code)
+	}
+	host, _ := parseRemoteHost(c.Request.RemoteAddr)
+	return "ip:" + host
+}
+
+// oauthTokenClientAuthenticates reports whether the request carries client
+// credentials (confidential client). The limiter runs before authentication,
+// so this is a presence check only; a forged value just selects the
+// unverified-sub bucket for a client that is listed per-user anyway.
+func oauthTokenClientAuthenticates(c *gin.Context) bool {
+	return strings.HasPrefix(c.GetHeader("Authorization"), "Basic ") ||
+		c.PostForm("client_secret") != "" ||
+		c.PostForm("client_assertion") != ""
+}
+
+func credentialDigest(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return hex.EncodeToString(sum[:16])
 }
 
 // decodeBasicAuthClientID extracts the client_id (Basic-auth username)

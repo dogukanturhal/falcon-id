@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      opentelemetry:
+        patterns: ["go.opentelemetry.io/*"]
+      kubernetes:
+        patterns: ["k8s.io/*", "sigs.k8s.io/*"]
+      grpc-and-protobuf:
+        patterns: ["google.golang.org/*"]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # docker-compose.yml images (Postgres, Redis, SpiceDB) are development-only
+  # and are tracked by the docker ecosystem above where Dependabot can read them.

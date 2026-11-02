@@ -1,0 +1,1 @@
+{"type":"https://docs.example.com/errors/validation-failed","title":"Request failed","status":422,"detail":"Sole-approver self-approval requires a written justification of at least 10 characters.","instance":"/api/v1/mm/purchase-orders/33333333-3333-3333-3333-333333333333/actions/approve","code":"self_approval_justification_required","traceId":"approval-fixture"}

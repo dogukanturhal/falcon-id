@@ -18,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
 
@@ -118,8 +120,20 @@ func (m *ServiceAuthMiddleware) validateServiceJWT(c *gin.Context, tokenString s
 	if !ok {
 		return fmt.Errorf("invalid claims")
 	}
+	// Tenant API key tokens are for the business API only, never S2S.
+	if typ, _ := claims["type"].(string); typ == services.APIKeyTokenType {
+		return fmt.Errorf("API key tokens are not accepted here")
+	}
 
 	isSelfIssued := resolvedSlug == "oauth-client"
+
+	// Tokens signed with the OAuth provider key include end-user access
+	// tokens, so only genuine client_credentials tokens may pass.
+	if isSelfIssued {
+		if err := validateClientCredentialsClaims(claims); err != nil {
+			return err
+		}
+	}
 
 	if err := validateServiceJWTAudience(claims, isSelfIssued); err != nil {
 		return err
@@ -227,6 +241,42 @@ func validateServiceJWTAudience(claims jwt.MapClaims, isSelfIssued bool) error {
 		}
 	}
 	return fmt.Errorf("invalid audience: %v", audValues)
+}
+
+// validateClientCredentialsClaims accepts a token signed with the OAuth
+// provider key only when it is a client_credentials token for a service
+// principal. User tokens (authorization_code, refresh, tenant exchange),
+// api_key tokens and anything carrying a user/session marker are rejected.
+//
+// Positive signal: `gty == "client_credentials"`, stamped at minting. Tokens
+// minted before that claim existed (no `gty`) are still accepted while they
+// live, but only if `sub` equals `client_id` (a user token's sub is a user
+// UUID) — remove this fallback once all pre-gty tokens have expired.
+func validateClientCredentialsClaims(claims jwt.MapClaims) error {
+	if t, _ := claims["type"].(string); t == "api_key" {
+		return fmt.Errorf("api_key token not accepted on internal routes")
+	}
+	for _, k := range []string{"sid", "idp_session", "act", "auth_time", "email"} {
+		if _, ok := claims[k]; ok {
+			return fmt.Errorf("user-bound token not accepted on internal routes")
+		}
+	}
+	// Tenant-administered clients can also mint client_credentials tokens, so
+	// only clients owned by the platform tenant count as service principals.
+	if tid, _ := claims["tenant_id"].(string); tid != models.HexxlockInternalTenantID {
+		return fmt.Errorf("token tenant is not the platform tenant")
+	}
+	sub, _ := claims["sub"].(string)
+	clientID, _ := claims["client_id"].(string)
+	if sub == "" || clientID == "" || sub != clientID {
+		return fmt.Errorf("token subject is not a service client")
+	}
+	if gty, present := claims["gty"]; present {
+		if g, _ := gty.(string); g != "client_credentials" {
+			return fmt.Errorf("token grant type not accepted on internal routes")
+		}
+	}
+	return nil
 }
 
 // extractAudiences normalises the JWT `aud` claim into a string slice
@@ -351,6 +401,8 @@ type CompositeKeyLookup struct {
 	oauthKeyID  string
 	oauthPubKey *rsa.PublicKey
 	spLookup    ServicePrincipalLookup
+
+	oauthResolver func(kid string) (*rsa.PublicKey, bool)
 }
 
 // NewCompositeKeyLookup creates a composite key resolver.
@@ -364,11 +416,24 @@ func NewCompositeKeyLookup(oauthKeyID string, oauthPubKey *rsa.PublicKey, spLook
 	}
 }
 
+// WithOAuthKeyResolver makes self-issued kids resolve dynamically (so keys that
+// appear after startup, e.g. via rotation, are accepted) instead of only the
+// startup key.
+func (c *CompositeKeyLookup) WithOAuthKeyResolver(fn func(kid string) (*rsa.PublicKey, bool)) *CompositeKeyLookup {
+	c.oauthResolver = fn
+	return c
+}
+
 // LookupPublicKey resolves the signing key for a given kid.
 // If the kid matches the OAuth provider's own key, returns that key with slug derived
 // from the token's client_id claim (set later by ServiceAuth middleware).
 // Otherwise delegates to the service principal registry.
 func (c *CompositeKeyLookup) LookupPublicKey(ctx context.Context, keyID string) (*rsa.PublicKey, string, error) {
+	if c.oauthResolver != nil {
+		if pub, ok := c.oauthResolver(keyID); ok {
+			return pub, "oauth-client", nil
+		}
+	}
 	if keyID == c.oauthKeyID {
 		// Self-issued token — slug will be overridden from client_id claim in ServiceAuth
 		return c.oauthPubKey, "oauth-client", nil

@@ -1583,6 +1583,20 @@ func TestOAuthHandler_LoginPage_FeatureFlag(t *testing.T) {
 		return r
 	}
 
+	t.Run("rejects look-alike authorize paths", func(t *testing.T) {
+		t.Setenv("OAUTH_LOGIN_REDIRECT_URL", "/login")
+		for _, bad := range []string{
+			"%2Foauth%2Fauthorize-evil%3Fclient_id%3Dabc",
+			"%2Foauth%2Fauthorize%2F..%2F..%2Fadmin",
+			"%2F%2Fevil.example%2Foauth%2Fauthorize",
+		} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/oauth/login?redirect="+bad, nil)
+			makeRouter().ServeHTTP(w, req)
+			assert.Equal(t, "/login", w.Header().Get("Location"), bad)
+		}
+	})
+
 	t.Run("redirects to apps/login when OAUTH_LOGIN_REDIRECT_URL is set", func(t *testing.T) {
 		t.Setenv("OAUTH_LOGIN_REDIRECT_URL", "/login")
 

@@ -101,12 +101,19 @@ type MinimalClaims struct {
 	// We keep roles in the token for quick role-based checks without Redis lookup
 	Roles []string `json:"roles"`
 
+	// Act is the RFC 8693 actor (set only on impersonation tokens: the operator
+	// acting as the subject). ImpersonatorID / ImpersonationSessionID repeat it
+	// under the legacy claim names so receivers can banner an impersonated session.
+	Act                    *TokenActor `json:"act,omitempty"`
+	ImpersonatorID         string      `json:"impersonator_id,omitempty"`
+	ImpersonationSessionID string      `json:"impersonation_session_id,omitempty"`
+
 	// Scope defines the authorization scope ("tenant" or "platform")
 	// - "tenant": Normal tenant users with tenant-scoped permissions
 	// - "platform": Platform administrators with cross-tenant access
 	Scope string `json:"scp"`
 
-	// AppRoles contains the application-specific role assignments (e.g., "HexxLockERP.Admin").
+	// AppRoles contains the application-specific role assignments (e.g., "ExampleSuite.Admin").
 	// These are distinct from realm-level roles and are scoped to a specific application.
 	// Included only when the token is issued in an app-role context (client-credentials flow
 	// or when the user has roles assigned on the corresponding service principal).
@@ -223,7 +230,7 @@ type SpiceDBClaims struct {
 	// user was on the v2 rollout was permanently redirected to
 	// /unauthorized?reason=product_not_entitled, with no path to recover
 	// short of forcing a v1 token. Root-caused 2026-09-11 via a self-
-	// service Mearax signup that had an ACTIVE iam_product_instances row
+	// service AcmeWeb signup that had an ACTIVE iam_product_instances row
 	// but still 403'd — see GenerateAccessTokenV2's resolver call and
 	// signup_post_provisioner.go's HandleSubscriptionActivatedSync for
 	// the accompanying fix to the mint-before-provisioning race.

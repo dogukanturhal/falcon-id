@@ -3,9 +3,11 @@
 package middleware
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -17,9 +19,81 @@ import (
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
 
-// RequirePlatformAdmin middleware that requires the user to be a platform admin
-// SECURITY: This checks both the isPlatformAdmin claim AND verifies the tenant is exampletenant
-// Use this for platform-level operations that should only be accessible to HexxLock staff
+// platformAdminRoles are the only role names that grant access to the
+// platform plane (§2.8 the product roadmap: "Only platform_admin roles in
+// Hexxlock internal tenant ... may administer platform roles / cross-tenant
+// functions"). iam_admin is included because admin_bootstrap.go assigns it
+// alongside platform_admin to the bootstrap account and it is used
+// interchangeably for platform-plane IAM administration.
+var platformAdminRoles = []string{"platform_admin", "iam_admin"}
+
+// platformAuthorityPtr holds the OPS_STRICT_PLATFORM_ROLES authority. Unset
+// (or non-strict) = legacy behaviour everywhere below.
+var platformAuthorityPtr atomic.Pointer[services.PlatformAuthority]
+
+// SetPlatformAuthority installs the strict platform-role authority. Call once
+// at startup; nil restores legacy behaviour.
+func SetPlatformAuthority(pa *services.PlatformAuthority) { platformAuthorityPtr.Store(pa) }
+
+func strictPlatformRoles() bool { return platformAuthorityPtr.Load().Strict() }
+
+// applyStrictPlatformAuthority overrides the token-derived IsPlatformAdmin
+// with a LIVE check against iam_platform_roles when OPS_STRICT_PLATFORM_ROLES
+// is on, and records the verdict in PlatformAuthorityVerified. A no-op in
+// legacy mode. Tokens minted before the flag flipped (or before an
+// elevation expired) therefore stop granting platform admin immediately,
+// not at token expiry.
+func applyStrictPlatformAuthority(c *gin.Context, u *models.CurrentUser) {
+	pa := platformAuthorityPtr.Load()
+	if !pa.Strict() || u == nil {
+		return
+	}
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	ok := pa.VerifyAdmin(ctx, u.ID, u.TenantID, u.Email, userHasAnyRole(u.Roles, platformAdminRoles))
+	u.IsPlatformAdmin = ok
+	u.PlatformAuthorityVerified = ok
+}
+
+// platformPlaneRoleOK reports whether the principal holds the platform-plane
+// role the platform-admin gates require: the legacy tenant role
+// (platform_admin / iam_admin), or - under OPS_STRICT_PLATFORM_ROLES - the
+// verdict of the live iam_platform_roles check.
+func platformPlaneRoleOK(u *models.CurrentUser) bool {
+	if strictPlatformRoles() {
+		return u.PlatformAuthorityVerified
+	}
+	return userHasAnyRole(u.Roles, platformAdminRoles)
+}
+
+// isPlatformPlaneRoleName reports whether a role name is one of the legacy
+// platform-plane tenant roles.
+func isPlatformPlaneRoleName(name string) bool {
+	return userHasAnyRole([]string{name}, append([]string{"super_admin"}, platformAdminRoles...))
+}
+
+// holdsPlatformAdminRole is platformPlaneRoleOK for the tenant-ownership
+// checks, which historically also accepted super_admin.
+func holdsPlatformAdminRole(u *models.CurrentUser) bool {
+	if strictPlatformRoles() {
+		return u.PlatformAuthorityVerified
+	}
+	return u.HasRole("platform_admin") || u.HasRole("super_admin")
+}
+
+// RequirePlatformAdmin middleware that requires the user to be a platform admin.
+//
+// SECURITY (R0 platform-admin audit, docs/audits/2026-09-27-platform-admin-audit.md
+// finding F1): this used to grant platform access to ANY user in the
+// exampletenant tenant, regardless of role — tenant membership alone
+// was treated as sufficient. That is wrong: the internal tenant holds
+// non-admin service/operational accounts (e.g. payment-provider-sync,
+// mail-operator) that must not receive blanket platform:* access. This now
+// requires ALL THREE: the isPlatformAdmin claim, tenant == exampletenant,
+// AND the caller holding platform_admin or iam_admin. Fail-closed: any
+// missing signal denies.
 func (m *AuthMiddleware) RequirePlatformAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userVal, exists := c.Get(CurrentUserKey)
@@ -55,6 +129,17 @@ func (m *AuthMiddleware) RequirePlatformAdmin() gin.HandlerFunc {
 			return
 		}
 
+		// SECURITY: tenant membership is necessary but not sufficient — the
+		// caller must actually hold a platform-plane role. See finding F1.
+		if !platformPlaneRoleOK(user) {
+			logger.Log.Warn("Platform admin access denied - internal tenant member without platform role",
+				zap.String("user_id", user.ID.String()),
+				zap.Strings("roles", user.Roles),
+			)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Platform admin access required"})
+			return
+		}
+
 		c.Next()
 	}
 }
@@ -71,10 +156,13 @@ func userHasAnyRole(userRoles, allowedRoles []string) bool {
 	return false
 }
 
-// isVerifiedPlatformAdmin returns true when the user carries the platform admin flag AND
-// belongs to the exampletenant tenant (defense in depth).
+// isVerifiedPlatformAdmin returns true when the user carries the platform admin flag,
+// belongs to the exampletenant tenant, AND holds a platform-plane role
+// (defense in depth — see RequirePlatformAdmin / finding F1).
 func isVerifiedPlatformAdmin(user *models.CurrentUser) bool {
-	return user.IsPlatformAdmin && user.TenantID.String() == models.HexxlockInternalTenantID
+	return user.IsPlatformAdmin &&
+		user.TenantID.String() == models.HexxlockInternalTenantID &&
+		platformPlaneRoleOK(user)
 }
 
 // requireUserFromContext extracts *models.CurrentUser from the Gin context, aborting on failure.

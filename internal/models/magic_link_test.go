@@ -429,7 +429,7 @@ func TestMagicLinkVerifyRequest_FieldTags(t *testing.T) {
 	})
 
 	t.Run("should accept an opaque hex token", func(t *testing.T) {
-		token := "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" // gitleaks:allow — test fixture, not a real credential
+		token := "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
 		req := MagicLinkVerifyRequest{Token: token}
 		assert.Equal(t, token, req.Token)
 	})

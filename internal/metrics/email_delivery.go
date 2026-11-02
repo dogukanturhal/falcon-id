@@ -150,4 +150,5 @@ const (
 	EmailTemplateNewDeviceSignIn     = "new_device_signin"
 	EmailTemplateAccountLocked       = "account_locked"
 	EmailTemplateSuspiciousLogin     = "suspicious_login"
+	EmailTemplateDeviceWitnessTOTP   = "device_witness_totp"
 )

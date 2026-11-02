@@ -3,6 +3,7 @@
 package models
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,7 +31,40 @@ type APIKey struct {
 	ExpiresAt         *time.Time `json:"expires_at,omitempty" db:"expires_at"`
 	RevokedAt         *time.Time `json:"revoked_at,omitempty" db:"revoked_at"`
 	CreatedBy         *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+
+	// Tenant API key (WO#20) columns; zero values for legacy hxk_ rows.
+	Kind               string      `json:"kind" db:"kind"`
+	KeyID              *string     `json:"key_id,omitempty" db:"key_id"`
+	HashAlg            string      `json:"-" db:"hash_alg"`
+	Access             *string     `json:"access,omitempty" db:"access"`
+	RoleIDs            []uuid.UUID `json:"role_ids,omitempty" db:"role_ids"`
+	CompanyIDs         []uuid.UUID `json:"company_ids,omitempty" db:"company_ids"`
+	PrevHash           *string     `json:"-" db:"prev_hash"`
+	PrevValidUntil     *time.Time  `json:"-" db:"prev_valid_until"`
+	RotatedAt          *time.Time  `json:"rotated_at,omitempty" db:"rotated_at"`
+	CompanySyncState   string      `json:"company_sync_state,omitempty" db:"company_sync_state"`
+	CompanySyncAttempt int         `json:"-" db:"company_sync_attempts"`
+	CompanySyncNextAt  *time.Time  `json:"-" db:"company_sync_next_at"`
 }
+
+// Tenant API key kinds, hash algorithms and company-sync states.
+const (
+	APIKeyKindLegacy = "legacy"
+	APIKeyKindTenant = "tenant"
+	APIKeyHashArgon2 = "argon2"
+	// APIKeyHashHMAC is the prefix of hash_alg for tenant keys; the stored
+	// value is versioned by pepper ("hmac-sha256:v1", see APIKeyHashAlgHMAC).
+	APIKeyHashHMAC    = "hmac-sha256"
+	APIKeyAccessRead  = "read"
+	APIKeyAccessWrite = "write"
+
+	APIKeyCompanySyncSynced        = "synced"
+	APIKeyCompanySyncPendingAdd    = "pending_add"
+	APIKeyCompanySyncPendingRemove = "pending_remove"
+	// APIKeyCompanySyncFailed is terminal: business rejected the call (400/422)
+	// and retrying cannot succeed. The workers skip it; an operator must act.
+	APIKeyCompanySyncFailed = "failed"
+)
 
 // APIKeyUsage tracks individual API key usage
 type APIKeyUsage struct {
@@ -137,4 +171,16 @@ type APIKeyUsageStats struct {
 type EndpointUsage struct {
 	Endpoint     string `json:"endpoint"`
 	RequestCount int64  `json:"request_count"`
+}
+
+// APIKeyHashAlgHMAC is the hash_alg value for a tenant key hashed with the
+// given pepper version, e.g. "hmac-sha256:v1".
+func APIKeyHashAlgHMAC(pepperVersion string) string {
+	return APIKeyHashHMAC + ":" + pepperVersion
+}
+
+// APIKeyPepperVersion extracts the pepper version from a hash_alg value.
+func APIKeyPepperVersion(hashAlg string) (string, bool) {
+	version, found := strings.CutPrefix(hashAlg, APIKeyHashHMAC+":")
+	return version, found && version != ""
 }

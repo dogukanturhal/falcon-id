@@ -12,14 +12,14 @@
 --     "schema_version": 1,
 --     "global":   { "locale": "en-US", "theme": "dark" },
 --     "products": {
---       "mearax":     { "schema_version": 1, "onboarding": { "tour_seen": true,  "dismissed_banners": ["welcome"] } },
+--       "acmeweb":     { "schema_version": 1, "onboarding": { "tour_seen": true,  "dismissed_banners": ["welcome"] } },
 --       "hexx_forge": { "schema_version": 1, "onboarding": { "tour_seen": false } }
 --     }
 --   }
 --
 -- Each product owns its own subtree and bumps its own schema_version
 -- independently — no cross-product collisions, no flat key namespace
--- explosion at N products (avoids the `mearax_onboarding_*` anti-pattern
+-- explosion at N products (avoids the `acmeweb_onboarding_*` anti-pattern
 -- called out in the 2026-06-02 onboarding-architecture research,
 -- transcript stored in repo /docs/decisions/).
 --
@@ -54,7 +54,7 @@ ALTER TABLE iam_users
 ALTER TABLE iam_users VALIDATE CONSTRAINT iam_users_preferences_is_object;
 
 -- jsonb_path_ops is the right operator class here — we'll query with @>
--- containment ("any user with products.mearax.onboarding.tour_seen=true"),
+-- containment ("any user with products.acmeweb.onboarding.tour_seen=true"),
 -- not arbitrary path projections. Smaller index, faster scans.
 --
 -- CONCURRENTLY would be ideal in prod but is rejected by Keystone's

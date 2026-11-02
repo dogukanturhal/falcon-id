@@ -76,12 +76,16 @@ type enrollRequest struct {
 	WitnessSignedAt *string `json:"witness_signed_at,omitempty"` // RFC3339
 	EnrolledAt      string  `json:"enrolled_at"`                 // RFC3339 UTC
 
-	// Hardware identity (OEM SMBIOS/DMI) collected by the hexxlock-access
+	// Hardware identity (OEM SMBIOS/DMI) collected by the device-agent
 	// agent at enrollment. All optional — omitted/empty persist as "".
 	// Shared cross-repo contract field names (snake_case).
 	SerialNumber string `json:"serial_number"`
 	Model        string `json:"model"`
 	Manufacturer string `json:"manufacturer"`
+
+	// WitnessMethod is how the enrollment was witnessed: "passkey" or "otp".
+	// Optional (older jess omits it; persisted as "").
+	WitnessMethod string `json:"witness_method,omitempty"`
 }
 
 // enrollResponse is returned on a successful 201. Matches jess
@@ -109,6 +113,9 @@ type getByEKHashResponse struct {
 	SerialNumber string `json:"serial_number"`
 	Model        string `json:"model"`
 	Manufacturer string `json:"manufacturer"`
+	// WitnessMethod: "passkey" | "otp" | "" (legacy). jess caps renewal of
+	// "otp" devices using enrolled_at.
+	WitnessMethod string `json:"witness_method,omitempty"`
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -168,6 +175,12 @@ func (h *IAMDevicesHandler) Enroll(c *gin.Context) {
 		return
 	}
 
+	if req.WitnessMethod != "" && req.WitnessMethod != "passkey" && req.WitnessMethod != "otp" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_witness_method",
+			"details": "witness_method must be \"passkey\" or \"otp\" when present"})
+		return
+	}
+
 	// Parse optional witness_signed_at.
 	var witnessSignedAt *time.Time
 	if req.WitnessSignedAt != nil {
@@ -196,6 +209,7 @@ func (h *IAMDevicesHandler) Enroll(c *gin.Context) {
 		SerialNumber:    req.SerialNumber,
 		Model:           req.Model,
 		Manufacturer:    req.Manufacturer,
+		WitnessMethod:   req.WitnessMethod,
 	}
 
 	if err := h.repo.RegisterDevice(c.Request.Context(), row); err != nil {
@@ -253,9 +267,10 @@ type getByUUIDResponse struct {
 	RevokedAt       string  `json:"revoked_at,omitempty"` // RFC3339; empty = active
 	RevokedReason   *string `json:"revoked_reason,omitempty"`
 	// Hardware identity (empty string when the agent did not capture it).
-	SerialNumber string `json:"serial_number"`
-	Model        string `json:"model"`
-	Manufacturer string `json:"manufacturer"`
+	SerialNumber  string `json:"serial_number"`
+	Model         string `json:"model"`
+	Manufacturer  string `json:"manufacturer"`
+	WitnessMethod string `json:"witness_method,omitempty"`
 }
 
 // GetByUUID handles GET /internal/v1/iam-devices/by-uuid/:uuid.
@@ -315,6 +330,7 @@ func (h *IAMDevicesHandler) GetByUUID(c *gin.Context) {
 		SerialNumber:    row.SerialNumber,
 		Model:           row.Model,
 		Manufacturer:    row.Manufacturer,
+		WitnessMethod:   row.WitnessMethod,
 	}
 	if row.RevokedAt != nil {
 		resp.RevokedAt = row.RevokedAt.UTC().Format(time.RFC3339)
@@ -388,6 +404,7 @@ func (h *IAMDevicesHandler) GetByEKHash(c *gin.Context) {
 		SerialNumber:    row.SerialNumber,
 		Model:           row.Model,
 		Manufacturer:    row.Manufacturer,
+		WitnessMethod:   row.WitnessMethod,
 	}
 
 	c.JSON(http.StatusOK, resp)

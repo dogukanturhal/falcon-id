@@ -33,6 +33,11 @@ type Bootstrap struct {
 	repo             *Repository
 	log              *zap.SugaredLogger
 	pageSize         int
+	trialReadyHook   func(context.Context, uuid.UUID) error
+}
+
+func (b *Bootstrap) SetTrialReadyHook(hook func(context.Context, uuid.UUID) error) {
+	b.trialReadyHook = hook
 }
 
 // NewBootstrap creates a Bootstrap. httpClient should be an authenticated
@@ -65,12 +70,13 @@ type tenantListResponse struct {
 // bootstrapTenantPayload is a partial decode of the REST response — we only
 // extract the fields the projection stores.
 type bootstrapTenantPayload struct {
-	ID       uuid.UUID       `json:"id"`
-	Plan     string          `json:"plan"`
-	Type     string          `json:"type"`
-	Status   string          `json:"subscription_status"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	ID             uuid.UUID       `json:"id"`
+	Plan           string          `json:"plan"`
+	Type           string          `json:"type"`
+	Status         string          `json:"subscription_status"`
+	PlatformStatus string          `json:"status"`
+	Metadata       json.RawMessage `json:"metadata,omitempty"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }
 
 // RunOnce performs a full paginated snapshot of tenant-management and applies
@@ -112,7 +118,7 @@ func (b *Bootstrap) RunOnce(ctx context.Context) (int, error) {
 			// !699).
 			evt := TenantEvent{
 				ID:        t.ID,
-				Status:    t.Status,
+				Status:    tenantProjectionStatus(tenantPayload{Status: t.Status, PlatformStatus: t.PlatformStatus}),
 				Metadata:  []byte(t.Metadata),
 				EventTime: t.UpdatedAt,
 			}
@@ -124,6 +130,15 @@ func (b *Bootstrap) RunOnce(ctx context.Context) (int, error) {
 						"tenant_id", t.ID, "error", err)
 				}
 				continue
+			}
+			var metadata map[string]any
+			if len(t.Metadata) > 0 {
+				_ = json.Unmarshal(t.Metadata, &metadata)
+			}
+			if result != UpsertResultOrphan && evt.Status == "trial" && metadata["signup_trial_started"] == true && b.trialReadyHook != nil {
+				if err := b.trialReadyHook(ctx, t.ID); err != nil {
+					return total, fmt.Errorf("bootstrap confirmed trial product: %w", err)
+				}
 			}
 			switch result {
 			case UpsertResultApplied, UpsertResultSkipped:

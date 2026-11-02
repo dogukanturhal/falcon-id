@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
@@ -135,6 +136,16 @@ type OAuthClientTx interface {
 	MarkAuthorizationCodeUsedCAS(ctx context.Context, id uuid.UUID) (bool, error)
 	// CreateOAuthToken persists the issued token row inside the transaction.
 	CreateOAuthToken(ctx context.Context, token *models.OAuthToken) error
+	// LockRefreshRecovery is the authoritative check-and-revoke of the
+	// lost-response recovery path (see RefreshRecoveryOutcome).
+	LockRefreshRecovery(ctx context.Context, tokenID, observedSuccessor uuid.UUID) (RefreshRecoveryOutcome, error)
+	// SetTokenReplacedBy records the successor minted from a consumed token.
+	SetTokenReplacedBy(ctx context.Context, tokenID, successorID uuid.UUID) error
+	// RepointTokenReplacedBy moves replaced_by from the superseded successor to
+	// the pair a recovery just minted (compare-and-set on the old value, under
+	// the row lock LockRefreshRecovery took). Concurrent replays that observed
+	// the old successor then see the pointer moved and report Raced.
+	RepointTokenReplacedBy(ctx context.Context, tokenID, from, to uuid.UUID) error
 	// Commit finalises both writes; call it only after token generation has
 	// fully succeeded.
 	Commit(ctx context.Context) error
@@ -142,6 +153,38 @@ type OAuthClientTx interface {
 	// retry). A Rollback after a successful Commit is a no-op.
 	Rollback(ctx context.Context) error
 }
+
+// RefreshRecoveryOutcome is the result of LockRefreshRecovery.
+type RefreshRecoveryOutcome int
+
+const (
+	// RefreshRecoveryOK: the consumed token's successor was unused and is now
+	// revoked; the caller may issue a fresh pair from the same lineage.
+	RefreshRecoveryOK RefreshRecoveryOutcome = iota
+	// RefreshRecoveryRaced: a concurrent replay already recovered this token
+	// (replaced_by moved since the caller read it). Not theft.
+	RefreshRecoveryRaced
+	// RefreshRecoveryLineageAdvanced: the successor was used, revoked or is
+	// gone, so the replay is genuine reuse.
+	RefreshRecoveryLineageAdvanced
+	// RefreshRecoveryIneligible: the consumed token was already recovered once,
+	// is older than RefreshRecoveryWindow, or its successor was issued to a
+	// different IP than the replaying request. Handled as theft.
+	RefreshRecoveryIneligible
+)
+
+// RefreshRecoveryWindow bounds how long after its rotation a consumed refresh
+// token may still be recovered (a lost response is noticed within seconds; a
+// longer-lived replay is a stolen copy).
+const RefreshRecoveryWindow = 5 * time.Minute
+
+// Values of iam_oauth_tokens.revoke_reason written by the rotation path.
+const (
+	RevokeReasonRotated            = "rotated"
+	RevokeReasonRecoverySuperseded = "recovery_superseded"
+	RevokeReasonFamilyRevoked      = "family_revoked"
+	RevokeReasonSessionEnded       = "session_ended"
+)
 
 // oauthClientTx binds an OAuthClientRepository to a live pgx.Tx so every
 // embedded repository method runs on the transaction instead of the pool.
@@ -575,8 +618,8 @@ func (r *OAuthClientRepository) CreateOAuthToken(ctx context.Context, token *mod
 			id, tenant_id, client_id, user_id, token_type, token, scopes,
 			refresh_token, ip_address, user_agent, is_revoked, expires_at,
 			created_at, updated_at,
-			auth_methods_used, idp_session_id, token_family_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`
+			auth_methods_used, idp_session_id, token_family_id, session_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
 
 	if token.AuthMethodsUsed == nil {
 		token.AuthMethodsUsed = []string{}
@@ -594,7 +637,7 @@ func (r *OAuthClientRepository) CreateOAuthToken(ctx context.Context, token *mod
 		token.TokenType, token.Token, token.Scopes,
 		token.RefreshToken, token.IPAddress, token.UserAgent,
 		token.IsRevoked, token.ExpiresAt, token.CreatedAt, token.UpdatedAt,
-		token.AuthMethodsUsed, token.IdpSessionID, token.TokenFamilyID,
+		token.AuthMethodsUsed, token.IdpSessionID, token.TokenFamilyID, token.SessionID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create OAuth token: %w", err)
@@ -609,7 +652,8 @@ func (r *OAuthClientRepository) GetOAuthTokenByHash(ctx context.Context, tokenHa
 		SELECT id, tenant_id, client_id, user_id, token_type, token, scopes,
 		       refresh_token, ip_address, user_agent, is_revoked, revoked_at,
 		       expires_at, created_at, updated_at,
-		       auth_methods_used, idp_session_id, token_family_id
+		       auth_methods_used, idp_session_id, token_family_id, session_id, replaced_by,
+		       revoke_reason, recovery_count
 		FROM iam_oauth_tokens
 		WHERE token = $1 OR refresh_token = $1`
 
@@ -620,7 +664,8 @@ func (r *OAuthClientRepository) GetOAuthTokenByHash(ctx context.Context, tokenHa
 		&token.RefreshToken, &token.IPAddress, &token.UserAgent,
 		&token.IsRevoked, &token.RevokedAt, &token.ExpiresAt,
 		&token.CreatedAt, &token.UpdatedAt,
-		&token.AuthMethodsUsed, &token.IdpSessionID, &token.TokenFamilyID,
+		&token.AuthMethodsUsed, &token.IdpSessionID, &token.TokenFamilyID, &token.SessionID, &token.ReplacedBy,
+		&token.RevokeReason, &token.RecoveryCount,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -660,13 +705,137 @@ func (r *OAuthClientRepository) RevokeOAuthToken(ctx context.Context, tokenHash 
 func (r *OAuthClientRepository) ConsumeRefreshToken(ctx context.Context, tokenID uuid.UUID) (bool, error) {
 	now := time.Now()
 	query := `UPDATE iam_oauth_tokens
-	          SET is_revoked = true, revoked_at = $1, updated_at = $1
+	          SET is_revoked = true, revoked_at = $1, updated_at = $1, revoke_reason = 'rotated'
 	          WHERE id = $2 AND is_revoked = false`
 	tag, err := r.pool.Exec(ctx, query, now, tokenID)
 	if err != nil {
 		return false, fmt.Errorf("failed to consume refresh token: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+// SetTokenReplacedBy stamps replaced_by on the consumed token row (migration
+// 0031): the lineage pointer lost-response recovery follows.
+func (r *OAuthClientRepository) SetTokenReplacedBy(ctx context.Context, tokenID, successorID uuid.UUID) error {
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE iam_oauth_tokens SET replaced_by = $1, updated_at = now() WHERE id = $2 AND replaced_by IS NULL`,
+		successorID, tokenID); err != nil {
+		return fmt.Errorf("failed to set replaced_by: %w", err)
+	}
+	return nil
+}
+
+// RepointTokenReplacedBy is the recovery-only counterpart of
+// SetTokenReplacedBy: it overwrites replaced_by, but only while it still holds
+// `from`.
+func (r *OAuthClientRepository) RepointTokenReplacedBy(ctx context.Context, tokenID, from, to uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE iam_oauth_tokens SET replaced_by = $3, updated_at = now() WHERE id = $1 AND replaced_by = $2`,
+		tokenID, from, to)
+	if err != nil {
+		return fmt.Errorf("failed to repoint replaced_by: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("failed to repoint replaced_by: lineage pointer moved")
+	}
+	return nil
+}
+
+// RefreshSuccessorUnused reports whether the successor recorded on a consumed
+// token still exists, is live (not revoked) and was never rotated itself. It
+// is a lock-free pre-check; LockRefreshRecovery is authoritative.
+func (r *OAuthClientRepository) RefreshSuccessorUnused(ctx context.Context, successorID uuid.UUID) (bool, error) {
+	var revoked bool
+	var replacedBy *uuid.UUID
+	err := r.pool.QueryRow(ctx,
+		`SELECT is_revoked, replaced_by FROM iam_oauth_tokens WHERE id = $1`, successorID,
+	).Scan(&revoked, &replacedBy)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read refresh successor: %w", err)
+	}
+	return !revoked && replacedBy == nil, nil
+}
+
+// LockRefreshRecovery runs on a transaction. It row-locks the consumed token
+// (the lineage head, serialising concurrent replays) and its successor, then:
+//   - replaced_by != observedSuccessor: a concurrent replay already recovered
+//     it -> RefreshRecoveryRaced (exactly one replay wins);
+//   - already recovered once, or rotated longer ago than RefreshRecoveryWindow
+//     -> RefreshRecoveryIneligible;
+//   - successor missing / revoked / itself rotated: the lineage advanced ->
+//     RefreshRecoveryLineageAdvanced;
+//   - otherwise revokes the unused successor as recovery_superseded, bumps
+//     recovery_count on the consumed token -> RefreshRecoveryOK.
+func (r *OAuthClientRepository) LockRefreshRecovery(ctx context.Context, tokenID, observedSuccessor uuid.UUID) (RefreshRecoveryOutcome, error) {
+	var current *uuid.UUID
+	var recoveryCount int16
+	var revokedAt *time.Time
+	if err := r.pool.QueryRow(ctx,
+		`SELECT replaced_by, recovery_count, revoked_at FROM iam_oauth_tokens WHERE id = $1 FOR UPDATE`, tokenID,
+	).Scan(&current, &recoveryCount, &revokedAt); err != nil {
+		return RefreshRecoveryLineageAdvanced, fmt.Errorf("failed to lock refresh token: %w", err)
+	}
+	if current == nil || *current != observedSuccessor {
+		return RefreshRecoveryRaced, nil
+	}
+	if recoveryCount >= 1 || revokedAt == nil || time.Since(*revokedAt) > RefreshRecoveryWindow {
+		return RefreshRecoveryIneligible, nil
+	}
+	var revoked bool
+	var next *uuid.UUID
+	err := r.pool.QueryRow(ctx,
+		`SELECT is_revoked, replaced_by FROM iam_oauth_tokens WHERE id = $1 FOR UPDATE`, observedSuccessor,
+	).Scan(&revoked, &next)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RefreshRecoveryLineageAdvanced, nil
+	}
+	if err != nil {
+		return RefreshRecoveryLineageAdvanced, fmt.Errorf("failed to lock refresh successor: %w", err)
+	}
+	if revoked || next != nil {
+		return RefreshRecoveryLineageAdvanced, nil
+	}
+	// No IP binding here: the BFF does not forward the browser IP, so the
+	// recorded and request IPs are both the BFF pod and the check would block
+	// nobody. Add it back once a trusted client IP reaches falcon-id.
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE iam_oauth_tokens SET is_revoked = true, revoked_at = now(), updated_at = now(), revoke_reason = $2 WHERE id = $1`,
+		observedSuccessor, RevokeReasonRecoverySuperseded); err != nil {
+		return RefreshRecoveryLineageAdvanced, fmt.Errorf("failed to revoke refresh successor: %w", err)
+	}
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE iam_oauth_tokens SET recovery_count = recovery_count + 1, updated_at = now() WHERE id = $1`,
+		tokenID); err != nil {
+		return RefreshRecoveryLineageAdvanced, fmt.Errorf("failed to bump recovery_count: %w", err)
+	}
+	return RefreshRecoveryOK, nil
+}
+
+// execRetryDeadlock runs a bulk revoke UPDATE, retrying up to 3 attempts when
+// Postgres reports a deadlock (40P01): concurrent family / session sweeps and
+// rotations lock overlapping rows in different orders.
+func (r *OAuthClientRepository) execRetryDeadlock(ctx context.Context, query string, args ...any) (int64, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		var tag pgconn.CommandTag
+		tag, err = r.pool.Exec(ctx, query, args...)
+		if err == nil {
+			return tag.RowsAffected(), nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return 0, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 20 * time.Millisecond):
+		}
+	}
+	return 0, err
 }
 
 // RevokeRefreshTokenFamily revokes every still-live token sharing the given
@@ -679,13 +848,68 @@ func (r *OAuthClientRepository) ConsumeRefreshToken(ctx context.Context, tokenID
 func (r *OAuthClientRepository) RevokeRefreshTokenFamily(ctx context.Context, familyID uuid.UUID) (int64, error) {
 	now := time.Now()
 	query := `UPDATE iam_oauth_tokens
-	          SET is_revoked = true, revoked_at = $1, updated_at = $1
+	          SET is_revoked = true, revoked_at = $1, updated_at = $1,
+	              revoke_reason = COALESCE(revoke_reason, 'family_revoked')
 	          WHERE token_family_id = $2 AND is_revoked = false`
-	tag, err := r.pool.Exec(ctx, query, now, familyID)
+	n, err := r.execRetryDeadlock(ctx, query, now, familyID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to revoke refresh token family: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	return n, nil
+}
+
+// RevokeTokensBySession revokes every still-live token of userID bound to the
+// login session sessionID plus every token of that user in the rotation
+// families those tokens belong to. sessionID is matched against session_id
+// (the iam_sessions row, migration 0028) and idp_session_id (the `sid` claim).
+// Scoped by user_id so a mismatched or forged session reference can never
+// reach another user's tokens.
+//
+// Called on EXPLICIT session end only (logout, admin/user session revoke,
+// password change, deactivation). Idle/absolute expiry of the SSO session
+// must never reach this: refresh tokens have their own lifetime. Legacy
+// tokens with NULL session_id and idp_session_id are unbound and untouched.
+// Returns the number of rows revoked. uuid.Nil for either id is a no-op.
+func (r *OAuthClientRepository) RevokeTokensBySession(ctx context.Context, sessionID, userID uuid.UUID) (int64, error) {
+	if sessionID == uuid.Nil || userID == uuid.Nil {
+		return 0, nil
+	}
+	now := time.Now()
+	query := `UPDATE iam_oauth_tokens
+		SET is_revoked = true, revoked_at = $1, updated_at = $1,
+		    revoke_reason = COALESCE(revoke_reason, 'session_ended')
+		WHERE is_revoked = false AND user_id = $3
+		  AND (session_id = $2 OR idp_session_id = $2
+		       OR token_family_id IN (
+		           SELECT token_family_id FROM iam_oauth_tokens
+		           WHERE user_id = $3 AND (session_id = $2 OR idp_session_id = $2)
+		             AND token_family_id IS NOT NULL))`
+	n, err := r.execRetryDeadlock(ctx, query, now, sessionID, userID)
+	if err != nil {
+		return 0, fmt.Errorf("failed revoke session tokens: %w", err)
+	}
+	return n, nil
+}
+
+// ListSessionIDsByIdpSession returns the distinct iam_sessions row ids that
+// userID's tokens issued under the IdP session idpSessionID are bound to.
+func (r *OAuthClientRepository) ListSessionIDsByIdpSession(ctx context.Context, idpSessionID, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT DISTINCT session_id FROM iam_oauth_tokens
+		 WHERE idp_session_id = $1 AND user_id = $2 AND session_id IS NOT NULL`, idpSessionID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed list session ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed scan session id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // RevokeAllClientTokens revokes all tokens for a client
@@ -726,16 +950,15 @@ func (r *OAuthClientRepository) RevokeUserClientTokens(ctx context.Context, user
 // is_revoked=true causes IntrospectToken to return active=false on next
 // call (RFC 7662 §2.2 conformance per memory
 // internal engineering notes), and ConsumeRefreshToken on
-// the OAuth side classifies the token as ConsumeRefreshTokenReuseDetected
-// → triggers the full family revoke + OIDC Back-Channel Logout fan-out
-// to every relying party.
+// the OAuth side rejects the token with invalid_grant "session has ended"
+// (revoke_reason != 'rotated' is never treated as theft).
 func (r *OAuthClientRepository) RevokeAllUserOAuthTokens(ctx context.Context, userID uuid.UUID, reason string) error {
 	now := time.Now()
-	// reason is captured in audit / CAEP emission paths; the column itself
-	// is is_revoked + revoked_at (no reason column on iam_oauth_tokens).
-	_ = reason
-	query := `UPDATE iam_oauth_tokens SET is_revoked = true, revoked_at = $1 WHERE user_id = $2 AND is_revoked = false`
-	_, err := r.pool.Exec(ctx, query, now, userID)
+	// reason lands in iam_oauth_tokens.revoke_reason (migration 0031) so a
+	// later refresh replay is classified as "session ended", not as theft.
+	// Only "rotated" rows are treated as reuse by RefreshTokens.
+	query := `UPDATE iam_oauth_tokens SET is_revoked = true, revoked_at = $1, updated_at = $1, revoke_reason = $3 WHERE user_id = $2 AND is_revoked = false`
+	_, err := r.pool.Exec(ctx, query, now, userID, reason)
 	if err != nil {
 		return fmt.Errorf("failed to revoke all user OAuth tokens: %w", err)
 	}

@@ -10,18 +10,24 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/dogukanturhal/falcon-id/internal/middleware"
+	sharedpurge "github.com/dogukanturhal/platform-shared/tenantpurge"
 )
 
 // StubHandler groups all placeholder endpoints.
 type StubHandler struct {
-	db *pgxpool.Pool
+	db    *pgxpool.Pool
+	purge TenantPurgePlanner
 }
 
 // NewStubHandler creates a new StubHandler. The pool is optional — when nil,
@@ -719,12 +725,79 @@ func (h *StubHandler) UpdateTenant(c *gin.Context) {
 	})
 }
 
-// DeleteTenant deletes a tenant.
-// TODO: implement real tenant deletion
+// TenantPurgePlanner starts a tenant purge run in plan mode on tenant-management.
+type TenantPurgePlanner interface {
+	StartPlan(ctx context.Context, tenantID uuid.UUID, reason, actor string, actorID *uuid.UUID) (TenantPurgeRun, error)
+}
+
+// TenantPurgeRun is the run tenant-management created.
+type TenantPurgeRun struct {
+	RunID string `json:"run_id"`
+	State string `json:"state"`
+}
+
+// SetTenantPurgePlanner wires the tenant-management purge client. Without one,
+// DeleteTenant answers 501.
+func (h *StubHandler) SetTenantPurgePlanner(p TenantPurgePlanner) { h.purge = p }
+
+// DeleteTenant starts the purge of a tenant. falcon-id's iam_tenants is a synced
+// projection and tenant-management is the system of record (ADR-0029), so this does
+// not delete anything itself: it asks tenant-management to plan a purge run and
+// returns the run id. Applying the run (slug confirmation, reviewed plan digest,
+// backup reference) stays on tenant-management's own admin API, which then drives
+// every participant, falcon-id included, over Kafka.
+//
+// Body: {"reason": "..."} (required). Protected tenants are refused here too.
 func (h *StubHandler) DeleteTenant(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"id":      c.Param("tenant_id"),
-		"message": "Tenant deletion not yet implemented via platform management",
+	if h.purge == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"id":      c.Param("tenant_id"),
+			"error":   "tenant purge is not configured",
+			"message": "tenant-management (platform-core) is the system of record for tenant lifecycle; its purge API is not reachable from falcon-id",
+		})
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("tenant_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant id"})
+		return
+	}
+	if sharedpurge.IsProtected(tenantID.String()) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "protected tenant, refusing"})
+		return
+	}
+	user := middleware.GetCurrentUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Reason) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reason is required"})
+		return
+	}
+	actorID := user.ID
+	run, err := h.purge.StartPlan(c.Request.Context(), tenantID, strings.TrimSpace(req.Reason), user.ID.String(), &actorID)
+	if err != nil {
+		var se interface{ HTTPStatus() int }
+		if errors.As(err, &se) {
+			switch status := se.HTTPStatus(); status {
+			case http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity, http.StatusServiceUnavailable:
+				c.JSON(status, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		slog.Error("tenant purge plan failed", "tenant_id", tenantID, "error", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "tenant-management purge API call failed"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"tenant_id": tenantID,
+		"run_id":    run.RunID,
+		"state":     run.State,
+		"message":   "purge planned; review and apply it on tenant-management",
 	})
 }
 

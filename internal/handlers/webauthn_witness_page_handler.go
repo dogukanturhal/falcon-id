@@ -73,10 +73,10 @@ const WitnessCallbackPath = "/witness-callback"
 // different upstream than the document origin.
 const WitnessCSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* https://id.hexxlock.com; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
-// witnessSHA256HexRE matches a lower-case-or-mixed-case 64-char hex string.
+// witnessSHA256HexRE matches a lower-case 64-char hex string (the encoding jess stores).
 // Used to validate the ek_pubkey_hash query parameter, which the operator
 // is meant to read off the device's enrollment screen before signing.
-var witnessSHA256HexRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+var witnessSHA256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // witnessCallbackURLRE is the strict callback-URL allowlist:
 //   - http:// only (the loopback target is plaintext by definition; the
@@ -184,6 +184,13 @@ type witnessPageBootstrap struct {
 	State        string `json:"state"`
 	OperatorSub  string `json:"operatorSub"`
 	CSRFToken    string `json:"csrfToken"`
+	// Method is the witness method the page will run ("passkey" | "totp"),
+	// resolved server-side from the ?method= query and the account's factors.
+	Method string `json:"method"`
+	// Notice, when set, replaces the form with a non-retryable message
+	// (e.g. no usable factor); NoticeTitle is its heading.
+	Notice      string `json:"notice,omitempty"`
+	NoticeTitle string `json:"noticeTitle,omitempty"`
 }
 
 // witnessEnrollPageData is the html/template render context.
@@ -282,6 +289,8 @@ func (h *WebAuthnHandler) RenderWitnessEnrollPage(c *gin.Context) {
 	// page — strictly fail-closed.
 	csrfToken := h.generateWitnessCSRFToken(c, user.SessionID)
 
+	method, noticeTitle, notice := h.resolveWitnessMethod(c, user, c.Query("method"))
+
 	bootstrap := witnessPageBootstrap{
 		DeviceUUID:   deviceUUID,
 		EKPubkeyHash: ekHash,
@@ -289,6 +298,9 @@ func (h *WebAuthnHandler) RenderWitnessEnrollPage(c *gin.Context) {
 		State:        state,
 		OperatorSub:  user.ID.String(),
 		CSRFToken:    csrfToken,
+		Method:       method,
+		Notice:       notice,
+		NoticeTitle:  noticeTitle,
 	}
 	bsJSON, err := json.Marshal(bootstrap)
 	if err != nil {
@@ -431,3 +443,33 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxyge
 <div class="error"><strong>{{.Title}}</strong>{{.Detail}}</div>
 </div>
 </body></html>`
+
+// resolveWitnessMethod decides which method the page runs from the requested
+// ?method= (passkey|totp, default passkey) and the account's factors:
+//   - an account WITH a passkey always gets the passkey flow (no fallback);
+//   - without one, the authenticator app is the only workable method, and is
+//     offered only when the kill switch and realm policy allow it;
+//   - an explicit method=passkey on a passkey-less account is answered with a
+//     message instead of silently switching the factor the operator picked.
+func (h *WebAuthnHandler) resolveWitnessMethod(c *gin.Context, user *models.CurrentUser, requested string) (method, noticeTitle, notice string) {
+	if h.witnessInfo == nil {
+		return "passkey", "", ""
+	}
+	st := h.witnessInfo.Status(c.Request.Context(), user)
+	if st.HasPasskey {
+		return "passkey", "", ""
+	}
+	if !st.TOTPAllowed {
+		return "passkey", "No passkey on this account",
+			"This account has no passkey and authenticator-app witnessing is not available. Register a passkey in your Falcon ID account security settings."
+	}
+	if requested == "passkey" {
+		return "passkey", "No passkey on this account",
+			"This account has no passkey. Go back and choose \"Use authenticator app\"."
+	}
+	if !st.HasTOTP {
+		return "totp", "Set up an authenticator app",
+			"This account has no passkey and no authenticator app. Set up an authenticator app in your Falcon ID account security settings, then try again after 24 hours."
+	}
+	return "totp", "", ""
+}

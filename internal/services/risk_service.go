@@ -666,7 +666,7 @@ func (s *RiskService) RecordLoginEvent(
 		event.BlockReason = &reason
 	}
 	// Edge-stamped geo enrichment (platform migration v0.232.247).
-	// Sourced from id-hexxlock-geo-stamp Cloudflare Worker via
+	// Sourced from geo-stamp Cloudflare Worker via
 	// X-Geo-* headers, stamped onto ctx by auth_handler.go::Login at
 	// the trust boundary. Per-field empty-string guard so an absent
 	// X-Geo-City doesn't land as "" in the column. IsVPNHint is only

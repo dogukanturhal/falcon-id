@@ -28,8 +28,20 @@ var ErrRLSContextMismatch = errors.New("RLS context guard: session variable does
 // (when available) app.current_realm_id for PostgreSQL RLS.
 // This middleware MUST be applied AFTER auth middleware OR tenant extractor middleware.
 //
+// REGISTERED as of the RLS-enforcement change (cmd/routes.go,
+// applyGlobalMiddleware): this function IS mounted globally via
+// router.Use(database.RLSMiddleware(dataPlanePool)) for any request that has
+// a tenant_id in context. The stale "NOT CURRENTLY REGISTERED" note that
+// used to live here (dated 2026-09-21) predates that wiring and was left
+// uncorrected by the commit that did the wiring; it is removed here because
+// it no longer describes the code. Registering this middleware alone still
+// does not make every repository query run inside its transaction -
+// repositories must separately be converted to consume "db_tx"/"pgx_tx" out
+// of gin context (e.g. via each repository's WithDB(tx) clone method, see
+// internal/repositories/withdb.go) instead of querying the raw pool.
+//
 // CRITICAL: For each request with a tenant_id in context (from JWT or X-Tenant-ID header),
-// this middleware acquires a connection and executes:
+// this middleware opens an explicit transaction and executes, inside it:
 //
 //	SET LOCAL app.current_tenant_id = '<tenant_uuid>'
 //
@@ -37,11 +49,25 @@ var ErrRLSContextMismatch = errors.New("RLS context guard: session variable does
 //
 //	SET LOCAL app.current_realm_id = '<realm_uuid>'
 //
+// SET LOCAL only takes effect for the remainder of the current transaction block;
+// outside of one it is a silent no-op (PostgreSQL emits
+// "WARNING: SET LOCAL can only be used in transaction blocks" and the setting
+// is discarded before the next statement runs on that connection). A prior
+// version of this middleware called SET LOCAL on a bare acquired connection
+// with no enclosing BEGIN, so the tenant/realm GUCs were never actually
+// applied. This version opens the transaction explicitly and verifies each
+// GUC with a read-back (matching the pattern already used by
+// WithTenantContextPgx / WithTenantContextSQLX below) before letting the
+// request proceed, and commits or rolls back the transaction once the
+// downstream handler chain returns.
+//
 // This is REQUIRED for Row Level Security (RLS) policies that filter by:
 //
 //	tenant_id = current_setting('app.current_tenant_id', true)::UUID
 //
-// WITHOUT this middleware, RLS policies will block ALL rows, causing 0-row queries.
+// WITHOUT this middleware being both registered AND actually used by the
+// repository layer, RLS policies with a fail-closed shape will block ALL
+// rows, causing 0-row queries.
 //
 // Usage:
 //
@@ -87,105 +113,90 @@ func RLSMiddleware(db interface{}) gin.HandlerFunc {
 			}
 		}
 
-		// Set tenant (and optionally realm) context on the database connection.
-		// IMPORTANT: We must acquire a connection for the request lifecycle.
-		var err error
+		// Set tenant (and optionally realm) context inside an explicit
+		// transaction that spans the request lifecycle. SET LOCAL is only
+		// meaningful inside a transaction block (see doc comment above).
 		switch v := db.(type) {
 		case *sql.DB:
-			// For sql.DB, acquire connection and defer release
-			conn, connErr := v.Conn(c.Request.Context())
-			if connErr != nil {
+			tx, txErr := v.BeginTx(c.Request.Context(), nil)
+			if txErr != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-					"error": "Failed to acquire database connection",
+					"error": "Failed to begin database transaction",
 				})
 				return
 			}
-			defer conn.Close() //nolint:errcheck
 
-			// Set LOCAL to ensure the setting is transaction-scoped
-			_, err = conn.ExecContext(c.Request.Context(), "SET LOCAL app.current_tenant_id = $1", tenantID.String())
-			if err != nil {
+			if err := setAndVerifyGUCSQL(c.Request.Context(), tx, tenantID, realmID); err != nil {
+				_ = tx.Rollback()
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 					"error": "Failed to set tenant context for RLS",
 				})
 				return
 			}
 
-			if realmID != uuid.Nil {
-				_, err = conn.ExecContext(c.Request.Context(), "SET LOCAL app.current_realm_id = $1", realmID.String())
-				if err != nil {
-					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-						"error": "Failed to set realm context for RLS",
-					})
-					return
+			c.Set("db_tx", tx)
+			defer func() {
+				if r := recover(); r != nil {
+					_ = tx.Rollback()
+					panic(r)
 				}
-			}
-
-			// Store connection in context for reuse
-			c.Set("db_conn", conn)
+				finishSQLTx(tx, c)
+			}()
+			c.Next()
 
 		case *sqlx.DB:
-			// For sqlx.DB, acquire connection and defer release
-			conn, connErr := v.Conn(c.Request.Context())
-			if connErr != nil {
+			tx, txErr := v.BeginTxx(c.Request.Context(), nil)
+			if txErr != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-					"error": "Failed to acquire database connection",
+					"error": "Failed to begin database transaction",
 				})
 				return
 			}
-			defer conn.Close() //nolint:errcheck
 
-			_, err = conn.ExecContext(c.Request.Context(), "SET LOCAL app.current_tenant_id = $1", tenantID.String())
-			if err != nil {
+			if err := setAndVerifyGUCSQL(c.Request.Context(), tx.Tx, tenantID, realmID); err != nil {
+				_ = tx.Rollback()
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 					"error": "Failed to set tenant context for RLS",
 				})
 				return
 			}
 
-			if realmID != uuid.Nil {
-				_, err = conn.ExecContext(c.Request.Context(), "SET LOCAL app.current_realm_id = $1", realmID.String())
-				if err != nil {
-					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-						"error": "Failed to set realm context for RLS",
-					})
-					return
+			c.Set("db_tx", tx)
+			defer func() {
+				if r := recover(); r != nil {
+					_ = tx.Rollback()
+					panic(r)
 				}
-			}
-
-			c.Set("db_conn", conn)
+				finishSQLXTx(tx, c)
+			}()
+			c.Next()
 
 		case *pgxpool.Pool:
-			// For pgxpool, acquire connection and defer release
-			conn, connErr := v.Acquire(c.Request.Context())
-			if connErr != nil {
+			tx, txErr := v.Begin(c.Request.Context())
+			if txErr != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-					"error": "Failed to acquire database connection",
+					"error": "Failed to begin database transaction",
 				})
 				return
 			}
-			defer conn.Release()
 
-			_, err = conn.Exec(c.Request.Context(), "SET LOCAL app.current_tenant_id = $1", tenantID.String())
-			if err != nil {
+			if err := setAndVerifyGUCPgx(c.Request.Context(), tx, tenantID, realmID); err != nil {
+				_ = tx.Rollback(c.Request.Context())
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 					"error": "Failed to set tenant context for RLS",
 				})
 				return
 			}
 
-			if realmID != uuid.Nil {
-				_, err = conn.Exec(c.Request.Context(), "SET LOCAL app.current_realm_id = $1", realmID.String())
-				if err != nil {
-					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-						"error": "Failed to set realm context for RLS",
-					})
-					return
+			c.Set("pgx_tx", tx)
+			defer func() {
+				if r := recover(); r != nil {
+					_ = tx.Rollback(context.Background())
+					panic(r)
 				}
-			}
-
-			// Store connection in context for reuse
-			c.Set("pgx_conn", conn)
+				finishPgxTx(tx, c)
+			}()
+			c.Next()
 
 		default:
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
@@ -193,8 +204,131 @@ func RLSMiddleware(db interface{}) gin.HandlerFunc {
 			})
 			return
 		}
+	}
+}
 
-		c.Next()
+// sqlExecer is satisfied by both *sql.Tx and the pieces of *sqlx.Tx we need.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// setAndVerifyGUCSQL sets app.current_tenant_id (and optionally
+// app.current_realm_id) via SET LOCAL on tx and reads each back to confirm
+// the setting actually took effect, guarding against the SET-LOCAL-outside-
+// a-transaction failure mode this middleware previously had.
+func setAndVerifyGUCSQL(ctx context.Context, tx sqlExecer, tenantID uuid.UUID, realmID uuid.UUID) error {
+	// set_config(name, value, is_local) -- NOT "SET LOCAL x = $1". Postgres's
+	// SET command is a utility statement that does not accept bind
+	// parameters at all (confirmed live: "PREPARE x(text) AS SET LOCAL
+	// app.current_tenant_id = $1" fails with "syntax error at or near
+	// SET"). set_config() is a regular function call, so it supports bind
+	// parameters through the normal extended query protocol, and its third
+	// argument (is_local=true) gives the exact same transaction-scoped
+	// semantics as SET LOCAL.
+	if _, err := tx.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String()); err != nil {
+		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
+	}
+	var actual string
+	if err := tx.QueryRowContext(ctx, "SELECT current_setting('app.current_tenant_id', true)").Scan(&actual); err != nil {
+		return fmt.Errorf("RLS context guard: failed to read back tenant_id: %w", err)
+	}
+	if actual != tenantID.String() {
+		return fmt.Errorf("%w: expected %s, got %q", ErrRLSContextMismatch, tenantID, actual)
+	}
+
+	if realmID != uuid.Nil {
+		if _, err := tx.ExecContext(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID.String()); err != nil {
+			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
+		}
+		if err := tx.QueryRowContext(ctx, "SELECT current_setting('app.current_realm_id', true)").Scan(&actual); err != nil {
+			return fmt.Errorf("RLS context guard: failed to read back realm_id: %w", err)
+		}
+		if actual != realmID.String() {
+			return fmt.Errorf("%w: expected realm %s, got %q", ErrRLSContextMismatch, realmID, actual)
+		}
+	}
+	return nil
+}
+
+// setAndVerifyGUCPgx is the pgx.Tx equivalent of setAndVerifyGUCSQL.
+func setAndVerifyGUCPgx(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, realmID uuid.UUID) error {
+	// See the comment in setAndVerifyGUCSQL above: SET LOCAL does not
+	// support bind parameters, so this must go through set_config().
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String()); err != nil {
+		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
+	}
+	var actual string
+	if err := tx.QueryRow(ctx, "SELECT current_setting('app.current_tenant_id', true)").Scan(&actual); err != nil {
+		return fmt.Errorf("RLS context guard: failed to read back tenant_id: %w", err)
+	}
+	if actual != tenantID.String() {
+		return fmt.Errorf("%w: expected %s, got %q", ErrRLSContextMismatch, tenantID, actual)
+	}
+
+	if realmID != uuid.Nil {
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID.String()); err != nil {
+			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
+		}
+		if err := tx.QueryRow(ctx, "SELECT current_setting('app.current_realm_id', true)").Scan(&actual); err != nil {
+			return fmt.Errorf("RLS context guard: failed to read back realm_id: %w", err)
+		}
+		if actual != realmID.String() {
+			return fmt.Errorf("%w: expected realm %s, got %q", ErrRLSContextMismatch, realmID, actual)
+		}
+	}
+	return nil
+}
+
+// finishSQLTx commits the request-scoped transaction on a clean response and
+// rolls it back otherwise (handler error/abort, or a non-2xx/3xx status the
+// handler set deliberately).
+//
+// finishSQLTx must never run directly on a panicking request: at the point
+// this function's caller (RLSMiddleware) would invoke it, a panic has not
+// yet been converted into a 5xx response, because an outer recovery
+// middleware's own deferred recover() only fires after every deferred call
+// registered deeper in the stack (including this middleware's) has already
+// run - c.Writer.Status() is still whatever it was before the panic. The
+// caller therefore wraps the call to finishSQLTx in its own deferred
+// recover() that detects a panic, rolls back, and re-panics BEFORE reaching
+// this function - see the defer in RLSMiddleware's *sql.DB case. Before that
+// defer existed, this middleware called finishSQLTx unconditionally
+// (non-deferred, right after c.Next()), so a downstream panic skipped the
+// call to it entirely and left the transaction (and its pooled connection)
+// never committed or rolled back - reproduced locally in
+// rls_middleware_panic_leak_local_test.go
+// (TestRLSMiddleware_PanicDoesNotLeakConnection).
+func finishSQLTx(tx *sql.Tx, c *gin.Context) {
+	if c.IsAborted() || c.Writer.Status() >= http.StatusBadRequest {
+		_ = tx.Rollback()
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+	}
+}
+
+// finishSQLXTx is the *sqlx.Tx equivalent of finishSQLTx.
+func finishSQLXTx(tx *sqlx.Tx, c *gin.Context) {
+	if c.IsAborted() || c.Writer.Status() >= http.StatusBadRequest {
+		_ = tx.Rollback()
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+	}
+}
+
+// finishPgxTx is the pgx.Tx equivalent of finishSQLTx.
+func finishPgxTx(tx pgx.Tx, c *gin.Context) {
+	ctx := context.Background()
+	if c.IsAborted() || c.Writer.Status() >= http.StatusBadRequest {
+		_ = tx.Rollback(ctx)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		_ = tx.Rollback(ctx)
 	}
 }
 
@@ -208,13 +342,13 @@ func RLSMiddlewarePgxPool(pool *pgxpool.Pool) gin.HandlerFunc {
 // sql.DB connection for RLS. Use SET LOCAL to scope the setting to the current transaction.
 // The realmID parameter is variadic for backward compatibility; only the first value is used.
 func SetRLSContext(ctx context.Context, db *sql.DB, tenantID uuid.UUID, realmID ...uuid.UUID) error {
-	_, err := db.ExecContext(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err := db.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = db.ExecContext(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = db.ExecContext(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}
@@ -227,13 +361,13 @@ func SetRLSContext(ctx context.Context, db *sql.DB, tenantID uuid.UUID, realmID 
 // sqlx.DB connection for RLS.
 // The realmID parameter is variadic for backward compatibility; only the first value is used.
 func SetRLSContextSQLX(ctx context.Context, db *sqlx.DB, tenantID uuid.UUID, realmID ...uuid.UUID) error {
-	_, err := db.ExecContext(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err := db.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = db.ExecContext(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = db.ExecContext(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}
@@ -246,13 +380,13 @@ func SetRLSContextSQLX(ctx context.Context, db *sqlx.DB, tenantID uuid.UUID, rea
 // pgxpool connection for RLS.
 // The realmID parameter is variadic for backward compatibility; only the first value is used.
 func SetRLSContextPgx(ctx context.Context, pool *pgxpool.Pool, tenantID uuid.UUID, realmID ...uuid.UUID) error {
-	_, err := pool.Exec(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err := pool.Exec(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = pool.Exec(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = pool.Exec(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}
@@ -281,7 +415,7 @@ func WithTenantContext(ctx context.Context, db *sql.DB, tenantID uuid.UUID, fn f
 	defer tx.Rollback() //nolint:errcheck // Rollback if not committed
 
 	// Set tenant context with LOCAL scope (transaction-scoped)
-	_, err = tx.ExecContext(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err = tx.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
@@ -296,7 +430,7 @@ func WithTenantContext(ctx context.Context, db *sql.DB, tenantID uuid.UUID, fn f
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = tx.ExecContext(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = tx.ExecContext(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}
@@ -336,7 +470,7 @@ func WithTenantContextSQLX(ctx context.Context, db *sqlx.DB, tenantID uuid.UUID,
 	defer tx.Rollback() //nolint:errcheck
 
 	// Set tenant context with LOCAL scope
-	_, err = tx.ExecContext(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err = tx.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
@@ -351,7 +485,7 @@ func WithTenantContextSQLX(ctx context.Context, db *sqlx.DB, tenantID uuid.UUID,
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = tx.ExecContext(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = tx.ExecContext(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}
@@ -394,7 +528,7 @@ func WithTenantContextPgx(ctx context.Context, pool *pgxpool.Pool, tenantID uuid
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// Set tenant context with LOCAL scope
-	_, err = tx.Exec(ctx, "SET LOCAL app.current_tenant_id = $1", tenantID.String())
+	_, err = tx.Exec(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String())
 	if err != nil {
 		return fmt.Errorf("failed to set app.current_tenant_id: %w", err)
 	}
@@ -409,7 +543,7 @@ func WithTenantContextPgx(ctx context.Context, pool *pgxpool.Pool, tenantID uuid
 	}
 
 	if len(realmID) > 0 && realmID[0] != uuid.Nil {
-		_, err = tx.Exec(ctx, "SET LOCAL app.current_realm_id = $1", realmID[0].String())
+		_, err = tx.Exec(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID[0].String())
 		if err != nil {
 			return fmt.Errorf("failed to set app.current_realm_id: %w", err)
 		}

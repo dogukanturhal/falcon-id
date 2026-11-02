@@ -45,7 +45,7 @@ const docTemplate = `{
     "title": "{{.Title}}",
     "contact": {
       "name": "Hexxlock API Support",
-      "email": "api-support@hexxlock.com"
+      "email": "dogukanturhal@hexxlock.com"
     },
     "version": "{{.Version}}"
   },

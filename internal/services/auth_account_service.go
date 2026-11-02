@@ -23,7 +23,8 @@ import (
 // knownModules is the canonical set of ExampleSuite business module slugs.
 var knownModules = []string{
 	"hr", "crm", "inventory", "invoicing", "marketing", "accounting",
-	"plm", "qms", "sd", "pm", "cmms", "fico", "mm", "ppscm", "ecommerce",
+	"plm", "qms", "sd", "pm", "projects", "cmms", "fico", "mm", "ppscm", "ecommerce",
+	"preaccounting", "payroll",
 }
 
 // deriveEntitledModules returns the list of business modules a user can access
@@ -254,10 +255,23 @@ func (s *AuthService) ChangePassword(ctx context.Context, userID uuid.UUID, curr
 	// EndAllUserSessionsExcept; any subsequent OAuth-token usage from
 	// the current device fails with "invalid_grant: token revoked"
 	// causing the BFF to redirect to login.
-	_ = s.tokenService.RevokeAllUserOAuthTokens(ctx, userID, "password_change")
+	if s.accessTerminator != nil {
+		// One path: sessions (except current), OAuth tokens, IdP SSO sessions
+		// (except current), per-session JWT blacklist and BCL. The flat
+		// user-level blacklist stays off so the user is not locked out.
+		opts := TerminateOptions{}
+		if currentSessionID != uuid.Nil {
+			opts.ExceptSessionID = &currentSessionID
+		}
+		termCtx, cancel := detachedTerminationCtx()
+		defer cancel()
+		_ = s.accessTerminator.TerminateUserAccessWith(termCtx, userID, user.TenantID, "password_change", opts)
+	} else {
+		_ = s.tokenService.RevokeAllUserOAuthTokens(ctx, userID, "password_change")
 
-	// End all sessions except current
-	_ = s.sessionRepo.EndAllUserSessionsExcept(ctx, userID, currentSessionID, "password_change")
+		// End all sessions except current
+		_ = s.sessionRepo.EndAllUserSessionsExcept(ctx, userID, currentSessionID, "password_change")
+	}
 
 	// Publish CAEPasswordChanged so receivers (Talon IAP, SSE
 	// subscribers) immediately re-evaluate any other active session
@@ -321,6 +335,9 @@ func (s *AuthService) RevokeSession(ctx context.Context, userID, sessionID uuid.
 		return fmt.Errorf("session does not belong to user")
 	}
 
+	// Explicit end: EndSession (idempotent) also sweeps the refresh tokens
+	// bound to this session and their families, so the revoked device cannot
+	// silently mint new access tokens.
 	return s.sessionRepo.EndSession(ctx, sessionID, "revoked")
 }
 
@@ -413,7 +430,7 @@ func (s *AuthService) GenerateImpersonationTokens(
 	permissions []string,
 	impersonatorID uuid.UUID,
 	impersonationSessionID uuid.UUID,
-) (accessToken string, refreshToken string, expiresIn int, err error) {
+) (accessToken string, expiresIn int, err error) {
 	// Create a temporary session ID for the impersonation
 	sessionID := uuid.New()
 
@@ -428,15 +445,13 @@ func (s *AuthService) GenerateImpersonationTokens(
 		impersonationSessionID,
 	)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("failed to generate access token: %w", err)
+		return "", 0, fmt.Errorf("failed to generate access token: %w", err)
 	}
 
-	// For impersonation, we don't generate a refresh token
-	// The admin must end impersonation and re-impersonate if needed
-	// This is a security measure to prevent long-lived impersonation
+	// Impersonation never yields a refresh token: the credential is a single
+	// short-lived access token carrying act/impersonator claims. The operator
+	// ends the session and starts a new one to continue.
+	expiresIn = int(impersonationTokenTTL / time.Second)
 
-	// Impersonation tokens expire in 15 minutes
-	expiresIn = 15 * 60
-
-	return accessToken, "", expiresIn, nil
+	return accessToken, expiresIn, nil
 }

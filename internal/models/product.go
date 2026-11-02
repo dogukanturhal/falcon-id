@@ -45,7 +45,7 @@ const (
 	ProductVersionStatusEndOfLife ProductVersionStatus = "end_of_life"
 )
 
-// Product represents a product in the HexxLock product registry.
+// Product represents a product in the platform product registry.
 type Product struct {
 	ID               uuid.UUID              `json:"id" db:"id"`
 	Name             string                 `json:"name" db:"name"`

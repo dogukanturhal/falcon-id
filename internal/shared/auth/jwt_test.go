@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const testSecret = "test-secret-key-for-jwt-signing-32chars" // gitleaks:allow — test fixture, not a real credential
+const testSecret = "test-secret-key-for-jwt-signing-32chars"
 
 // createTestToken creates a test JWT token with the given parameters
 func createTestToken(secret string, tenantID, userID uuid.UUID, expiresAt time.Time) string {
@@ -140,13 +140,13 @@ func TestExtractBearerToken(t *testing.T) {
 		{ //nolint:gosec // test fixture value, not a real credential
 			name:       "Valid bearer token",
 			authHeader: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
-			wantToken:  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test", // gitleaks:allow — test fixture, not a real credential
+			wantToken:  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
 			wantErr:    false,
 		},
 		{ //nolint:gosec // test fixture value, not a real credential
 			name:       "Valid bearer token lowercase",
 			authHeader: "bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
-			wantToken:  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test", // gitleaks:allow — test fixture, not a real credential
+			wantToken:  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
 			wantErr:    false,
 		},
 		{
@@ -157,7 +157,7 @@ func TestExtractBearerToken(t *testing.T) {
 		},
 		{
 			name:       "Missing bearer prefix",
-			authHeader: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test", // gitleaks:allow — test fixture, not a real credential
+			authHeader: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
 			wantToken:  "",
 			wantErr:    true,
 		},

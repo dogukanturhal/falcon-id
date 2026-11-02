@@ -79,8 +79,8 @@ func (r *OutboxRepository) GetPendingEvents(ctx context.Context, batchSize int) 
 			   status, retry_count, max_retries, error_message,
 			   created_at, processed_at, next_retry_at
 		FROM iam_permission_outbox
-		WHERE (status = $1)
-		   OR (status = $2 AND next_retry_at IS NOT NULL AND next_retry_at <= NOW() AND retry_count < max_retries)
+		WHERE event_type <> 'role.revoked' AND ((status = $1)
+		   OR (status = $2 AND next_retry_at IS NOT NULL AND next_retry_at <= NOW() AND retry_count < max_retries))
 		ORDER BY created_at ASC
 		LIMIT $3
 		FOR UPDATE SKIP LOCKED`

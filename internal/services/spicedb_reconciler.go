@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/falcon-id/internal/authorization"
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 	"github.com/dogukanturhal/falcon-id/pkg/spicedb"
@@ -275,6 +277,21 @@ func (r *SpiceDBReconciler) reconcileTenant(ctx context.Context, tenantID uuid.U
 		}
 	}
 
+	// WO#20: tenant API key principals are not iam_users rows, so the passes
+	// above never see them. Gated on the developer-keys flag.
+	if r.config.DeveloperKeysEnabled {
+		if err := r.reconcileAPIKeyRoles(ctx, tenantID, stats); err != nil {
+			logger.Warn("reconcileAPIKeyRoles failed",
+				zap.String("tenant_id", tenantID.String()),
+				zap.Error(err),
+			)
+			stats.Errors++
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
 	return firstErr
 }
 
@@ -409,6 +426,75 @@ func (r *SpiceDBReconciler) reconcileUserTenantMemberships(
 	return rows.Err()
 }
 
+// userRoleState is one user's PostgreSQL-side role state in a tenant.
+type userRoleState struct {
+	active  bool
+	desired map[uuid.UUID]struct{}
+}
+
+// loadUserRoleStates reads every known user's active role grants in tenantID:
+// home users plus external (seat-free) members, whose home tenant is another
+// one. An external member counts as active only while the membership is
+// active, so a revocation whose synchronous SpiceDB delete failed is still
+// converged to "no roles".
+//
+// iam_user_memberships has FORCE RLS (tenant-only policy) and the pool role
+// is NOBYPASSRLS: without the tenant scope the LEFT JOIN finds no external
+// membership and every external member would be converged to "no roles".
+// The scan is per tenant, so it runs under tenantID's scope.
+func loadUserRoleStates(ctx context.Context, db repositories.DBTX, tenantID uuid.UUID) (map[uuid.UUID]*userRoleState, error) {
+	const q = `
+		SELECT u.id,
+		       u.is_active AND (u.tenant_id = $1 OR m.status = 'active'),
+		       role.id
+		FROM iam_users u
+		LEFT JOIN iam_user_memberships m
+		  ON m.user_id = u.id
+		 AND m.tenant_id = $1
+		 AND m.seat_class = 'external'
+		LEFT JOIN iam_user_roles ur
+		  ON ur.user_id = u.id
+		 AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+		LEFT JOIN iam_roles role
+		  ON role.id = ur.role_id
+		 AND role.tenant_id = $1
+		WHERE u.tenant_id = $1 OR m.id IS NOT NULL
+		ORDER BY u.id, role.id`
+
+	states := make(map[uuid.UUID]*userRoleState)
+	err := repositories.WithTenantScope(ctx, db, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, q, tenantID)
+		if err != nil {
+			return fmt.Errorf("reconcileUserRoles query: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var (
+				userID uuid.UUID
+				active bool
+				roleID *uuid.UUID
+			)
+			if err := rows.Scan(&userID, &active, &roleID); err != nil {
+				return fmt.Errorf("reconcileUserRoles scan: %w", err)
+			}
+			state := states[userID]
+			if state == nil {
+				state = &userRoleState{active: active, desired: make(map[uuid.UUID]struct{})}
+				states[userID] = state
+			}
+			if active && roleID != nil {
+				state.desired[*roleID] = struct{}{}
+			}
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return states, nil
+}
+
 // reconcileUserRoles makes every known user's SpiceDB role set match active
 // PostgreSQL assignments exactly, including stale-edge removal and inactive
 // users with no desired grants.
@@ -417,51 +503,10 @@ func (r *SpiceDBReconciler) reconcileUserRoles(
 	tenantID uuid.UUID,
 	stats *ReconcileStats,
 ) error {
-	const q = `
-		SELECT u.id, u.is_active, role.id
-		FROM iam_users u
-		LEFT JOIN iam_user_roles ur
-		  ON ur.user_id = u.id
-		 AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
-		LEFT JOIN iam_roles role
-		  ON role.id = ur.role_id
-		 AND role.tenant_id = $1
-		WHERE u.tenant_id = $1
-		ORDER BY u.id, role.id`
-
-	rows, err := r.db.Query(ctx, q, tenantID)
+	states, err := loadUserRoleStates(ctx, r.db, tenantID)
 	if err != nil {
-		return fmt.Errorf("reconcileUserRoles query: %w", err)
-	}
-	defer rows.Close()
-
-	type userRoleState struct {
-		active  bool
-		desired map[uuid.UUID]struct{}
-	}
-	states := make(map[uuid.UUID]*userRoleState)
-	for rows.Next() {
-		var (
-			userID uuid.UUID
-			active bool
-			roleID *uuid.UUID
-		)
-		if err := rows.Scan(&userID, &active, &roleID); err != nil {
-			return fmt.Errorf("reconcileUserRoles scan: %w", err)
-		}
-		state := states[userID]
-		if state == nil {
-			state = &userRoleState{active: active, desired: make(map[uuid.UUID]struct{})}
-			states[userID] = state
-		}
-		if active && roleID != nil {
-			state.desired[*roleID] = struct{}{}
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
-	rows.Close()
 
 	for userID, state := range states {
 		actual, err := r.client.LookupUserRoles(ctx, tenantID, userID)
@@ -523,6 +568,15 @@ func (r *SpiceDBReconciler) reconcileRolePermissions(
 		WHERE r.tenant_id = $1
 		ORDER BY r.id, p.name`
 
+	// Load the catalog first so only one pool connection is held at a time.
+	catalog, err := r.loadConcreteCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	if len(catalog) == 0 {
+		return fmt.Errorf("permission catalog empty; refusing to reconcile role permissions")
+	}
+
 	rows, err := r.db.Query(ctx, q, tenantID)
 	if err != nil {
 		return fmt.Errorf("reconcileRolePermissions query: %w", err)
@@ -535,6 +589,7 @@ func (r *SpiceDBReconciler) reconcileRolePermissions(
 		relation   string
 	}
 	desiredByRole := make(map[uuid.UUID]map[permissionEdge]struct{})
+	unmatchedByRole := make(map[uuid.UUID][]string)
 	for rows.Next() {
 		var (
 			roleID         uuid.UUID
@@ -554,12 +609,14 @@ func (r *SpiceDBReconciler) reconcileRolePermissions(
 
 		// Expand wildcard permissions (e.g. "core:users:*") into concrete
 		// permission names from the iam_permissions table.
-		permNames, expandErr := r.expandPermission(ctx, *permissionName)
-		if expandErr != nil {
-			return fmt.Errorf("expand permission %q for role %s: %w", *permissionName, roleID, expandErr)
-		}
+		permNames, unmatched, _ := expandPermissionPatterns([]string{*permissionName}, catalog)
+		unmatchedByRole[roleID] = append(unmatchedByRole[roleID], unmatched...)
 
 		for _, pName := range permNames {
+			if relation := requesterPermissionRelation(pName); relation != "" {
+				module := strings.SplitN(pName, ":", 2)[0]
+				desired[permissionEdge{objectType: "module", objectID: module, relation: relation}] = struct{}{}
+			}
 			objectType, objectID, relation, err := parsePermissionName(pName, roleID)
 			if err != nil {
 				logger.Warn("Cannot derive SpiceDB relationship from permission name",
@@ -579,6 +636,16 @@ func (r *SpiceDBReconciler) reconcileRolePermissions(
 		return err
 	}
 	rows.Close()
+
+	for roleID, patterns := range unmatchedByRole {
+		if len(patterns) > 0 {
+			logger.Warn("Wildcard role permissions matched no catalog permission; skipped",
+				zap.String("tenant_id", tenantID.String()),
+				zap.String("role_id", roleID.String()),
+				zap.Strings("patterns", patterns),
+			)
+		}
+	}
 
 	actual, err := r.client.LookupTenantRolePermissions(ctx, tenantID)
 	if err != nil {
@@ -622,52 +689,25 @@ func (r *SpiceDBReconciler) reconcileRolePermissions(
 	return nil
 }
 
-// expandPermission returns the concrete permission names for a given permission.
-// Non-wildcard permissions are returned as-is in a single-element slice.
-// Wildcard permissions (e.g. "core:users:*") are expanded by querying
-// iam_permissions for all entries that match the module:resource prefix.
-func (r *SpiceDBReconciler) expandPermission(ctx context.Context, name string) ([]string, error) {
-	if !strings.Contains(name, ":*") && !strings.HasSuffix(name, "*") {
-		return []string{name}, nil
-	}
-
-	// "core:users:*" → prefix "core:users:"
-	prefix := strings.TrimSuffix(name, "*")
-	if prefix == "" {
-		return nil, fmt.Errorf("cannot expand bare wildcard %q", name)
-	}
-
-	const q = `SELECT name FROM iam_permissions WHERE name LIKE $1 AND name NOT LIKE '%%:*'`
-	rows, err := r.db.Query(ctx, q, prefix+"%")
+// loadConcreteCatalog returns every concrete (non-wildcard) permission name in
+// iam_permissions: the authoritative set wildcard role grants expand against.
+func (r *SpiceDBReconciler) loadConcreteCatalog(ctx context.Context) ([]string, error) {
+	rows, err := r.db.Query(ctx, `SELECT name FROM iam_permissions WHERE position('*' in name) = 0`)
 	if err != nil {
-		return nil, fmt.Errorf("expandPermission query: %w", err)
+		return nil, fmt.Errorf("load permission catalog: %w", err)
 	}
 	defer rows.Close()
-
 	var names []string
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			return nil, fmt.Errorf("expandPermission scan: %w", err)
+			return nil, fmt.Errorf("load permission catalog scan: %w", err)
 		}
 		names = append(names, n)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("expandPermission rows: %w", err)
+		return nil, fmt.Errorf("load permission catalog rows: %w", err)
 	}
-
-	if len(names) == 0 {
-		logger.Warn("Wildcard permission expanded to zero concrete permissions",
-			zap.String("wildcard", name),
-			zap.String("prefix", prefix),
-		)
-	} else {
-		logger.Info("Expanded wildcard permission",
-			zap.String("wildcard", name),
-			zap.Int("expanded_count", len(names)),
-		)
-	}
-
 	return names, nil
 }
 
@@ -706,7 +746,124 @@ func parsePermissionName(name string, _ uuid.UUID) (objectType, objectID, relati
 	}
 
 	objectType = "access_grant"
-	objectID = spicedb.PermissionToSpiceDBID(name)
+	objectID, err = spicedb.PermissionToSpiceDBIDChecked(name)
+	if err != nil {
+		return "", "", "", err
+	}
 	relation = "granted_to_role"
 	return objectType, objectID, relation, nil
+}
+
+// apiKeyRoleState is one tenant API key's PostgreSQL-side role state.
+type apiKeyRoleState struct {
+	desired   map[uuid.UUID]struct{}
+	expiresAt *time.Time
+}
+
+// loadAPIKeyRoleStates reads every tenant API key of tenantID. A key that is
+// active and unexpired desires its role_ids; a revoked, deactivated or expired
+// key desires none, so stale edges left by a failed revoke are removed.
+// iam_api_keys has tenant+realm RLS, so the scan runs under the tenant scope.
+func loadAPIKeyRoleStates(ctx context.Context, db repositories.DBTX, tenantID uuid.UUID) (map[uuid.UUID]*apiKeyRoleState, error) {
+	const q = `
+		SELECT id, role_ids, expires_at,
+		       (is_active AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()))
+		FROM iam_api_keys
+		WHERE tenant_id = $1 AND kind = 'tenant'`
+
+	states := make(map[uuid.UUID]*apiKeyRoleState)
+	err := repositories.WithTenantScope(ctx, db, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, q, tenantID)
+		if err != nil {
+			return fmt.Errorf("reconcileAPIKeyRoles query: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				keyID     uuid.UUID
+				roleIDs   []uuid.UUID
+				expiresAt *time.Time
+				live      bool
+			)
+			if err := rows.Scan(&keyID, &roleIDs, &expiresAt, &live); err != nil {
+				return fmt.Errorf("reconcileAPIKeyRoles scan: %w", err)
+			}
+			state := &apiKeyRoleState{desired: make(map[uuid.UUID]struct{}), expiresAt: expiresAt}
+			if live {
+				for _, id := range roleIDs {
+					state.desired[id] = struct{}{}
+				}
+			}
+			states[keyID] = state
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return states, nil
+}
+
+// reconcileAPIKeyRoles makes each tenant API key's SpiceDB role edges match
+// PostgreSQL: missing edges are written with the key's expiry caveat and
+// stale ones (revoked/expired keys, removed roles) are deleted. A key never
+// gets a tenant member/admin edge, so only role edges are managed here.
+func (r *SpiceDBReconciler) reconcileAPIKeyRoles(
+	ctx context.Context,
+	tenantID uuid.UUID,
+	stats *ReconcileStats,
+) error {
+	states, err := loadAPIKeyRoleStates(ctx, r.db, tenantID)
+	if err != nil {
+		return err
+	}
+
+	for keyID, state := range states {
+		actual, err := r.client.LookupUserRoles(ctx, tenantID, keyID)
+		if err != nil {
+			logger.Warn("Failed to lookup API key roles in SpiceDB",
+				zap.String("tenant_id", tenantID.String()),
+				zap.String("api_key_id", keyID.String()),
+				zap.Error(err),
+			)
+			stats.Errors++
+			continue
+		}
+		actualSet := make(map[uuid.UUID]struct{}, len(actual))
+		for _, rawRoleID := range actual {
+			roleID, parseErr := uuid.Parse(rawRoleID)
+			if parseErr != nil {
+				logger.Warn("Ignoring malformed SpiceDB role id", zap.String("role_id", rawRoleID), zap.Error(parseErr))
+				stats.Errors++
+				continue
+			}
+			actualSet[roleID] = struct{}{}
+			if _, keep := state.desired[roleID]; keep {
+				continue
+			}
+			if _, err := r.client.DeleteUserRole(ctx, tenantID, keyID, roleID); err != nil {
+				logger.Warn("Failed to remove stale API key role edge from SpiceDB",
+					zap.String("api_key_id", keyID.String()), zap.Error(err))
+				stats.Errors++
+				continue
+			}
+			stats.UserRoleRepairs++
+		}
+		if state.expiresAt == nil {
+			continue // tenant keys always carry an expiry; never write an unbounded edge
+		}
+		for roleID := range state.desired {
+			if _, present := actualSet[roleID]; present {
+				continue
+			}
+			if _, err := r.client.WriteUserRoleUntil(ctx, tenantID, keyID, roleID, *state.expiresAt); err != nil {
+				logger.Warn("Failed to restore API key role edge in SpiceDB",
+					zap.String("api_key_id", keyID.String()), zap.Error(err))
+				stats.Errors++
+				continue
+			}
+			stats.UserRoleRepairs++
+		}
+	}
+	return nil
 }

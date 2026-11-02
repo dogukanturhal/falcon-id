@@ -183,7 +183,7 @@ func ExampleZedTokenStore_userRoleAssignment() {
 
 	// Simulate writing user-role relationship to SpiceDB
 	// In real code, this would be: token, _ := client.WriteUserRole(...)
-	zedToken := "GhUKEzE3MTI1ODM1OTkwMDAwMDAwMDA=" //nolint:gosec // test fixture value, not a real credential  // gitleaks:allow — test fixture, not a real credential
+	zedToken := "GhUKEzE3MTI1ODM1OTkwMDAwMDAwMDA=" //nolint:gosec // test fixture value, not a real credential
 
 	// Store the token for the user-role assignment
 	userRoleKey := userID.String() + "_" + roleID.String()
@@ -206,7 +206,7 @@ func ExampleZedTokenStore_resourcePermission() {
 
 	// Simulate writing resource relationship to SpiceDB
 	// In real code: token, _ := client.WriteResourceRelationship(...)
-	zedToken := "GhUKEzE3MTI1ODM1OTkwMDAwMDAwMDA=" //nolint:gosec // test fixture value, not a real credential  // gitleaks:allow — test fixture, not a real credential
+	zedToken := "GhUKEzE3MTI1ODM1OTkwMDAwMDAwMDA=" //nolint:gosec // test fixture value, not a real credential
 
 	// Store token scoped to this invoice
 	_ = store.StoreToken(ctx, tenantID, "invoice", invoiceID.String(), zedToken)

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -50,26 +49,12 @@ const (
 //     id.hexxlock.com-direct API calls), where Host is the public hostname.
 //  3. localhost / 127.0.0.1 short-circuit for dev-server cross-port sharing.
 func getCookieDomain(c *gin.Context) string {
-	if v := os.Getenv("COOKIE_DOMAIN"); v != "" {
-		return v
-	}
-	host := c.Request.Host
-	// Strip port if present
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
-	// For localhost, explicitly return hostLocalhost to ensure cookies are shared
-	// across different ports (frontend:3000 and API:9080)
-	if host == hostLocalhost || strings.HasPrefix(host, "127.0.0.1") {
-		return hostLocalhost
-	}
-	return host
+	return middleware.CookieDomain(c)
 }
 
 // isSecureEnvironment returns true if we should use secure cookies
 func isSecureEnvironment() bool {
-	env := os.Getenv("ENVIRONMENT")
-	return env == envProduction || env == "staging"
+	return middleware.IsSecureEnvironment()
 }
 
 // setAuthCookies sets the HttpOnly access-token cookie. Refresh tokens are
@@ -352,7 +337,10 @@ func (h *AuthHandler) sessionIDFromAccessToken(accessToken string) uuid.UUID {
 // single cookie schema continues to work whether SSO is established
 // via the universal-login API path or the legacy form. Operators
 // MAY shorten this via SESSION_TTL_DEFAULT to align it with the DB
-// session row (see Config.SessionTTLDefault).
+// session row (see Config.SessionTTLDefault). The cookie is not a fixed
+// deadline: resolveIdpSessionCookie re-issues it with a fresh Max-Age on each
+// silent /oauth/authorize, bounded by the absolute cap (AuthTime +
+// SESSION_TTL_REMEMBER_ME, default 7d), so active SSO outlives this value.
 const idpSessionDefaultMaxAge = 7 * 24 * time.Hour
 
 // establishIdpSession persists an IdP SSO entry in Redis and writes
@@ -395,17 +383,21 @@ const idpSessionDefaultMaxAge = 7 * 24 * time.Hour
 //     A long DB row with a short cookie would silently re-prompt; a
 //     short DB row with a long cookie would 401 on the next /oauth/
 //     authorize bounce. They must match.
-func (h *AuthHandler) establishIdpSession(c *gin.Context, user *models.UserResponse, sessionID uuid.UUID, rememberMe bool) {
+func (h *AuthHandler) establishIdpSession(c *gin.Context, user *models.UserResponse, sessionID uuid.UUID, rememberMe bool, proofTime ...int64) {
 	if h.sessionCache == nil || user == nil {
 		return
 	}
 	idpSessionID := uuid.New()
+	authTime := time.Now().Unix()
+	if len(proofTime) > 0 && proofTime[0] > 0 && proofTime[0] <= authTime {
+		authTime = proofTime[0]
+	}
 	if err := h.sessionCache.SetIdpSession(c.Request.Context(), idpSessionID, &redispkg.IdpSessionData{
 		UserID:    user.ID,
 		TenantID:  user.TenantID,
 		Username:  user.Username,
 		Email:     user.Email,
-		AuthTime:  time.Now().Unix(),
+		AuthTime:  authTime,
 		SessionID: sessionID,
 	}); err != nil {
 		// Non-fatal: tokens already minted; SSO degrades to re-prompt on
@@ -413,22 +405,9 @@ func (h *AuthHandler) establishIdpSession(c *gin.Context, user *models.UserRespo
 		logger.Log.Warn("failed to store IdP session in Redis", zap.Error(err))
 		return
 	}
-	secure := isSecureEnvironment()
-	// falcon_idp_session must be sent on the top-level cross-site GET that
-	// carries a relying party's user back into /oauth/authorize (d-254) —
-	// SameSite=Strict silently drops it on exactly that hop, which is what
-	// broke silent SSO for mearax after it moved off the hexxlock.com apex
-	// onto ligarbo.com (t-520). Lax in every environment, not just !secure.
-	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(
-		"falcon_idp_session",
-		idpSessionID.String(),
-		int(h.idpSessionCookieMaxAge(rememberMe).Seconds()),
-		"/",
-		getCookieDomain(c),
-		secure,
-		true,
-	)
+	// Attributes (incl. SameSite=Lax, d-254/t-520) live in
+	// middleware.SetIdpSessionCookie, shared with the sliding re-issue.
+	middleware.SetIdpSessionCookie(c, idpSessionID.String(), h.idpSessionCookieMaxAge(rememberMe))
 }
 
 // idpSessionCookieMaxAge resolves the falcon_idp_session cookie
@@ -731,7 +710,7 @@ func (h *AuthHandler) categorizeLoginProviders(tenantID uuid.UUID, providers []*
 func (h *AuthHandler) Login(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
 	}
 
@@ -760,7 +739,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	ctx = clientctx.WithCountry(ctx, middleware.ClientCountryGin(c))
 
 	// Edge-stamped geo enrichment (asn / asn_org / city / region /
-	// is_vpn_hint) sourced from the id-hexxlock-geo-stamp Cloudflare
+	// is_vpn_hint) sourced from the geo-stamp Cloudflare
 	// Worker via X-Geo-* request headers. Stamped alongside the
 	// country code so createSession can read both from one ctx walk.
 	// Zero-value (Worker not deployed / route not under its pattern)
@@ -784,6 +763,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	response, err := h.authService.Login(ctx, &req, ipAddress, userAgent)
 	if err != nil {
+		if errors.Is(err, services.ErrMFAUnavailable) {
+			respondMFAFlowError(c, err)
+			return
+		}
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		logger.SecurityAudit.Warn("Security audit: failed login attempt",
 			zap.String("event", "auth.login.failed"),
 			zap.String("username", req.Username),
@@ -827,7 +813,29 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			c.JSON(http.StatusLocked, body)
 			return
 		}
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+		// SECURITY / UX tradeoff (2026-09-18 incident follow-up): this body
+		// is deliberately IDENTICAL for every login-credential failure —
+		// wrong password, unknown username, AND "no local password set"
+		// (services/auth_credentials_service.go's authenticateLocal,
+		// which logs that distinct reason server-side only, see its doc
+		// comment). A response that varied by reason — e.g. a distinct
+		// "this account has no password" message — would let an attacker
+		// enumerate which usernames exist and are missing a local
+		// credential, which is exactly the kind of account-existence
+		// oracle constant-time password verification above already
+		// exists to prevent. Instead the actionable hint ("use Forgot
+		// password") is folded into the SAME generic message so it helps
+		// the "no local password set" case (a real, if rare, account
+		// state — see the CompleteSignup doc comments for how a signup
+		// could reach it) without adding a new discriminator: a user with
+		// a merely-wrong password gets equally correct, equally
+		// actionable advice, and an attacker probing arbitrary usernames
+		// learns nothing they couldn't learn before. Password reset
+		// (PasswordResetService.ResetPassword) does not require an
+		// existing password_hash, so this path genuinely unblocks the
+		// affected accounts rather than sending them into a second dead
+		// end.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password. If this is a new account, use \"Forgot password\" to set one."})
 		return
 	}
 
@@ -944,6 +952,9 @@ func (h *AuthHandler) CompleteMFALogin(c *gin.Context) {
 
 	response, err := h.authService.CompleteMFALogin(ctx, &req, ipAddress, userAgent)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		// Security audit: MFA verification failure
 		logger.SecurityAudit.Warn("Security audit: MFA verification failed",
 			zap.String("event", "auth.mfa.failed"),
@@ -953,7 +964,7 @@ func (h *AuthHandler) CompleteMFALogin(c *gin.Context) {
 			zap.String("reason", err.Error()),
 			zap.Time("timestamp", time.Now().UTC()),
 		)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA verification failed"})
+		respondMFAFlowError(c, err)
 		return
 	}
 
@@ -964,7 +975,15 @@ func (h *AuthHandler) CompleteMFALogin(c *gin.Context) {
 			accessTTL = time.Duration(response.ExpiresIn) * time.Second
 		}
 		setAuthCookies(c, response.AccessToken, accessTTL)
-		h.establishIdpSession(c, response.User, h.sessionIDFromAccessToken(response.AccessToken), response.IsRememberMeSession)
+		// A retry reissues cookies, not a new MFA proof. Keep the original
+		// authentication timestamp rather than extending the fresh-auth window.
+		proofTime := int64(0)
+		if h.tokenService != nil {
+			if claims, err := h.tokenService.ValidateAccessTokenWithContext(ctx, response.AccessToken); err == nil && claims != nil {
+				proofTime = claims.AuthTime
+			}
+		}
+		h.establishIdpSession(c, response.User, h.sessionIDFromAccessToken(response.AccessToken), response.IsRememberMeSession, proofTime)
 	}
 
 	// Security audit: MFA verification success
@@ -979,7 +998,9 @@ func (h *AuthHandler) CompleteMFALogin(c *gin.Context) {
 		)
 	}
 
-	c.JSON(http.StatusOK, response)
+	// Authentication material travels in HttpOnly cookies. Do not serialize
+	// UserResponse (including thousands of permissions/avatar data) again.
+	writeMFACompletionResponse(c, response)
 }
 
 // MFAEnrollmentInit handles the first leg of the registration-interrupt
@@ -1504,7 +1525,7 @@ func (h *AuthHandler) SwitchMFALoginMethod(c *gin.Context) {
 
 	response, err := h.authService.SwitchMFALoginMethod(c.Request.Context(), req.SessionID, req.Method)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA method switch failed"})
+		respondMFAFlowError(c, err)
 		return
 	}
 
@@ -1600,27 +1621,40 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	// refreshes the page" loop. Defensively clearing first means even
 	// when authService.Logout fails downstream, the SSO cookie + Redis
 	// IdP session entry are GONE for this browser/identity.
+	// Per-device sign-out by default: pin down THIS device's session. The JWT
+	// `sid` claim is canonical; OAuth access tokens omit it, so fall back to
+	// the session_id / idp_session_id on the presented token's
+	// iam_oauth_tokens row. Read the token before the cookie is cleared.
+	logoutSessionID := user.SessionID
+	var logoutIdpID uuid.UUID
+	if h.tokenService != nil {
+		if rawToken := presentedAccessToken(c); rawToken != "" {
+			rowSID, rowIdpID := h.tokenService.ResolveOAuthSession(c.Request.Context(), rawToken, user.ID)
+			if logoutSessionID == uuid.Nil {
+				logoutSessionID = rowSID
+			}
+			logoutIdpID = rowIdpID
+		}
+	}
+
 	clearAuthCookies(c)
 	clearIdpSessionCookie(c)
 
 	// Try to delete the Redis IdP session by every key we can recover.
 	//   1. user.SessionID from the JWT `sid` claim — the canonical key.
 	//      OAuth access tokens issued to RPs (e.g. the accounts BFF
-	//      calling here with its hexxlock_access_token) deliberately
+	//      calling here with its access_token) deliberately
 	//      omit `sid` per OIDC, so user.SessionID will be uuid.Nil for
 	//      cross-RP logout calls — that's expected, falls through to
 	//      step 3.
 	//   2. falcon_idp_session cookie value — present on browser-direct
 	//      same-origin calls, missing when SameSite=Strict drops it on
 	//      a cross-site BFF round-trip.
-	//   3. user.ID — fan-out delete every live IdP session for this
-	//      user. This is the only path that works for RP-initiated
-	//      logout via Bearer access token (steps 1 and 2 yield
-	//      nothing). Matches "click Sign out → all my sessions end"
-	//      user expectation; also closes the silent-SSO loop where
-	//      /oauth/authorize would otherwise resurrect the user via
-	//      the surviving Redis idp_session entry.
-	// All three paths are succeed-or-no-op and idempotent.
+	//   3. the idp_session_id on the presented access token's row.
+	//   4. user.ID — fan-out delete every live IdP session for this
+	//      user, ONLY for an explicit sign-out everywhere (AllDevices).
+	//      A per-device sign-out must not end the user's other devices.
+	// All paths are succeed-or-no-op and idempotent.
 	if h.sessionCache != nil {
 		if user.SessionID != uuid.Nil {
 			if delErr := h.sessionCache.DeleteIdpSession(c.Request.Context(), user.SessionID); delErr != nil {
@@ -1638,7 +1672,14 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 				}
 			}
 		}
-		if user.ID != uuid.Nil {
+		if logoutIdpID != uuid.Nil && logoutIdpID != user.SessionID {
+			if delErr := h.sessionCache.DeleteIdpSession(c.Request.Context(), logoutIdpID); delErr != nil {
+				logger.SecurityAudit.Warn("Logout: DeleteIdpSession by token idp id failed",
+					zap.String("session_id", logoutIdpID.String()),
+					zap.Error(delErr))
+			}
+		}
+		if req.AllDevices && user.ID != uuid.Nil {
 			if n, delErr := h.sessionCache.DeleteAllIdpSessionsByUser(c.Request.Context(), user.ID); delErr != nil {
 				logger.SecurityAudit.Warn("Logout: DeleteAllIdpSessionsByUser failed",
 					zap.String("user_id", user.ID.String()),
@@ -1674,7 +1715,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	// where the access token deliberately omits `sid` per OIDC. The
 	// production accounts.hexxlock.com BFF uses exactly this path: it
 	// fetches /api/v1/auth/logout server-side with `Authorization:
-	// Bearer <hexxlock_access_token>`, and that token only carries sub.
+	// Bearer <access_token>`, and that token only carries sub.
 	// In that branch we fan out the blacklist across every active
 	// session row for this user, mirroring DeleteAllIdpSessionsByUser
 	// — the user-intent contract is "click Sign Out and every browser
@@ -1691,13 +1732,13 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	// auth_credentials_service.go:222.
 	if h.tokenBlacklist != nil {
 		switch {
-		case user.SessionID != uuid.Nil:
-			if blErr := h.tokenBlacklist.BlacklistSession(c.Request.Context(), user.SessionID, "user_logout", defaultAccessTokenTTL); blErr != nil {
+		case logoutSessionID != uuid.Nil && !req.AllDevices:
+			if blErr := h.tokenBlacklist.BlacklistSession(c.Request.Context(), logoutSessionID, "user_logout", defaultAccessTokenTTL); blErr != nil {
 				logger.SecurityAudit.Warn("Logout: BlacklistSession failed",
-					zap.String("session_id", user.SessionID.String()),
+					zap.String("session_id", logoutSessionID.String()),
 					zap.Error(blErr))
 			}
-		case h.sessionRepo != nil && user.ID != uuid.Nil:
+		case req.AllDevices && h.sessionRepo != nil && user.ID != uuid.Nil:
 			sessions, listErr := h.sessionRepo.GetActiveSessions(c.Request.Context(), user.ID)
 			if listErr != nil {
 				logger.SecurityAudit.Warn("Logout: GetActiveSessions for fan-out failed",
@@ -1719,12 +1760,22 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 				zap.String("user_id", user.ID.String()),
 				zap.Int("count", blacklisted))
 		default:
-			logger.SecurityAudit.Info("Logout: BlacklistSession skipped (no sid claim and no session repo wired)",
+			logger.SecurityAudit.Info("Logout: BlacklistSession skipped (no resolvable session for per-device sign-out)",
 				zap.String("user_id", user.ID.String()))
 		}
 	}
 
-	err := h.authService.Logout(c.Request.Context(), user.ID, user.SessionID, user.TenantID, req.AllDevices)
+	// The token's idp_session_id may differ from its iam_sessions id; sweep
+	// that binding too (per-device only, all-devices revokes everything).
+	if !req.AllDevices && h.tokenService != nil && logoutIdpID != uuid.Nil && logoutIdpID != logoutSessionID {
+		if revErr := h.tokenService.RevokeOAuthTokensBySession(c.Request.Context(), logoutIdpID, user.ID); revErr != nil {
+			logger.SecurityAudit.Warn("Logout: revoke tokens by idp session failed",
+				zap.String("session_id", logoutIdpID.String()),
+				zap.Error(revErr))
+		}
+	}
+
+	err := h.authService.Logout(c.Request.Context(), user.ID, logoutSessionID, user.TenantID, req.AllDevices)
 	if err != nil {
 		// Log the error but don't expose details. Cookies + IdP session
 		// are already gone — return 200 so the BFF treats this as a
@@ -1760,3 +1811,19 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 
 // Profile management, session management, password reset, CSRF token, token validation,
 // and pagination helpers are in auth_handler_profile.go
+
+// presentedAccessToken returns the bearer token (Authorization header, else
+// the falcon_access_token cookie) without aborting the request.
+func presentedAccessToken(c *gin.Context) string {
+	if authHeader := c.GetHeader("Authorization"); authHeader != "" {
+		parts := strings.Split(authHeader, " ")
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			return parts[1]
+		}
+		return ""
+	}
+	if cookie, err := c.Cookie("falcon_access_token"); err == nil {
+		return cookie
+	}
+	return ""
+}

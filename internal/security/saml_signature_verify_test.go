@@ -57,12 +57,6 @@ func mkKeyCert(t *testing.T, cn string) (*rsa.PrivateKey, *x509.Certificate) {
 	return key, cert
 }
 
-type ks struct {
-	key  *rsa.PrivateKey
-	cert []byte
-}
-
-func (k ks) GetKeyPair() (*rsa.PrivateKey, []byte, error) { return k.key, k.cert, nil }
 
 // assertionXML builds a minimal but realistic SAML Assertion.
 func assertionXML(id, nameID string) string {

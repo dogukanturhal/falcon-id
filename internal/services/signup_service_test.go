@@ -93,6 +93,46 @@ func (m *mockSignupRequestRepo) MarkCompleted(ctx context.Context, id uuid.UUID,
 	return m.Called(ctx, id, tenantID, userID).Error(0)
 }
 
+func (m *mockSignupRequestRepo) SetProvisionedTenant(ctx context.Context, id uuid.UUID, tenantID uuid.UUID, slug string) error {
+	return m.Called(ctx, id, tenantID, slug).Error(0)
+}
+
+func (m *mockSignupRequestRepo) SetCompanyDetails(ctx context.Context, id uuid.UUID, name, slug string) error {
+	return m.Called(ctx, id, name, slug).Error(0)
+}
+
+func (m *mockSignupRequestRepo) SetCompletionSecretHash(ctx context.Context, id uuid.UUID, hash string) error {
+	return m.Called(ctx, id, hash).Error(0)
+}
+
+func (m *mockSignupRequestRepo) SetContinuation(ctx context.Context, id uuid.UUID, continuation string) error {
+	return m.Called(ctx, id, continuation).Error(0)
+}
+
+func (m *mockSignupRequestRepo) ReserveVerificationResend(ctx context.Context, id uuid.UUID, cooldown, window time.Duration, maxPerWindow, maxFailedTotal int, requireUnverified bool) (bool, error) {
+	args := m.Called(ctx, id, cooldown, window, maxPerWindow, maxFailedTotal, requireUnverified)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *mockSignupRequestRepo) SetVerificationCode(ctx context.Context, id uuid.UUID, hash string, expiresAt time.Time) error {
+	return m.Called(ctx, id, hash, expiresAt).Error(0)
+}
+
+func (m *mockSignupRequestRepo) ClaimVerificationAttempt(ctx context.Context, id uuid.UUID, maxAttempts, maxFailedTotal int) (string, time.Time, int, bool, error) {
+	args := m.Called(ctx, id, maxAttempts, maxFailedTotal)
+	return args.String(0), args.Get(1).(time.Time), args.Int(2), args.Bool(3), args.Error(4)
+}
+
+func (m *mockSignupRequestRepo) ConsumeVerificationCode(ctx context.Context, id uuid.UUID, hash string) (bool, error) {
+	args := m.Called(ctx, id, hash)
+	return args.Bool(0), args.Error(1)
+}
+
+func (m *mockSignupRequestRepo) CountCompletedBusinessSignupsByEmailDomain(ctx context.Context, domain string) (int, error) {
+	args := m.Called(ctx, domain)
+	return args.Int(0), args.Error(1)
+}
+
 // ---
 
 type mockSignupEmailSender struct{ mock.Mock }
@@ -195,7 +235,7 @@ func buildSignupService(
 	user *mockSignupUserCreator,
 	lookup *mockSignupUserLookup,
 ) *SignupService {
-	return NewSignupService(repo, email, tenant, stubTenantManagementRegistrar{}, user, lookup, "downstream.com", "starter")
+	return NewSignupService(repo, email, tenant, stubTenantManagementRegistrar{}, user, lookup, "downstream.com", "starter", testOTPKey)
 }
 
 // buildSignupServiceWithRegistrar is buildSignupService with an explicit,
@@ -209,7 +249,7 @@ func buildSignupServiceWithRegistrar(
 	user *mockSignupUserCreator,
 	lookup *mockSignupUserLookup,
 ) *SignupService {
-	return NewSignupService(repo, email, tenant, registrar, user, lookup, "downstream.com", "starter")
+	return NewSignupService(repo, email, tenant, registrar, user, lookup, "downstream.com", "starter", testOTPKey)
 }
 
 func freshInput(accountType string) *models.CreateSignupRequestInput { //nolint:unparam // accountType is always "personal" currently but kept for flexibility
@@ -233,9 +273,11 @@ func businessInput() *models.CreateSignupRequestInput {
 
 func pendingRequest(email string) *models.SignupRequest {
 	now := time.Now()
+	first := "Jane"
 	return &models.SignupRequest{
 		ID:                uuid.New(),
 		Email:             email,
+		FirstName:         &first,
 		AccountType:       "personal",
 		VerificationToken: "existing-token",
 		Verified:          false,
@@ -250,6 +292,7 @@ func verifiedRequest(email, accountType string) *models.SignupRequest {
 	req := pendingRequest(email)
 	req.AccountType = accountType
 	req.Verified = true
+	req.CompletionSecretHash = testCompletionSecretHash()
 	now := time.Now()
 	req.VerifiedAt = &now
 	return req
@@ -321,6 +364,12 @@ func TestSignupService_InitiateSignup_BusinessSuccess(t *testing.T) {
 	input := businessInput()
 
 	lookup.On("GetByEmail", mock.Anything, "john@acme.com").Return(nil, errors.New("not found"))
+	// Abuse control (see InitiateSignup's one-trial-per-work-domain doc
+	// comment): acme.com has no prior COMPLETED business signup, so this
+	// returns 0 and InitiateSignup proceeds. The "blocks a second signup"
+	// half of this control is its own test,
+	// TestSignupService_InitiateSignup_BusinessDomainAlreadyTrialed below.
+	repo.On("CountCompletedBusinessSignupsByEmailDomain", mock.Anything, "acme.com").Return(0, nil)
 	repo.On("GetPendingByEmail", mock.Anything, "john@acme.com").Return(nil, errors.New("not found"))
 	repo.On("Create", mock.Anything, mock.MatchedBy(func(r *models.SignupRequest) bool {
 		return r.AccountType == "business" &&
@@ -339,6 +388,135 @@ func TestSignupService_InitiateSignup_BusinessSuccess(t *testing.T) {
 
 	repo.AssertExpectations(t)
 	emailSvc.AssertExpectations(t)
+}
+
+// TestSignupService_InitiateSignup_BusinessDomainAlreadyTrialed is the
+// CONTROL for the one-trial-per-work-domain abuse control added
+// 2026-09-18 (t-signup-no-plan-step) alongside removing the signup
+// wizard's plan step (see InitiateSignup's doc comment on the check
+// itself for the full rationale: every self-serve signup now gets a
+// full top-tier trial with no card, so nothing else stopped
+// bob@acme.com from re-running signup right after alice@acme.com).
+//
+// This proves a SECOND business signup at a domain that already has one
+// COMPLETED business signup is refused with SignupStateError{"domain_trial_exists"}
+// — never reaching GetPendingByEmail/Create/SendSignupVerificationEmail
+// (mock.Mock panics on an unexpected call, so those being absent from
+// this test's expectations is itself part of the assertion: if the
+// early-return were ever deleted, this test would fail loudly on an
+// unexpected mock call, not silently pass).
+func TestSignupService_InitiateSignup_BusinessDomainAlreadyTrialed(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+
+	input := &models.CreateSignupRequestInput{
+		Email:       "second-employee@acme.com",
+		FirstName:   "Bob",
+		AccountType: "business",
+		CompanyName: testAcmeCorpOrg,
+	}
+
+	lookup.On("GetByEmail", mock.Anything, "second-employee@acme.com").Return(nil, errors.New("not found"))
+	repo.On("CountCompletedBusinessSignupsByEmailDomain", mock.Anything, "acme.com").Return(1, nil)
+
+	result, err := svc.InitiateSignup(context.Background(), input, "10.0.0.3", "Chrome/120")
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	var stateErr *SignupStateError
+	require.ErrorAs(t, err, &stateErr)
+	assert.Equal(t, "domain_trial_exists", stateErr.Code)
+
+	repo.AssertExpectations(t)
+	emailSvc.AssertExpectations(t)
+	repo.AssertNotCalled(t, "GetPendingByEmail", mock.Anything, mock.Anything)
+	repo.AssertNotCalled(t, "Create", mock.Anything, mock.Anything)
+	emailSvc.AssertNotCalled(t, "SendSignupVerificationEmail", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestSignupService_InitiateSignup_FreeEmailDomain_NotDomainLimited is the
+// paired negative/positive control for the check above: a SECOND signup
+// at a well-known free-webmail domain (gmail.com) is NOT blocked even
+// though CountCompletedBusinessSignupsByEmailDomain is never even called
+// — proving the exemption in freeEmailProviderDomains actually short-
+// circuits before the repo query, not merely that the repo happens to
+// return 0. If the exemption check were ever removed, this test's
+// AssertNotCalled would fail as soon as the (unmocked) repo call panicked.
+func TestSignupService_InitiateSignup_FreeEmailDomain_NotDomainLimited(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+
+	input := &models.CreateSignupRequestInput{
+		Email:       "founder@gmail.com",
+		FirstName:   "Casey",
+		AccountType: "business",
+		CompanyName: "Solo Founder LLC",
+	}
+
+	lookup.On("GetByEmail", mock.Anything, "founder@gmail.com").Return(nil, errors.New("not found"))
+	repo.On("GetPendingByEmail", mock.Anything, "founder@gmail.com").Return(nil, errors.New("not found"))
+	repo.On("Create", mock.Anything, mock.MatchedBy(func(r *models.SignupRequest) bool {
+		return r.AccountType == "business" && r.Email == "founder@gmail.com"
+	})).Return(nil)
+	emailSvc.On("SendSignupVerificationEmail", mock.Anything, "founder@gmail.com", mock.AnythingOfType("string"), "Casey").Return(nil)
+
+	result, err := svc.InitiateSignup(context.Background(), input, "10.0.0.4", "Chrome/120")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	repo.AssertExpectations(t)
+	emailSvc.AssertExpectations(t)
+	repo.AssertNotCalled(t, "CountCompletedBusinessSignupsByEmailDomain", mock.Anything, mock.Anything)
+}
+
+// TestSignupService_InitiateSignup_PersonalAccount_NeverDomainChecked
+// proves the domain check does not even run for personal accounts —
+// every personal signup shares ONE consumer domain
+// (consumerEmailDomain(), downstream.com in this test's fixture), so
+// running this check there would lock out every personal signup after
+// the very first one. See InitiateSignup's doc comment for why personal
+// accounts never start a billing trial at all.
+func TestSignupService_InitiateSignup_PersonalAccount_NeverDomainChecked(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+
+	input := freshInput("personal")
+
+	lookup.On("GetByEmail", mock.Anything, "jane@downstream.com").Return(nil, errors.New("not found"))
+	repo.On("GetPendingByEmail", mock.Anything, "jane@downstream.com").Return(nil, errors.New("not found"))
+	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
+	emailSvc.On("SendSignupVerificationEmail", mock.Anything, "jane@downstream.com", mock.AnythingOfType("string"), "Jane").Return(nil)
+
+	result, err := svc.InitiateSignup(context.Background(), input, "10.0.0.5", "agent")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	repo.AssertExpectations(t)
+	emailSvc.AssertExpectations(t)
+	repo.AssertNotCalled(t, "CountCompletedBusinessSignupsByEmailDomain", mock.Anything, mock.Anything)
 }
 
 func TestSignupService_InitiateSignup_ExistingUser_ReturnsError(t *testing.T) {
@@ -382,7 +560,9 @@ func TestSignupService_InitiateSignup_PendingExists_ResendEmail(t *testing.T) {
 
 	lookup.On("GetByEmail", mock.Anything, "jane@downstream.com").Return(nil, errors.New("not found"))
 	repo.On("GetPendingByEmail", mock.Anything, "jane@downstream.com").Return(existing, nil)
-	emailSvc.On("SendSignupVerificationEmail", mock.Anything, "jane@downstream.com", "existing-token", "Jane").Return(nil)
+	repo.On("ReserveVerificationResend", mock.Anything, existing.ID, mock.Anything, mock.Anything, mock.Anything, mock.Anything, true).Return(true, nil)
+	repo.On("SetVerificationCode", mock.Anything, existing.ID, mock.AnythingOfType("string"), mock.Anything).Return(nil)
+	emailSvc.On("SendSignupVerificationEmail", mock.Anything, "jane@downstream.com", mock.MatchedBy(func(c string) bool { return signupCodeRE.MatchString(c) }), "Jane").Return(nil)
 
 	result, err := svc.InitiateSignup(context.Background(), input, "10.0.0.1", "agent")
 
@@ -390,8 +570,51 @@ func TestSignupService_InitiateSignup_PendingExists_ResendEmail(t *testing.T) {
 	require.NotNil(t, result)
 	// Must return the existing request (same ID), not a new one.
 	assert.Equal(t, existing.ID, result.ID)
-	assert.Equal(t, existing.VerificationToken, result.VerificationToken)
 	// Must NOT create a new record.
+	repo.AssertNotCalled(t, "Create")
+	emailSvc.AssertExpectations(t)
+}
+
+// TestSignupService_InitiateSignup_VerifiedButNotCompleted_Resumes proves the
+// fix for the "atlasbadi" / "atlasbadi-a1ad" production duplicate-tenant
+// bug: retrying InitiateSignup for an email that already verified but never
+// finished CompleteSignup must return the SAME signup request (so the
+// client resumes into CompleteSignup against it), not silently fall through
+// to minting a brand-new request row — the second half of that bug lived in
+// provisionTenant re-registering a tenant for the new row (see the
+// TestSignupService_CompleteSignup_ResumesAfterPartialTenantRegistration
+// test for that half).
+func TestSignupService_InitiateSignup_VerifiedButNotCompleted_Resumes(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
+
+	input := freshInput("personal")
+	existing := verifiedRequest("jane@downstream.com", "personal")
+
+	lookup.On("GetByEmail", mock.Anything, "jane@downstream.com").Return(nil, errors.New("not found"))
+	// GetPendingByEmail's own WHERE clause is "NOT completed AND expires_at
+	// > NOW()" — it does not filter on `verified`, so a verified-but-
+	// incomplete row is exactly what it returns here.
+	repo.On("GetPendingByEmail", mock.Anything, "jane@downstream.com").Return(existing, nil)
+	// Recovery: the same throttled resend path runs (requireUnverified=false),
+	// so the resumer must re-prove the mailbox with a fresh code.
+	repo.On("ReserveVerificationResend", mock.Anything, existing.ID, mock.Anything, mock.Anything, mock.Anything, mock.Anything, false).Return(true, nil)
+	repo.On("SetVerificationCode", mock.Anything, existing.ID, mock.AnythingOfType("string"), mock.Anything).Return(nil)
+	emailSvc.On("SendSignupVerificationEmail", mock.Anything, "jane@downstream.com", mock.MatchedBy(func(c string) bool { return signupCodeRE.MatchString(c) }), "Jane").Return(nil)
+
+	result, err := svc.InitiateSignup(context.Background(), input, "10.0.0.1", "agent")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, existing.ID, result.ID)
+	// Must NOT create a new record (that would orphan a tenant).
 	repo.AssertNotCalled(t, "Create")
 	emailSvc.AssertExpectations(t)
 }
@@ -534,8 +757,9 @@ func TestSignupService_VerifyEmail_Success(t *testing.T) {
 
 	repo.On("GetByToken", mock.Anything, "valid-token").Return(pending, nil)
 	repo.On("MarkVerified", mock.Anything, pending.ID).Return(nil)
+	repo.On("SetCompletionSecretHash", mock.Anything, pending.ID, mock.AnythingOfType("string")).Return(nil)
 
-	result, err := svc.VerifyEmail(context.Background(), "valid-token")
+	result, err := svc.VerifyEmail(context.Background(), &models.VerifySignupEmailInput{Token: "valid-token"})
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -558,7 +782,7 @@ func TestSignupService_VerifyEmail_InvalidToken(t *testing.T) {
 
 	repo.On("GetByToken", mock.Anything, "bad-token").Return(nil, errors.New("not found"))
 
-	result, err := svc.VerifyEmail(context.Background(), "bad-token")
+	result, err := svc.VerifyEmail(context.Background(), &models.VerifySignupEmailInput{Token: "bad-token"})
 
 	require.Error(t, err)
 	assert.Nil(t, result)
@@ -581,7 +805,7 @@ func TestSignupService_VerifyEmail_ExpiredToken(t *testing.T) {
 
 	repo.On("GetByToken", mock.Anything, "expired-token").Return(expired, nil)
 
-	result, err := svc.VerifyEmail(context.Background(), "expired-token")
+	result, err := svc.VerifyEmail(context.Background(), &models.VerifySignupEmailInput{Token: "expired-token"})
 
 	require.Error(t, err)
 	assert.Nil(t, result)
@@ -606,8 +830,9 @@ func TestSignupService_VerifyEmail_AlreadyVerified_Idempotent(t *testing.T) {
 	alreadyVerified.VerifiedAt = &now
 
 	repo.On("GetByToken", mock.Anything, "already-verified-token").Return(alreadyVerified, nil)
+	repo.On("SetCompletionSecretHash", mock.Anything, alreadyVerified.ID, mock.AnythingOfType("string")).Return(nil)
 
-	result, err := svc.VerifyEmail(context.Background(), "already-verified-token")
+	result, err := svc.VerifyEmail(context.Background(), &models.VerifySignupEmailInput{Token: "already-verified-token"})
 
 	require.NoError(t, err, "re-verifying must succeed (idempotent)")
 	require.NotNil(t, result)
@@ -632,7 +857,7 @@ func TestSignupService_VerifyEmail_MarkVerifiedError(t *testing.T) {
 	repo.On("GetByToken", mock.Anything, "ok-token").Return(pending, nil)
 	repo.On("MarkVerified", mock.Anything, pending.ID).Return(errors.New("db error"))
 
-	result, err := svc.VerifyEmail(context.Background(), "ok-token")
+	result, err := svc.VerifyEmail(context.Background(), &models.VerifySignupEmailInput{Token: "ok-token"})
 
 	require.Error(t, err)
 	assert.Nil(t, result)
@@ -673,7 +898,7 @@ func TestSignupService_CompleteSignup_PersonalSuccess(t *testing.T) {
 	}), mock.Anything).Return(user, nil)
 	repo.On("MarkCompleted", mock.Anything, req.ID, consumerTenant.ID, user.ID).Return(nil)
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "SecurePassword1!",
 		PlanCode:        "starter",
@@ -718,6 +943,7 @@ func TestSignupService_CompleteSignup_BusinessSuccess(t *testing.T) {
 	registrar.On("Register", mock.Anything, mock.MatchedBy(func(r *TenantManagementRegisterRequest) bool {
 		return r.TenantName == testAcmeCorpOrg && r.TenantSlug == testTenantSlugAcme && r.Email == req.Email
 	})).Return(&TenantManagementRegisterResult{ID: registeredTenantID}, nil)
+	repo.On("SetProvisionedTenant", mock.Anything, req.ID, registeredTenantID, testTenantSlugAcme).Return(nil)
 	tenantSvc.On("CreateTenant", mock.Anything, mock.MatchedBy(func(r *models.CreateTenantRequest) bool {
 		return r.Type == "customer" && r.Name == testAcmeCorpOrg && r.Slug == testTenantSlugAcme &&
 			r.ID != nil && *r.ID == registeredTenantID
@@ -725,7 +951,7 @@ func TestSignupService_CompleteSignup_BusinessSuccess(t *testing.T) {
 	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).Return(user, nil)
 	repo.On("MarkCompleted", mock.Anything, req.ID, tenant.ID, user.ID).Return(nil)
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "AcmeSecure1!",
 		PlanCode:        "starter",
@@ -767,7 +993,7 @@ func TestSignupService_CompleteSignup_TenantRegistrationFails_HardFails(t *testi
 	registrar.On("Register", mock.Anything, mock.Anything).
 		Return((*TenantManagementRegisterResult)(nil), errors.New("tenant-management unreachable"))
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "AcmeSecure1!",
 		PlanCode:        "starter",
@@ -778,6 +1004,117 @@ func TestSignupService_CompleteSignup_TenantRegistrationFails_HardFails(t *testi
 	tenantSvc.AssertNotCalled(t, "CreateTenant")
 	userSvc.AssertNotCalled(t, "CreateForSignup")
 	repo.AssertNotCalled(t, "MarkCompleted", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestSignupService_CompleteSignup_ResumesAfterPartialTenantRegistration
+// proves the fix for the production duplicate-tenant bug (tenant
+// "atlasbadi" 938ba35f left as a permanent zero-user orphan after
+// "atlasbadi-a1ad" cf097694 was minted 24 seconds later for a retry of the
+// SAME signup). req.TenantID already set (as SetProvisionedTenant would
+// have left it after a prior attempt's successful Register, followed by a
+// failed/incomplete local CreateTenant) must make provisionTenant resume
+// straight into CreateTenant using the already-registered tenant ID and
+// the already-accepted slug — Register must NOT be called again.
+func TestSignupService_CompleteSignup_ResumesAfterPartialTenantRegistration(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	registrar := &mockTenantManagementRegistrar{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupServiceWithRegistrar(repo, emailSvc, tenantSvc, registrar, userSvc, lookup)
+
+	companyName := testAcmeCorpOrg
+	req := verifiedRequest("john@acme.com", "business")
+	req.CompanyName = &companyName
+
+	// Simulates the checkpoint SetProvisionedTenant would have written
+	// after a prior attempt's Register succeeded but local CreateTenant
+	// did not run (or failed) — tenant_id set, company_slug overwritten
+	// with the tenant-management-accepted slug (not the original
+	// candidate, which may have collided).
+	alreadyRegisteredTenantID := uuid.New()
+	acceptedSlug := testTenantSlugAcme
+	req.TenantID = &alreadyRegisteredTenantID
+	req.CompanySlug = &acceptedSlug
+
+	tenant := &models.Tenant{ID: alreadyRegisteredTenantID, Name: testAcmeCorpOrg, Slug: acceptedSlug, Type: "customer"}
+	user := fakeUser(tenant.ID, req.Email)
+
+	repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
+	// The local iam_tenants row does not exist yet for this ID.
+	tenantSvc.On("GetByID", mock.Anything, alreadyRegisteredTenantID).Return(nil, nil)
+	tenantSvc.On("CreateTenant", mock.Anything, mock.MatchedBy(func(r *models.CreateTenantRequest) bool {
+		return r.ID != nil && *r.ID == alreadyRegisteredTenantID && r.Slug == acceptedSlug
+	})).Return(tenant, nil)
+	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).Return(user, nil)
+	repo.On("MarkCompleted", mock.Anything, req.ID, tenant.ID, user.ID).Return(nil)
+
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
+		SignupRequestID: req.ID,
+		Password:        "AcmeSecure1!",
+		PlanCode:        "starter",
+	}, "", "")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, tenant.ID, result.User.TenantID)
+	// The whole point: a SECOND tenant-management registration must never
+	// happen for a signup request that already has one.
+	registrar.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+	repo.AssertNotCalled(t, "SetProvisionedTenant", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestSignupService_CompleteSignup_FullyResumedRetry_IsIdempotent proves
+// that if BOTH phases already completed on a prior attempt (tenant-
+// management row AND local iam_tenants row both exist for req.TenantID —
+// e.g. CompleteSignup is called twice because a client retried after a
+// slow/lost HTTP response), provisionTenant returns the existing tenant
+// without calling either Register or CreateTenant again.
+func TestSignupService_CompleteSignup_FullyResumedRetry_IsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	repo := &mockSignupRequestRepo{}
+	emailSvc := &mockSignupEmailSender{}
+	tenantSvc := &mockSignupTenantCreator{}
+	registrar := &mockTenantManagementRegistrar{}
+	userSvc := &mockSignupUserCreator{}
+	lookup := &mockSignupUserLookup{}
+
+	svc := buildSignupServiceWithRegistrar(repo, emailSvc, tenantSvc, registrar, userSvc, lookup)
+
+	companyName := testAcmeCorpOrg
+	req := verifiedRequest("john@acme.com", "business")
+	req.CompanyName = &companyName
+
+	tenantID := uuid.New()
+	slug := testTenantSlugAcme
+	req.TenantID = &tenantID
+	req.CompanySlug = &slug
+
+	existingTenant := &models.Tenant{ID: tenantID, Name: testAcmeCorpOrg, Slug: slug, Type: "customer"}
+	user := fakeUser(tenantID, req.Email)
+
+	repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
+	// Both phases already provisioned: the local tenant already exists.
+	tenantSvc.On("GetByID", mock.Anything, tenantID).Return(existingTenant, nil)
+	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).Return(user, nil)
+	repo.On("MarkCompleted", mock.Anything, req.ID, tenantID, user.ID).Return(nil)
+
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
+		SignupRequestID: req.ID,
+		Password:        "AcmeSecure1!",
+		PlanCode:        "starter",
+	}, "", "")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, tenantID, result.User.TenantID)
+	registrar.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+	tenantSvc.AssertNotCalled(t, "CreateTenant", mock.Anything, mock.Anything)
 }
 
 // TestSignupService_CompleteSignup_BusinessNoCompanySlug_GeneratesRandomSlug
@@ -804,23 +1141,26 @@ func TestSignupService_CompleteSignup_BusinessNoCompanySlug_GeneratesRandomSlug(
 	req := verifiedRequest("jane@newco.example.com", "business")
 
 	registeredTenantID := uuid.New()
-	tenant := &models.Tenant{ID: registeredTenantID, Name: "My Company", Type: "customer"}
+	tenant := &models.Tenant{ID: registeredTenantID, Name: models.PlaceholderTenantName, Type: "customer"}
 	user := fakeUser(tenant.ID, req.Email)
 
 	repo.On("GetByID", mock.Anything, req.ID).Return(req, nil)
 	registrar.On("Register", mock.Anything, mock.MatchedBy(func(r *TenantManagementRegisterRequest) bool {
-		return r.TenantName == "My Company" &&
+		return r.TenantName == models.PlaceholderTenantName &&
 			isGeneratedFallbackSlug(r.TenantSlug) &&
 			models.IsValidSlug(r.TenantSlug) &&
 			!models.IsReservedSlug(r.TenantSlug)
 	})).Return(&TenantManagementRegisterResult{ID: registeredTenantID}, nil)
+	repo.On("SetProvisionedTenant", mock.Anything, req.ID, registeredTenantID, mock.MatchedBy(func(slug string) bool {
+		return isGeneratedFallbackSlug(slug) && slug != "company"
+	})).Return(nil)
 	tenantSvc.On("CreateTenant", mock.Anything, mock.MatchedBy(func(r *models.CreateTenantRequest) bool {
 		return isGeneratedFallbackSlug(r.Slug) && r.Slug != "company"
 	})).Return(tenant, nil)
 	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).Return(user, nil)
 	repo.On("MarkCompleted", mock.Anything, req.ID, tenant.ID, user.ID).Return(nil)
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "Sup3rSecure1!",
 		PlanCode:        "starter",
@@ -858,7 +1198,7 @@ func TestSignupService_CompleteSignup_TenantSlugCollision_RetriesWithDifferentSl
 	req := verifiedRequest("jane@newco.example.com", "business")
 
 	registeredTenantID := uuid.New()
-	tenant := &models.Tenant{ID: registeredTenantID, Name: "My Company", Type: "customer"}
+	tenant := &models.Tenant{ID: registeredTenantID, Name: models.PlaceholderTenantName, Type: "customer"}
 	user := fakeUser(tenant.ID, req.Email)
 
 	// Captured via .Run(), which testify invokes exactly once per actual
@@ -882,11 +1222,12 @@ func TestSignupService_CompleteSignup_TenantSlugCollision_RetriesWithDifferentSl
 		Run(captureSlug).
 		Return(&TenantManagementRegisterResult{ID: registeredTenantID}, nil).
 		Once()
+	repo.On("SetProvisionedTenant", mock.Anything, req.ID, registeredTenantID, mock.AnythingOfType("string")).Return(nil)
 	tenantSvc.On("CreateTenant", mock.Anything, mock.AnythingOfType("*models.CreateTenantRequest")).Return(tenant, nil)
 	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).Return(user, nil)
 	repo.On("MarkCompleted", mock.Anything, req.ID, tenant.ID, user.ID).Return(nil)
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "Sup3rSecure1!",
 		PlanCode:        "starter",
@@ -913,10 +1254,11 @@ func TestSignupService_CompleteSignup_NotVerified_ReturnsError(t *testing.T) {
 	svc := buildSignupService(repo, emailSvc, tenantSvc, userSvc, lookup)
 
 	unverified := pendingRequest("jane@example.com") // Verified = false
+	unverified.CompletionSecretHash = testCompletionSecretHash()
 
 	repo.On("GetByID", mock.Anything, unverified.ID).Return(unverified, nil)
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: unverified.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -943,7 +1285,7 @@ func TestSignupService_CompleteSignup_AlreadyCompleted_ReturnsError(t *testing.T
 
 	repo.On("GetByID", mock.Anything, done.ID).Return(done, nil)
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: done.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -970,7 +1312,7 @@ func TestSignupService_CompleteSignup_Expired_ReturnsError(t *testing.T) {
 
 	repo.On("GetByID", mock.Anything, expired.ID).Return(expired, nil)
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: expired.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -995,7 +1337,7 @@ func TestSignupService_CompleteSignup_SignupNotFound_ReturnsError(t *testing.T) 
 	missingID := uuid.New()
 	repo.On("GetByID", mock.Anything, missingID).Return(nil, pgx.ErrNoRows)
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: missingID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -1032,7 +1374,7 @@ func TestSignupService_CompleteSignup_ConsumerTenantMissing(t *testing.T) {
 	tenantSvc.On("GetByID", mock.Anything, models.WellKnownTenantConsumer).
 		Return((*models.Tenant)(nil), nil)
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -1067,7 +1409,7 @@ func TestSignupService_CompleteSignup_UserCreateError(t *testing.T) {
 	userSvc.On("CreateForSignup", mock.Anything, mock.AnythingOfType("*models.CreateUserRequest"), mock.Anything).
 		Return(nil, errors.New("email already registered"))
 
-	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	_, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -1103,7 +1445,7 @@ func TestSignupService_CompleteSignup_MarkCompletedError_NonFatal(t *testing.T) 
 	// MarkCompleted fails — must be non-fatal.
 	repo.On("MarkCompleted", mock.Anything, req.ID, consumerTenant.ID, user.ID).Return(errors.New("db error"))
 
-	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{
+	result, err := svc.CompleteSignup(context.Background(), &models.CompleteSignupInput{CompletionSecret: testCompletionSecret,
 		SignupRequestID: req.ID,
 		Password:        "Pass1234!",
 		PlanCode:        "starter",
@@ -1130,9 +1472,18 @@ func TestGenerateSlug(t *testing.T) {
 		{"numbers kept", "Company 42", "company-42"},
 		{"dashes preserved", "already-slugged", "already-slugged"},
 		{"leading trailing dashes trimmed", "-bad-slug-", "bad-slug"},
-		{"only special chars", "!@#$%", "company"},
-		{"empty string", "", "company"},
-		{"unicode stripped", "Héllo Wörld", "hllo-wrld"},
+		{"only special chars", "!@#$%", ""},
+		{"empty string", "", ""},
+		{"accents folded", "Héllo Wörld", "hello-world"},
+		{"turkish a.s.", "Çağrı Yazılım A.Ş.", "cagri-yazilim"},
+		{"turkish ltd sti", "Kaya İnşaat San. ve Tic. Ltd. Şti.", "kaya-insaat"},
+		{"dotted capital I", "İstanbul", "istanbul"},
+		{"dotless capital I", "IŞIK Mobilya", "isik-mobilya"},
+		{"too short falls back", "AB", ""},
+		{"reserved gets suffix", "Admin", "admin-2"},
+		{"suffix only is kept", "Ltd", "ltd"},
+		{"80 chars cut at hyphen", strings.Repeat("abcdefghi ", 8), "abcdefghi-abcdefghi-abcdefghi-abcdefghi"},
+		{"long single word hard cut", strings.Repeat("x", 80), strings.Repeat("x", 40)},
 		{"multiple consecutive spaces", "A   B   C", "a-b-c"},
 	}
 

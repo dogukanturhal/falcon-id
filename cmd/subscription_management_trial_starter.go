@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/dogukanturhal/falcon-id/internal/services"
 )
 
 // httpSubscriptionManagementTrialStarter implements
@@ -46,6 +48,7 @@ func newHTTPSubscriptionManagementTrialStarter(baseURL string, httpClient *http.
 
 type startTrialErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code"`
 }
 
 // StartTrial implements services.TrialStarter. packageCode, when non-empty,
@@ -56,6 +59,9 @@ type startTrialErrorResponse struct {
 // default package (subscription_packages.is_default) rather than falcon-id
 // guessing one.
 func (r *httpSubscriptionManagementTrialStarter) StartTrial(ctx context.Context, tenantID uuid.UUID, packageCode string) error {
+	if strings.EqualFold(strings.TrimSpace(packageCode), "free") {
+		return fmt.Errorf("Free is not a signup plan")
+	}
 	if r.baseURL == "" {
 		return fmt.Errorf("subscription-management trial starter: SUBSCRIPTION_MANAGEMENT_INTERNAL_URL is not configured")
 	}
@@ -93,11 +99,28 @@ func (r *httpSubscriptionManagementTrialStarter) StartTrial(ctx context.Context,
 	if resp.StatusCode != http.StatusOK {
 		var errResp startTrialErrorResponse
 		_ = json.Unmarshal(respBody, &errResp)
+		if resp.StatusCode == http.StatusConflict && errResp.Code == "TRIAL_ALREADY_CONSUMED" {
+			return services.ErrSignupTrialAlreadyConsumed
+		}
 		if errResp.Error != "" {
 			return fmt.Errorf("subscription-management trial start failed (%d): %s", resp.StatusCode, errResp.Error)
 		}
 		return fmt.Errorf("subscription-management trial start failed (%d)", resp.StatusCode)
 	}
 
+	var state struct {
+		Status     string     `json:"status"`
+		IsTrialing *bool      `json:"is_trialing"`
+		TrialEnd   *time.Time `json:"trial_end"`
+	}
+	if err := json.Unmarshal(respBody, &state); err != nil {
+		return fmt.Errorf("read trial state: %w", err)
+	}
+	if state.IsTrialing != nil && !*state.IsTrialing {
+		return services.ErrSignupTrialAlreadyConsumed
+	}
+	if state.IsTrialing == nil || state.TrialEnd == nil || !state.TrialEnd.After(time.Now()) || (state.Status != "active" && state.Status != "trialing") {
+		return fmt.Errorf("trial source did not confirm an active no-card trial")
+	}
 	return nil
 }

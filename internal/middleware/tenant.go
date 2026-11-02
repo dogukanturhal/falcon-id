@@ -27,6 +27,9 @@ const (
 // request even though the path matches /api/* — the route group is
 // expected to source tenant context from a downstream middleware".
 var publicEndpoints = []string{
+	// Scoped ServiceAuth endpoints derive tenant from the body and enforce act-as.
+	"/api/v1/authorization/lookup-subjects",
+	"/api/v1/authorization/check-batch",
 	"/health",
 	"/ready",
 	"/metrics",
@@ -83,6 +86,17 @@ var publicEndpoints = []string{
 	// fails with `400 Tenant context required` and zero permissions
 	// land in iam_permissions for those modules.
 	"/internal/permissions",
+	// Module permission-catalogue self-registration on the route services
+	// actually call: platform-shared permissions.Client posts to
+	// /internal/v1/permissions/register (the bare /internal/permissions path
+	// above is the legacy alias). Same GLOBAL-artefact model: the handler
+	// registers platform-level module metadata and reads no tenant context,
+	// and the route group is gated by ServiceAuth(). Services pinned to a
+	// platform-shared release that predates the client sending X-Tenant-ID
+	// otherwise fail at startup with `400 Tenant context required`.
+	// Exact route only (no trailing slash): /internal/v1/permissions/<other>
+	// would stay tenant-required.
+	"/internal/v1/permissions/register",
 	// Service-to-service ZTNA device-enrollment registry
 	// (POST /internal/v1/iam-devices/enroll, GET .../by-ek-hash/:hash).
 	// Same GLOBAL-artefact model as /internal/permissions above: iam_devices
@@ -106,6 +120,81 @@ var publicEndpoints = []string{
 	// Latent until the first ACTIVE tenant host was resolved (webmail.hexxlock.com,
 	// 2026-06-26) — every prior call fail-opened to the canonical host.
 	"/internal/v1/tenant-discovery",
+	// Service-to-service tenant-admin surface (GET .../users/count,
+	// .../connection-info, .../smtp-config). Same model as
+	// /internal/v1/iam-devices/ and /internal/v1/tenant-discovery above:
+	// every handler in this ServiceAuth()-gated route group derives the
+	// subject tenant strictly from the :id path parameter, never from
+	// TenantIDKey/GetTenantID(c) — confirmed via `git grep TenantIDKey`
+	// across internal/handlers/tenant_handler.go. The blanket X-Tenant-ID
+	// gate here is redundant with, and orthogonal to, the actual
+	// authorization (serviceAuthMiddleware.ServiceAuth()'s JWT
+	// validation); it does not re-open header-trust authorization, it
+	// only stops this global gate from rejecting well-authenticated
+	// S2S calls before ServiceAuth() ever runs.
+	//
+	// Without this exemption every caller of
+	// GET /internal/v1/tenants/:id/users/count (e.g. tenant-management's
+	// ReapOrphanTenants reconciler, first exercised 2026-09-27) 400s with
+	// `Tenant context required` regardless of Authorization header,
+	// because ExtractTenant() runs before ServiceAuth() in cmd/routes.go
+	// and this prefix was missing from publicEndpoints when the route
+	// group was added (feat/seat-quota-enforcement).
+	"/internal/v1/tenants/",
+	// Role-template revoke (S2S): tenant comes from the ServiceAuth +
+	// RequireScope-gated request body, never from X-Tenant-ID.
+	"/internal/v1/role-templates/",
+
+	// ADR-A10 delegated-admin guard action endpoint (POST
+	// /internal/v1/roles/:id/actions/grant-permission). Same model as
+	// /internal/v1/tenants/ above: ServiceAuth()-gated, and the handler
+	// derives the tenant from the target role's own TenantID (looked up
+	// server-side by :id), never from X-Tenant-ID. Without this exemption
+	// every grant-permission call from a caller that only sends a
+	// ServiceAuth Bearer (no X-Tenant-ID of its own to send) 400s with
+	// `Tenant context required` before ServiceAuth() ever runs.
+	"/internal/v1/roles/",
+
+	// Internal SoD evaluation (POST /internal/v1/sod/evaluate).
+	// ServiceAuth()-gated; the tenant being evaluated is named explicitly
+	// in the request body (it evaluates a specific user's assignments,
+	// which may not match the caller's own tenant context at all for a
+	// platform-side scheduled job), not derived from X-Tenant-ID.
+	"/internal/v1/sod/",
+	// R1 platform plane: JIT elevation + break-glass. These routes are
+	// gated by serviceAuthMiddleware.ServiceAuth() + RequireScope() (the
+	// acmeweb BFF's S2S credential) PLUS authMiddleware.RequireActorAuth()
+	// (the human operator's own session access token, forwarded in
+	// X-Actor-Assertion — see internal/middleware/actor_auth.go). Neither
+	// of those derives anything from TenantIDKey/GetTenantID(c): the
+	// subject is always the Platform-internal tenant
+	// (00000000-0000-0000-0000-000000000002), enforced by
+	// RequirePlatformInternalActor() reading the validated actor JWT's own
+	// tenant_id claim, never an X-Tenant-ID header. Same model as
+	// /internal/v1/tenants/ above.
+	//
+	// Deliberately WITHOUT a trailing slash (unlike /internal/v1/tenants/
+	// above, which keeps one to exclude its own bare list endpoint): the
+	// bare create paths (POST /internal/v1/jit-elevations,
+	// POST /internal/v1/break-glass, POST/GET /internal/v1/platform-roles,
+	// registered via .POST("", ...) / .GET("", ...) in
+	// cmd/routes_admin.go) have no trailing slash themselves, so a
+	// trailing-slash prefix here would fail to match them via
+	// strings.HasPrefix and 400 "Tenant context required" in
+	// production/staging despite being fully authenticated by the
+	// platformJITAuth chain. Every sub-path in all three route groups
+	// shares that identical auth chain and none reads
+	// TenantIDKey/GetTenantID(c), so widening the match to the bare path
+	// is safe.
+	"/internal/v1/jit-elevations",
+	"/internal/v1/break-glass",
+	"/internal/v1/platform-roles",
+	// Staff console operator chain (/internal/v1/ops/* and
+	// /internal/v1/ops-approvals/*): ServiceAuth + RequireScope + operatorauth
+	// authenticate the calling service and the human operator; tenant context
+	// is never taken from X-Tenant-ID (the actor is the internal tenant, the
+	// subject tenant comes from the target user / path / query).
+	"/internal/v1/ops",
 }
 
 // tenantRequiredPrefixes are the ONLY paths that require tenant context.

@@ -42,6 +42,9 @@ type SigningKey struct {
 }
 
 const (
+	// StatusPending is a published key that is not yet used for signing; it becomes
+	// active once ActivatedAt (the scheduled activation time) has passed.
+	StatusPending = "pending"
 	// StatusActive is an exported identifier.
 	StatusActive = "active"
 	// StatusRotated is an exported identifier.
@@ -56,14 +59,26 @@ const (
 )
 
 // KeyManager manages signing keys for JWT token operations.
+//
+// Rotation is publish-before-activate: Rotate inserts the next key as StatusPending
+// (served in JWKS, never used for signing). After PublishDelay a single elected
+// rotator (advisory lock) promotes it to StatusActive and retires the previous
+// active key. Every replica reloads the key set from the store periodically and on
+// unknown-kid misses, so all replicas converge on the newest active key.
 type KeyManager struct {
-	pool          *pgxpool.Pool
+	store         keyStore
 	encryptionKey []byte // 32-byte AES key for encrypting private keys at rest
 	logger        *zap.Logger
+	opts          Options
+	now           func() time.Time
 
 	mu        sync.RWMutex
 	activeKey *cachedKey
-	allKeys   map[string]*cachedKey // kid -> cachedKey (active + rotated for validation)
+	allKeys   map[string]*cachedKey // kid -> cachedKey (pending + active + rotated, minus retired)
+	version   uint64                // bumped whenever the visible key set changes
+
+	reloadMu       sync.Mutex // guards lastMissReload
+	lastMissReload time.Time
 }
 
 type cachedKey struct {
@@ -72,58 +87,131 @@ type cachedKey struct {
 	publicKey  crypto.PublicKey
 }
 
-// NewKeyManager creates a new KeyManager.
+// Options tunes the rotation lifecycle. Zero values take the defaults.
+type Options struct {
+	// PublishDelay is how long a pending key is published before it starts signing.
+	// Must exceed the JWKS Cache-Control max-age plus ReloadInterval.
+	PublishDelay time.Duration
+	// ReloadInterval is how often every replica reloads keys from the store.
+	ReloadInterval time.Duration
+	// RetireAfter is how long a rotated key stays in JWKS after rotation: at least the
+	// longest lifetime of any token it signed plus a margin.
+	RetireAfter time.Duration
+	// MissReloadInterval rate-limits on-demand reloads triggered by unknown kids.
+	MissReloadInterval time.Duration
+	// KeyLifetime is the validity of a newly generated key.
+	KeyLifetime time.Duration
+	// RotationThreshold: rotate when the active key has less than this left.
+	RotationThreshold time.Duration
+}
+
+// Defaults for Options.
+const (
+	DefaultPublishDelay       = 75 * time.Minute
+	DefaultReloadInterval     = 60 * time.Second
+	DefaultRetireAfter        = 24 * time.Hour
+	DefaultMissReloadInterval = 10 * time.Second
+	DefaultKeyLifetime        = 90 * 24 * time.Hour
+	DefaultRotationThreshold  = 7 * 24 * time.Hour
+)
+
+// WithDefaults fills zero fields with the package defaults.
+func (o Options) WithDefaults() Options {
+	if o.PublishDelay <= 0 {
+		o.PublishDelay = DefaultPublishDelay
+	}
+	if o.ReloadInterval <= 0 {
+		o.ReloadInterval = DefaultReloadInterval
+	}
+	if o.RetireAfter <= 0 {
+		o.RetireAfter = DefaultRetireAfter
+	}
+	if o.MissReloadInterval <= 0 {
+		o.MissReloadInterval = DefaultMissReloadInterval
+	}
+	if o.KeyLifetime <= 0 {
+		o.KeyLifetime = DefaultKeyLifetime
+	}
+	if o.RotationThreshold <= 0 {
+		o.RotationThreshold = DefaultRotationThreshold
+	}
+	return o
+}
+
+// NewKeyManager creates a new KeyManager backed by PostgreSQL.
 // encryptionKey must be exactly 32 bytes (AES-256).
 func NewKeyManager(pool *pgxpool.Pool, encryptionKey []byte, logger *zap.Logger) (*KeyManager, error) {
+	return newKeyManager(newPGStore(pool), encryptionKey, logger)
+}
+
+func newKeyManager(store keyStore, encryptionKey []byte, logger *zap.Logger) (*KeyManager, error) {
 	if len(encryptionKey) != 32 {
 		return nil, fmt.Errorf("encryption key must be 32 bytes, got %d", len(encryptionKey))
 	}
 
-	km := &KeyManager{
-		pool:          pool,
+	return &KeyManager{
+		store:         store,
 		encryptionKey: encryptionKey,
 		logger:        logger,
+		opts:          Options{}.WithDefaults(),
+		now:           time.Now,
 		allKeys:       make(map[string]*cachedKey),
-	}
-
-	return km, nil
+	}, nil
 }
 
-// Initialize loads existing keys from the database or generates a new one if none exist.
+// Configure overrides the rotation options. Call before Initialize.
+func (km *KeyManager) Configure(opts Options) {
+	km.opts = opts.WithDefaults()
+}
+
+// ReloadInterval returns the configured periodic reload interval.
+func (km *KeyManager) ReloadInterval() time.Duration { return km.opts.ReloadInterval }
+
+// Version changes whenever the visible key set (including statuses) changes.
+// Caches of derived documents (JWKS) key off it.
+func (km *KeyManager) Version() uint64 {
+	km.mu.RLock()
+	defer km.mu.RUnlock()
+	return km.version
+}
+
+// Initialize loads existing keys from the store and bootstraps the first key if none
+// exist. Bootstrap is serialized across replicas by the rotation lock.
 func (km *KeyManager) Initialize(ctx context.Context) error {
-	keys, err := km.loadKeys(ctx)
-	if err != nil {
+	if err := km.Reload(ctx); err != nil {
 		return fmt.Errorf("failed to load signing keys: %w", err)
 	}
 
-	km.mu.Lock()
-	// Note: mu.Unlock is called explicitly below (not deferred) to avoid deadlock
-	// when generateAndStore needs to acquire the same lock.
-
-	for _, k := range keys {
-		ck, err := km.decryptAndCache(k)
+	deadline := km.now().Add(15 * time.Second)
+	for {
+		if _, _, err := km.ActiveKey(); err == nil {
+			break
+		}
+		acquired, err := km.store.WithRotationLock(ctx, func(ctx context.Context) error {
+			if err := km.Reload(ctx); err != nil {
+				return err
+			}
+			if _, _, aerr := km.ActiveKey(); aerr == nil {
+				return nil // another replica bootstrapped meanwhile
+			}
+			km.logger.Info("No active signing key found, generating new RS256 key pair")
+			return km.insertNewKey(ctx, AlgorithmRS256, StatusActive, km.now())
+		})
 		if err != nil {
-			km.logger.Warn("Failed to decrypt signing key, skipping",
-				zap.String("key_id", k.KeyID),
-				zap.Error(err),
-			)
-			continue
-		}
-		km.allKeys[k.KeyID] = ck
-		if k.Status == StatusActive {
-			km.activeKey = ck
-		}
-	}
-
-	// If no active key exists, generate one (release lock first to avoid deadlock
-	// since generateAndStore also acquires km.mu)
-	needsGeneration := km.activeKey == nil
-	km.mu.Unlock()
-
-	if needsGeneration {
-		km.logger.Info("No active signing key found, generating new RS256 key pair")
-		if err := km.generateAndStore(ctx, AlgorithmRS256, 90*24*time.Hour); err != nil {
 			return fmt.Errorf("failed to generate initial signing key: %w", err)
+		}
+		if !acquired {
+			if km.now().After(deadline) {
+				return fmt.Errorf("timed out waiting for another replica to bootstrap the signing key")
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
+			if err := km.Reload(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -133,7 +221,6 @@ func (km *KeyManager) Initialize(ctx context.Context) error {
 		zap.String("active_kid", km.activeKey.KeyID),
 	)
 	km.mu.RUnlock()
-
 	return nil
 }
 
@@ -148,16 +235,53 @@ func (km *KeyManager) ActiveKey() (crypto.Signer, string, error) {
 	return km.activeKey.privateKey, km.activeKey.KeyID, nil
 }
 
-// PublicKey returns the public key for a given key ID.
+// PublicKey returns the public key for a given key ID. On an unknown kid it reloads
+// the key set from the store (rate-limited, once per MissReloadInterval) and retries,
+// so a key published by another replica is found without waiting for the periodic
+// reload.
 func (km *KeyManager) PublicKey(kid string) (crypto.PublicKey, error) {
+	if pub, ok := km.lookupPublic(kid); ok {
+		return pub, nil
+	}
+	if km.reloadOnMiss() {
+		if pub, ok := km.lookupPublic(kid); ok {
+			return pub, nil
+		}
+	}
+	return nil, fmt.Errorf("key not found: %s", kid)
+}
+
+func (km *KeyManager) lookupPublic(kid string) (crypto.PublicKey, bool) {
 	km.mu.RLock()
 	defer km.mu.RUnlock()
-
 	ck, ok := km.allKeys[kid]
-	if !ok {
-		return nil, fmt.Errorf("key not found: %s", kid)
+	if !ok || ck.Status == StatusRevoked {
+		return nil, false
 	}
-	return ck.publicKey, nil
+	return ck.publicKey, true
+}
+
+// reloadOnMiss reloads from the store unless one ran within MissReloadInterval.
+// Reports whether a reload actually succeeded.
+func (km *KeyManager) reloadOnMiss() bool {
+	if km.store == nil {
+		return false
+	}
+	km.reloadMu.Lock()
+	if now := km.now(); !km.lastMissReload.IsZero() && now.Sub(km.lastMissReload) < km.opts.MissReloadInterval {
+		km.reloadMu.Unlock()
+		return false
+	}
+	km.lastMissReload = km.now()
+	km.reloadMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := km.Reload(ctx); err != nil {
+		km.logger.Warn("On-demand signing key reload failed", zap.Error(err))
+		return false
+	}
+	return true
 }
 
 // AllPublicKeys returns all active and rotated public keys (for JWKS).
@@ -188,67 +312,212 @@ type PublicKeyInfo struct {
 	Status    string
 }
 
-// Rotate generates a new active key and marks the current active key as rotated.
-func (km *KeyManager) Rotate(ctx context.Context) error {
-	km.mu.Lock()
-	currentActive := km.activeKey
-	km.mu.Unlock()
+// Reload re-reads the key set from the store and swaps it in. The active key is the
+// newest key in state active; pending keys are published but never sign. Rotated keys
+// older than RetireAfter and revoked keys drop out of the set.
+func (km *KeyManager) Reload(ctx context.Context) error {
+	if km.store == nil {
+		return nil
+	}
+	rows, err := km.store.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query signing keys: %w", err)
+	}
 
-	if currentActive != nil {
-		now := time.Now()
-		_, err := km.pool.Exec(ctx,
-			`UPDATE iam_signing_keys SET status = $1, rotated_at = $2 WHERE id = $3`,
-			StatusRotated, now, currentActive.ID,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to mark current key as rotated: %w", err)
+	km.mu.RLock()
+	old := km.allKeys
+	prevActive := km.activeKey
+	km.mu.RUnlock()
+
+	now := km.now()
+	next := make(map[string]*cachedKey, len(rows))
+	var active *cachedKey
+	for _, k := range rows {
+		if k.Status == StatusRevoked {
+			continue
 		}
-
-		km.mu.Lock()
-		currentActive.Status = StatusRotated
-		currentActive.RotatedAt = &now
-		km.mu.Unlock()
-
-		km.logger.Info("Rotated signing key",
-			zap.String("old_kid", currentActive.KeyID),
-		)
+		if k.Status == StatusRotated && k.RotatedAt != nil && now.Sub(*k.RotatedAt) > km.opts.RetireAfter {
+			continue
+		}
+		var ck *cachedKey
+		if prev, ok := old[k.KeyID]; ok {
+			cp := *prev // reuse decrypted material, refresh state
+			cp.SigningKey = k
+			ck = &cp
+		} else {
+			ck, err = km.decryptAndCache(k)
+			if err != nil {
+				km.logger.Warn("Failed to decrypt signing key, skipping",
+					zap.String("key_id", k.KeyID), zap.Error(err))
+				continue
+			}
+		}
+		next[k.KeyID] = ck
+		if k.Status == StatusActive && (active == nil || k.ActivatedAt.Before(active.ActivatedAt)) {
+			active = ck
+		}
+	}
+	if active == nil && prevActive != nil {
+		// Keep the previous signer on a partial/failed view, but only while it is
+		// still loaded as active, or rotated for less than RetireAfter/2; a revoked,
+		// missing or long-rotated key must not keep signing, so the caller mints a new one.
+		if ck, ok := next[prevActive.KeyID]; ok {
+			youngRotated := ck.Status == StatusRotated && ck.RotatedAt != nil &&
+				now.Sub(*ck.RotatedAt) < km.opts.RetireAfter/2
+			if ck.Status == StatusActive || youngRotated {
+				active = ck
+			}
+		}
 	}
 
-	// Generate new active key
-	if err := km.generateAndStore(ctx, AlgorithmRS256, 90*24*time.Hour); err != nil {
-		return fmt.Errorf("failed to generate new signing key: %w", err)
+	km.mu.Lock()
+	changed := len(old) != len(next) || (km.activeKey == nil) != (active == nil) ||
+		(active != nil && km.activeKey != nil && active.KeyID != km.activeKey.KeyID)
+	if !changed {
+		for kid, ck := range next {
+			if o, ok := old[kid]; !ok || o.Status != ck.Status {
+				changed = true
+				break
+			}
+		}
+	}
+	km.allKeys = next
+	km.activeKey = active
+	if changed {
+		km.version++
+	}
+	km.mu.Unlock()
+	return nil
+}
+
+// Maintain runs one lifecycle step on the elected rotator: it reloads, activates a
+// pending key whose publish delay has elapsed, and otherwise starts a rotation when
+// the active key is near expiry. Replicas that do not win the advisory lock only
+// reload. Safe to call concurrently from every replica.
+func (km *KeyManager) Maintain(ctx context.Context) error {
+	if km.store == nil {
+		return nil
+	}
+	acquired, err := km.store.WithRotationLock(ctx, func(ctx context.Context) error {
+		// Re-check state inside the lock: another replica may have rotated already.
+		if err := km.Reload(ctx); err != nil {
+			return err
+		}
+		return km.maintainLocked(ctx, false)
+	})
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return km.Reload(ctx)
+	}
+	return nil
+}
+
+// Rotate forces a rotation: it publishes a new pending key (idempotent while one is
+// already pending). The key starts signing after PublishDelay via Maintain.
+func (km *KeyManager) Rotate(ctx context.Context) error {
+	acquired, err := km.store.WithRotationLock(ctx, func(ctx context.Context) error {
+		if err := km.Reload(ctx); err != nil {
+			return err
+		}
+		return km.maintainLocked(ctx, true)
+	})
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return fmt.Errorf("another replica is rotating signing keys")
+	}
+	return nil
+}
+
+// maintainLocked must run holding the rotation lock after a fresh Reload.
+func (km *KeyManager) maintainLocked(ctx context.Context, force bool) error {
+	now := km.now()
+
+	km.mu.RLock()
+	var pending *cachedKey
+	for _, ck := range km.allKeys {
+		if ck.Status == StatusPending && (pending == nil || ck.ActivatedAt.After(pending.ActivatedAt)) {
+			pending = ck
+		}
+	}
+	active := km.activeKey
+	km.mu.RUnlock()
+
+	if pending != nil {
+		if now.Before(pending.ActivatedAt) {
+			return nil // still in its publish window
+		}
+		return km.activate(ctx, pending, now)
 	}
 
+	if active == nil {
+		km.logger.Warn("No active signing key during rotation check, generating one")
+		return km.insertNewKey(ctx, AlgorithmRS256, StatusActive, now)
+	}
+	if active.Status != StatusActive {
+		km.logger.Error("No rotation while signing with a non-active key, check the encryption key consistency across replicas",
+			zap.String("kid", active.KeyID), zap.String("status", active.Status))
+		return nil
+	}
+	if !force && active.ExpiresAt.Sub(now) > km.opts.RotationThreshold {
+		return nil
+	}
+
+	km.logger.Info("Publishing next signing key (pending)",
+		zap.String("active_kid", active.KeyID),
+		zap.Time("active_expires_at", active.ExpiresAt),
+		zap.Duration("publish_delay", km.opts.PublishDelay),
+	)
+	return km.insertNewKey(ctx, AlgorithmRS256, StatusPending, now.Add(km.opts.PublishDelay))
+}
+
+// activate promotes pending to active and rotates every other active key.
+func (km *KeyManager) activate(ctx context.Context, pending *cachedKey, now time.Time) error {
+	km.mu.RLock()
+	var retire []uuid.UUID
+	var oldKIDs []string
+	for _, ck := range km.allKeys {
+		if ck.Status == StatusActive && ck.ID != pending.ID {
+			retire = append(retire, ck.ID)
+			oldKIDs = append(oldKIDs, ck.KeyID)
+		}
+	}
+	km.mu.RUnlock()
+
+	if err := km.store.Promote(ctx, pending.ID, retire, now); err != nil {
+		return fmt.Errorf("failed to activate signing key: %w", err)
+	}
+	if err := km.Reload(ctx); err != nil {
+		return err
+	}
+	km.logger.Info("Activated signing key",
+		zap.String("kid", pending.KeyID),
+		zap.Strings("rotated_kids", oldKIDs),
+	)
 	return nil
 }
 
 // RevokeKey marks a key as revoked (removed from JWKS, tokens signed with it become invalid).
 func (km *KeyManager) RevokeKey(ctx context.Context, kid string) error {
-	_, err := km.pool.Exec(ctx,
-		`UPDATE iam_signing_keys SET status = $1 WHERE key_id = $2`,
-		StatusRevoked, kid,
-	)
-	if err != nil {
+	if err := km.store.Revoke(ctx, kid); err != nil {
 		return fmt.Errorf("failed to revoke key: %w", err)
 	}
-
-	km.mu.Lock()
-	if ck, ok := km.allKeys[kid]; ok {
-		ck.Status = StatusRevoked
-	}
-	km.mu.Unlock()
-
 	km.logger.Info("Revoked signing key", zap.String("kid", kid))
-	return nil
+	return km.Reload(ctx)
 }
 
 // ListKeys returns all signing keys (for admin UI).
 func (km *KeyManager) ListKeys(ctx context.Context) ([]SigningKey, error) {
-	return km.loadKeys(ctx)
+	return km.store.Load(ctx)
 }
 
-// generateAndStore creates a new key pair, encrypts the private key, and stores it.
-func (km *KeyManager) generateAndStore(ctx context.Context, algorithm string, lifetime time.Duration) error {
+// insertNewKey generates a key pair, encrypts the private key and stores it with the
+// given status; activatedAt is the (scheduled) activation time. The local view is
+// refreshed by reloading from the store.
+func (km *KeyManager) insertNewKey(ctx context.Context, algorithm, status string, activatedAt time.Time) error {
 	var privateKey crypto.Signer
 	var publicKey crypto.PublicKey
 	var err error
@@ -295,72 +564,30 @@ func (km *KeyManager) generateAndStore(ctx context.Context, algorithm string, li
 		return fmt.Errorf("failed to encrypt private key: %w", err)
 	}
 
-	now := time.Now()
+	now := km.now()
 	sk := SigningKey{
 		ID:            uuid.New(),
 		Algorithm:     algorithm,
 		PrivateKeyEnc: encrypted,
 		PublicKeyPEM:  string(pubPEM),
 		KeyID:         kid,
-		Status:        StatusActive,
-		ActivatedAt:   now,
-		ExpiresAt:     now.Add(lifetime),
+		Status:        status,
+		ActivatedAt:   activatedAt,
+		ExpiresAt:     activatedAt.Add(km.opts.KeyLifetime),
 		CreatedAt:     now,
 	}
-
-	_, err = km.pool.Exec(ctx,
-		`INSERT INTO iam_signing_keys (id, algorithm, private_key_enc, public_key_pem, key_id, status, activated_at, expires_at, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		sk.ID, sk.Algorithm, sk.PrivateKeyEnc, sk.PublicKeyPEM, sk.KeyID, sk.Status, sk.ActivatedAt, sk.ExpiresAt, sk.CreatedAt,
-	)
-	if err != nil {
+	if err := km.store.Insert(ctx, sk); err != nil {
 		return fmt.Errorf("failed to store signing key: %w", err)
 	}
-
-	ck := &cachedKey{
-		SigningKey: sk,
-		privateKey: privateKey,
-		publicKey:  publicKey,
-	}
-
-	km.mu.Lock()
-	km.activeKey = ck
-	km.allKeys[kid] = ck
-	km.mu.Unlock()
 
 	km.logger.Info("Generated and stored new signing key",
 		zap.String("kid", kid),
 		zap.String("algorithm", algorithm),
+		zap.String("status", status),
+		zap.Time("activated_at", sk.ActivatedAt),
 		zap.Time("expires_at", sk.ExpiresAt),
 	)
-
-	return nil
-}
-
-// loadKeys reads all signing keys from the database.
-func (km *KeyManager) loadKeys(ctx context.Context) ([]SigningKey, error) {
-	rows, err := km.pool.Query(ctx,
-		`SELECT id, algorithm, private_key_enc, public_key_pem, key_id, status, activated_at, rotated_at, expires_at, created_at
-		 FROM iam_signing_keys
-		 WHERE status IN ($1, $2)
-		 ORDER BY activated_at DESC`,
-		StatusActive, StatusRotated,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query signing keys: %w", err)
-	}
-	defer rows.Close()
-
-	var keys []SigningKey
-	for rows.Next() {
-		var k SigningKey
-		if err := rows.Scan(&k.ID, &k.Algorithm, &k.PrivateKeyEnc, &k.PublicKeyPEM, &k.KeyID, &k.Status, &k.ActivatedAt, &k.RotatedAt, &k.ExpiresAt, &k.CreatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan signing key: %w", err)
-		}
-		keys = append(keys, k)
-	}
-
-	return keys, rows.Err()
+	return km.Reload(ctx)
 }
 
 // decryptAndCache decrypts a signing key and creates a cached key.

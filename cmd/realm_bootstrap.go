@@ -71,6 +71,16 @@ func bootstrapPlatformRealm(repos *Repositories) {
 
 	realmID := models.WellKnownRealmPlatform
 
+	// repos.Realm is only constructed when the control-plane DB is configured
+	// (cmd/repositories.go); without it there is nothing to bootstrap, and a
+	// nil dereference here would contradict the "do NOT panic" contract above.
+	if repos == nil || repos.Realm == nil {
+		logger.Error("bootstrapPlatformRealm: realm repository unavailable (no control-plane DB); skipping",
+			zap.String("realm_id", realmID.String()),
+		)
+		return
+	}
+
 	existing, err := repos.Realm.GetByID(ctx, realmID)
 	if err != nil {
 		logger.Error("bootstrapPlatformRealm: failed to check for existing realm",

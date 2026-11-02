@@ -40,6 +40,9 @@ type LoginResponse struct {
 	MFAMethod           string   `json:"mfa_method,omitempty"`            // Preferred/selected method: "totp" or "email"
 	AvailableMFAMethods []string `json:"available_mfa_methods,omitempty"` // List of available methods if multiple
 	SessionID           string   `json:"session_id,omitempty"`            // Temporary session for MFA verification
+	MaskedEmail         string   `json:"masked_email,omitempty"`
+	MFAExpiresIn        int64    `json:"mfa_expires_in,omitempty"`
+	ResendAfterSeconds  int64    `json:"resend_after_seconds,omitempty"`
 	// MFA Enrollment fields (returned when risk-based MFA fires for an
 	// unenrolled user — registration-interrupt pattern, mirrors Microsoft
 	// Entra ID Protection / Okta enrollment policies / Auth0 Require MFA
@@ -291,6 +294,14 @@ type CurrentUser struct {
 	// Platform admin flag - computed server-side
 	IsPlatformAdmin bool `json:"is_platform_admin"`
 
+	// PlatformAuthorityVerified is set by the auth middleware ONLY when
+	// OPS_STRICT_PLATFORM_ROLES is on and iam_platform_roles (an active
+	// platform_admin elevation) or the break-glass account vouches for this
+	// principal. It replaces the legacy tenant-role (platform_admin /
+	// iam_admin) check in the platform-admin gates. Never serialised and
+	// never read from a token.
+	PlatformAuthorityVerified bool `json:"-"`
+
 	// AuthMethod records how this principal was identified for the
 	// current request. Set by setAuthContext (access_token path) and
 	// resolveIdpSessionCookie (idp_session path). Empty for unauthenticated
@@ -528,6 +539,9 @@ type MFAStatusResponse struct {
 	AvailableMethods []string `json:"available_methods"`          // List of enabled methods
 	PreferredMethod  string   `json:"preferred_method,omitempty"` // User's preferred method
 	BackupCodesCount int      `json:"backup_codes_count"`
+	MaskedEmail      string   `json:"masked_email,omitempty"`
+	EmailCodeTTL     int64    `json:"email_code_ttl_seconds,omitempty"`
+	PasskeyAvailable bool     `json:"passkey_available"`
 }
 
 // EmailVerificationStatus for email verification status
@@ -560,12 +574,12 @@ type SelectMFAMethodRequest struct {
 	// credential) via getAvailableMFAMethods membership. Omitting webauthn
 	// here made the MFA picker's "verify with a passkey" choice 400 with
 	// "Invalid request" before ever reaching that check.
-	Method    string `json:"method" binding:"required,oneof=totp email webauthn"` // Selected method
+	Method string `json:"method" binding:"required,oneof=totp email webauthn"` // Selected method
 }
 
 // MFACompleteRequest for completing MFA verification during login (session-based, no password)
 type MFACompleteRequest struct {
-	SessionID  string `json:"session_id" binding:"required,min=1,max=255"`
+	SessionID  string `json:"session_id" binding:"required,uuid"`
 	MFACode    string `json:"mfa_code" binding:"required,min=1,max=20"`
 	RememberMe bool   `json:"remember_me,omitempty"`
 	DeviceID   string `json:"device_id,omitempty" binding:"omitempty,max=255"`
@@ -581,6 +595,7 @@ type MFASessionData struct {
 	AuthMethod string `json:"auth_method,omitempty"` // "password", "sso", "saml" — tracks origin for audit trail
 	ClientID   string `json:"client_id,omitempty"`   // OAuth client_id for audience-scoped tokens (persists through MFA flow)
 	CreatedAt  int64  `json:"created_at"`
+	MFAMethod  string `json:"mfa_method,omitempty"`
 }
 
 // MFAEnrollmentSession stores the registration-interrupt enrollment session in

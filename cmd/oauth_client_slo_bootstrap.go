@@ -277,13 +277,13 @@ func stringPtr(s string) *string {
 // `bootstrapProvisionerOAuthClient` owns its desired state and
 // applies its own m2m TTLs (cmd/oauth_provisioner_bootstrap.go:198-205).
 var oauthClientSLOSeedMatrix = []oauthClientSLOSeedDesired{
-	// Admin-tier IAP (Talon) — sole shipping BCL+FCL receiver for internal.example.com.
+	// Admin-tier IAP (Talon) — sole shipping BCL+FCL receiver for *.internal.example.com.
 	// Receivers: talon !30 + feat/tier1-frontchannel-logout-receiver.
 	{
 		ClientID:                          "svc-talon",
-		BackchannelLogoutURI:              stringPtr("https://internal.example.com/auth/backchannel-logout"),
+		BackchannelLogoutURI:              stringPtr("https://auth.internal.example.com/auth/backchannel-logout"),
 		BackchannelLogoutSessionRequired:  true,
-		FrontchannelLogoutURI:             stringPtr("https://internal.example.com/auth/frontchannel-logout"),
+		FrontchannelLogoutURI:             stringPtr("https://auth.internal.example.com/auth/frontchannel-logout"),
 		FrontchannelLogoutSessionRequired: true,
 		AccessTokenLifetime:               900,
 		IDTokenLifetime:                   900,

@@ -59,10 +59,51 @@ func (m *RealmMiddleware) Configure(cfg RealmMiddlewareConfig) {
 	}
 }
 
+// realmExemptPaths are infrastructure surfaces that carry no realm context and
+// must never be gated on realm resolution: kubelet probes and the metrics
+// scrape. They are matched by prefix so /health, /health/ready and
+// /health/live-deep are all covered by the single "/health" entry.
+//
+// This deliberately does NOT reuse middleware.publicEndpoints (tenant.go):
+// that list exempts realm-scoped auth surfaces such as /oauth/ and
+// /api/v1/auth/, which DO need realm resolution.
+var realmExemptPaths = []string{
+	"/health",
+	"/ready",
+	"/live",
+	"/metrics",
+}
+
+// isRealmExemptPath reports whether path is an infrastructure endpoint that
+// must bypass realm resolution entirely.
+func isRealmExemptPath(path string) bool {
+	for _, p := range realmExemptPaths {
+		if path == p || strings.HasPrefix(path, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // ExtractRealm extracts and validates realm context from the request
 // Priority: URL prefix > Header > Subdomain > Default realm
 func (m *RealmMiddleware) ExtractRealm() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Infrastructure endpoints are not realm-scoped. kubelet probes and
+		// Prometheus scrapes arrive with Host set to the raw pod IP
+		// (e.g. "10.42.2.88:8010"), which extractSubdomain() happily reads as
+		// the slug "10" — no such realm exists, so resolveRealm aborted the
+		// request with 404 REALM_NOT_FOUND. Once this middleware was mounted
+		// globally (cmd/routes.go, applyGlobalMiddleware), that 404 hit
+		// /health/ready and /health/live-deep, the liveness probe failed, and
+		// the pod entered CrashLoopBackOff before ever serving traffic.
+		// These paths must resolve without any realm — and without a DB round
+		// trip on every probe interval.
+		if isRealmExemptPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+
 		// Try to resolve realm via custom domain first (short-circuit path)
 		if handled := m.tryResolveByCustomDomain(c); handled {
 			return
@@ -94,6 +135,13 @@ func (m *RealmMiddleware) tryResolveByCustomDomain(c *gin.Context) bool {
 	realm, err := m.realmService.GetByDomain(c.Request.Context(), host)
 	if err != nil || realm == nil {
 		return false
+	}
+	if statusErr := m.checkRealmStatus(c, realm); statusErr != nil {
+		// checkRealmStatus already called AbortWithStatusJSON — this
+		// request IS handled (as a rejection), so the caller must not
+		// fall through to the other resolution paths and must not call
+		// c.Next() again.
+		return true
 	}
 	setRealmContext(c, realm, "custom_domain")
 	c.Next()
@@ -164,8 +212,20 @@ func (m *RealmMiddleware) resolveRealm(c *gin.Context, realmSlug string, realmID
 		return realm, nil
 	}
 
-	// Realm not found — try default realm fallback or return 404
-	if extractionSource == "default" {
+	// Realm not found. Fall back to the default realm when the identifier was
+	// INFERRED rather than asserted by the caller.
+	//
+	// "subdomain" is an inference: extractSubdomain() returns the first label
+	// of whatever Host arrives, so id.hexxlock.com yields "id",
+	// falcon-id-falcon-id.falcon-id.svc.cluster.local yields
+	// "falcon-id-falcon-id", and a raw pod IP yields "10". None of those are
+	// realms, and before this middleware was mounted globally none of them
+	// needed to be. Hard-404ing on them turned every production request and
+	// every in-cluster service-to-service call into REALM_NOT_FOUND.
+	//
+	// Explicit sources (url_prefix, header_id, header_slug) keep strict
+	// semantics: the caller named a realm, so a miss is a genuine 404.
+	if extractionSource == "default" || extractionSource == "subdomain" {
 		defaultRealm, defaultErr := m.realmService.GetDefaultRealm(c.Request.Context())
 		if defaultErr != nil || defaultRealm == nil {
 			m.logger.Error("Default realm not found", zap.Error(defaultErr))

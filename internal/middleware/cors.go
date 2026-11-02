@@ -37,7 +37,7 @@ func DefaultCORSConfig() CORSConfig {
 	case envProductionName:
 		// SECURITY: Strict production origins only.
 		//
-		// Includes every public HexxLock product subdomain that mounts a
+		// Includes every public platform product subdomain that mounts a
 		// browser SPA which talks to Falcon-ID (OIDC silent-SSO probe via
 		// /oauth/authorize, RP-initiated logout, token refresh via /oauth/token,
 		// JWKS fetch). When a new product subdomain ships, add it here OR
@@ -45,9 +45,9 @@ func DefaultCORSConfig() CORSConfig {
 		// will silently fall back to full redirect (visible to users as an
 		// extra page bounce on every navigation).
 		//
-		// 2026-05-30 — added mearax.hexxlock.com + accounts.hexxlock.com
-		// after iPhone Mearax dashboard surfaced preflight 403 on
-		// /oauth/authorize?response_type=code&client_id=mearax-bff... .
+		// 2026-05-30 — added acmeweb.hexxlock.com + accounts.hexxlock.com
+		// after iPhone AcmeWeb dashboard surfaced preflight 403 on
+		// /oauth/authorize?response_type=code&client_id=acmeapp-bff... .
 		// Pre-existing dashboard.hexxlock.com / app.hexxlock.com / admin
 		// entries kept; those mount distinct product SPAs.
 		allowedOrigins = []string{
@@ -57,7 +57,20 @@ func DefaultCORSConfig() CORSConfig {
 			"https://dashboard.hexxlock.com",
 			"https://admin.hexxlock.com",
 			"https://accounts.hexxlock.com",
-			"https://mearax.hexxlock.com",
+			"https://acmeweb.hexxlock.com",
+			// AcmeWeb serves example.com in production (see the acmeweb-prod
+			// HTTPRoute). Absent here, every browser call from the live
+			// customer app fails CORS preflight. app.hexxlock.com above is
+			// listed but has NO DNS record at all; it is left in place only
+			// because removing a dead entry is a separate decision from
+			// adding the live one.
+			//
+			// hexxlock.io was a legacy test apex retired 2026-09-24: the
+			// acmeweb-prod HTTPRoute now only 301-redirects it to example.com,
+			// it is never served as a first-class origin, so no browser ever
+			// sends an Origin: https://hexxlock.io preflight. Removed here.
+			"https://example.com",
+			"https://www.example.com",
 			"https://example.com",
 			"https://www.example.com",
 			"https://app.example.com",
@@ -69,7 +82,7 @@ func DefaultCORSConfig() CORSConfig {
 			"https://staging-app.hexxlock.com",
 			"https://staging-dashboard.hexxlock.com",
 			"https://staging-accounts.hexxlock.com",
-			"https://staging-mearax.hexxlock.com",
+			"https://staging-acmeweb.hexxlock.com",
 			"https://staging.example.com",
 			"https://staging-app.example.com",
 		}
@@ -121,8 +134,27 @@ func CORS() gin.HandlerFunc {
 	return CORSWithConfig(config)
 }
 
-// CORSWithConfig returns a CORS middleware with custom configuration
+// CORSWithConfig returns a CORS middleware with custom configuration and no
+// dynamic tenant-origin registry (equivalent to CORSWithRegistry(config,
+// nil) — kept for existing callers/tests that construct CORS without
+// tenant-management wiring).
 func CORSWithConfig(config CORSConfig) gin.HandlerFunc {
+	return CORSWithRegistry(config, nil)
+}
+
+// CORSWithRegistry returns a CORS middleware with custom configuration
+// whose allowed-origin check also consults registry (Stage 3: tenant
+// registry-derived origins on top of the static list and the existing
+// wildcard-subdomain patterns). registry may be nil — a nil registry's
+// Contains always returns false, so behaviour is identical to
+// CORSWithConfig in that case (registry unavailable/not configured falls
+// back to the static list exactly as before, never to "allow everything").
+//
+// registry.Contains is an in-memory map lookup only (see
+// DynamicOriginRegistry's doc comment) — this never performs a
+// per-request network call to tenant-management, including on CORS
+// preflight.
+func CORSWithRegistry(config CORSConfig, registry *DynamicOriginRegistry) gin.HandlerFunc {
 	// Pre-compute lowercase origins for faster lookup
 	allowedOriginsMap := make(map[string]bool)
 	for _, origin := range config.AllowedOrigins {
@@ -148,7 +180,7 @@ func CORSWithConfig(config CORSConfig) gin.HandlerFunc {
 			return
 		}
 
-		allowed := isOriginAllowed(origin, allowedOriginsMap, allowedSubdomainPatterns)
+		allowed := isOriginAllowed(origin, allowedOriginsMap, allowedSubdomainPatterns) || registry.Contains(origin)
 
 		if c.Request.Method == "OPTIONS" {
 			handlePreflightRequest(c, origin, allowed, config)

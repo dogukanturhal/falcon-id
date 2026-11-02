@@ -37,7 +37,7 @@ func invColumns() []string {
 
 func newTestInvitation(tenantID uuid.UUID) *models.UserInvitation {
 	userID := uuid.New()
-	msg := "Welcome to Example Suite"
+	msg := "Welcome to Examplesuite"
 	return &models.UserInvitation{
 		ID:             uuid.New(),
 		UserID:         userID,
