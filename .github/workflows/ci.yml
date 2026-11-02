@@ -111,13 +111,7 @@ jobs:
           curl -fsS http://localhost:8010/.well-known/openid-configuration | tee discovery.json
           grep -q '"issuer"' discovery.json
 
-      # Known issue: this returns HTTP 500. OAuthProviderService.CreateClient
-      # dereferences the result of TenantRepository.GetByID, which returns
-      # (nil, nil) when the tenant row is missing, and the internal tenant
-      # (00000000-0000-0000-0000-000000000002) is not seeded on a clean start.
-      # Not blocking until that is fixed in the code.
       - name: Create a client
-        continue-on-error: true
         run: |
           PROV_ID=quickstart-provisioner
           PROV_SECRET=quickstart-provisioner-secret-not-real
@@ -129,7 +123,7 @@ jobs:
           TOKEN=$(python3 -c 'import json; print(json.load(open("token.json"))["access_token"])')
           code=$(curl -sS -o client.json -w '%{http_code}' -X POST http://localhost:8010/api/v1/internal/oauth-clients \
             -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"redirect_uris":["http://localhost:9999/callback"],"scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,"logo_url":"https://example.com/logo.png"}')
+            -d '{"name":"Quickstart app","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"redirect_uris":["https://app.example.com/callback"],"scopes":["openid","profile","email"],"is_public":true,"require_pkce":true,"logo_url":"https://example.com/logo.png"}')
           echo "create client: HTTP $code"; cat client.json; echo
           [ "$code" = 201 ] || [ "$code" = 200 ]
 

@@ -448,7 +448,9 @@ func (s *InvitationService) ResendInvitation(ctx context.Context, userID uuid.UU
 	}
 
 	// Refresh invitation data
-	invitation, _ = s.invitationRepo.GetByID(ctx, invitation.ID)
+	if refreshed, _ := s.invitationRepo.GetByID(ctx, invitation.ID); refreshed != nil {
+		invitation = refreshed
+	}
 
 	logger.Info("Invitation email resent",
 		zap.String("invitation_id", invitation.ID.String()),

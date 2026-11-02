@@ -929,6 +929,9 @@ func (s *LDAPService) mapGroupsToRoles(ctx context.Context, providerID, userID u
 	if err != nil {
 		return fmt.Errorf("mapGroupsToRoles: failed to get identity provider: %w", err)
 	}
+	if provider == nil {
+		return fmt.Errorf("mapGroupsToRoles: identity provider not found")
+	}
 
 	if provider.LDAPConfig == nil {
 		logger.Debug("No LDAP config found", zap.String("provider", provider.Name))

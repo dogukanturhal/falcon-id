@@ -338,6 +338,10 @@ func (h *ContextHandler) SwitchContext(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve user information"})
 		return
 	}
+	if user == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
 
 	// Generate new token with new context (preserve session ID for continuity)
 	tokenOpts := services.TokenGenerationOptions{

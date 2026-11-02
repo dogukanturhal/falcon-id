@@ -7,6 +7,12 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- Quickstart client creation on a fresh database; standalone mode.
+
 ### Changed
 
 - Synced the public tree with the development repository, picking up the
@@ -22,13 +28,6 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
   Dependabot.
 
 - Security hardening.
-
-### Known issues
-
-- `POST /api/v1/internal/oauth-clients` returns HTTP 500 on a clean database:
-  `CreateClient` dereferences a tenant lookup that returns nothing because the
-  internal tenant is not seeded. The quickstart's authorization-code step
-  depends on it.
 
 ### Known gaps
 

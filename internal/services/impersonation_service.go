@@ -68,13 +68,13 @@ func (s *ImpersonationService) StartImpersonation(
 ) (*models.ImpersonationResponse, error) {
 	// Get admin user
 	adminUser, err := s.userRepo.GetByID(ctx, adminUserID)
-	if err != nil {
+	if err != nil || adminUser == nil {
 		return nil, fmt.Errorf("admin user not found")
 	}
 
 	// Get target user
 	targetUser, err := s.userRepo.GetByID(ctx, targetUserID)
-	if err != nil {
+	if err != nil || targetUser == nil {
 		return nil, fmt.Errorf("target user not found")
 	}
 

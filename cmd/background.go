@@ -713,24 +713,28 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 	//     401 silently. The Kafka consumer will catch up live events;
 	//     pre-existing tenants stay un-projected until the operator
 	//     wires the ExternalSecret. Logging the gap.
-	bootstrapURL := cfg.TenantManagementInternalURL
-	bootstrapClient := buildTenantBootstrapClient(cfg, sugar)
-	b := tenantprojection.NewBootstrap(bootstrapClient, bootstrapURL, repo, sugar)
-	if svcs != nil && svcs.SignupTrialProvisioner != nil {
-		b.SetTrialReadyHook(svcs.SignupTrialProvisioner.EnsureTrialProduct)
-	}
-	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer bootstrapCancel()
-
-	n, err := b.RunOnce(bootstrapCtx)
-	if err != nil {
-		// Non-fatal: log and continue. The Kafka consumer will process
-		// any events that arrived since the service last ran.
-		logger.Warn("Tenant projection bootstrap failed, continuing without REST snapshot",
-			zap.Error(err))
+	subCtx, subCancel := context.WithCancel(context.Background())
+	if cfg.StandaloneMode || cfg.TenantManagementInternalURL == "" {
+		logger.Info("Tenant projection bootstrap skipped: tenant-management not configured (standalone mode)")
 	} else {
-		logger.Info("Tenant projection bootstrap complete",
-			zap.Int("tenants_processed", n))
+		bootstrapClient := buildTenantBootstrapClient(cfg, sugar)
+		b := tenantprojection.NewBootstrap(bootstrapClient, cfg.TenantManagementInternalURL, repo, sugar)
+		if svcs != nil && svcs.SignupTrialProvisioner != nil {
+			b.SetTrialReadyHook(svcs.SignupTrialProvisioner.EnsureTrialProduct)
+		}
+		bootstrapCtx, bootstrapCancel := context.WithTimeout(subCtx, 60*time.Second)
+		n, err := b.RunOnce(bootstrapCtx)
+		bootstrapCancel()
+		if err != nil {
+			// Non-fatal: the Kafka consumer processes live events; keep
+			// retrying the snapshot in the background.
+			logger.Warn("Tenant projection bootstrap failed, retrying in background",
+				zap.Error(err))
+			go retryTenantBootstrap(subCtx, b)
+		} else {
+			logger.Info("Tenant projection bootstrap complete",
+				zap.Int("tenants_processed", n))
+		}
 	}
 
 	// Build Kafka subscriber.
@@ -747,7 +751,6 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 		sub.SetTrialReadyHook(svcs.SignupTrialProvisioner.EnsureTrialProduct)
 	}
 
-	subCtx, subCancel := context.WithCancel(context.Background())
 	go func() {
 		if err := sub.Run(subCtx); err != nil {
 			logger.Error("Tenant projection consumer exited unexpectedly", zap.Error(err))
@@ -762,6 +765,32 @@ func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 	return func() {
 		subCancel()
 		sub.Stop()
+	}
+}
+
+// retryTenantBootstrap re-runs the tenant-management REST snapshot with
+// exponential backoff (30s doubling to a 5m cap) until it succeeds or ctx is
+// cancelled. Failures are logged at WARN only.
+func retryTenantBootstrap(ctx context.Context, b *tenantprojection.Bootstrap) {
+	const maxDelay = 5 * time.Minute
+	delay := 30 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		n, err := b.RunOnce(attemptCtx)
+		cancel()
+		if err == nil {
+			logger.Info("Tenant projection bootstrap complete (after retry)",
+				zap.Int("tenants_processed", n))
+			return
+		}
+		logger.Warn("Tenant projection bootstrap retry failed",
+			zap.Error(err), zap.Duration("next_retry_in", min(delay*2, maxDelay)))
+		delay = min(delay*2, maxDelay)
 	}
 }
 

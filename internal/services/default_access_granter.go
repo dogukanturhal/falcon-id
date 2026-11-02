@@ -136,6 +136,9 @@ func (g *DefaultAccessGranter) GrantDefaultAccess(ctx context.Context, tenantID,
 func (g *DefaultAccessGranter) applyRolePolicy(ctx context.Context, tenantID, userID uuid.UUID, policy models.DefaultAccessPolicy) bool {
 	// SR-DAP-01: Validate role is not blocked
 	role, err := g.roleRepo.GetByID(ctx, policy.TargetID)
+	if err == nil && role == nil {
+		err = fmt.Errorf("role %s not found", policy.TargetID)
+	}
 	if err != nil {
 		logger.Warn("Default access: role not found, skipping",
 			zap.String("role_id", policy.TargetID.String()),

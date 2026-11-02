@@ -7,10 +7,13 @@ Schema-only SQL for starting Falcon ID on an empty PostgreSQL, used by the
 | --- | --- | --- |
 | `001_main.sql` | `falcon_id` | tables, indexes, constraints, functions, triggers, RLS policies |
 | `002_control.sql` | `falcon_id_control` | `realms`, `realm_tenants` |
+| `003_main_additions.sql` | `falcon_id` | hand-written additions the dump lacks: `iam_data_retention_policies` (+ its 4 seed rows) |
+| `004_control_additions.sql` | `falcon_id_control` | hand-written additions the dump lacks: `realm_domains` |
 | `docker-init.sh` | | mounted into the Postgres container's `docker-entrypoint-initdb.d`; loads both files and creates the control database |
 
 The server inserts its own bootstrap rows (platform and shared realms, the
-internal tenant, the admin user) on first start, so no seed file is needed.
+internal tenant, the admin user) on first start (`bootstrapInternalTenant` in
+`cmd/internal_tenant_bootstrap.go` creates the internal tenant if absent), so no seed file is needed.
 
 `001_main.sql` creates a `falcon_id_app` role (NOLOGIN) because some RLS
 policies are attached to it. The compose database user is a superuser and

@@ -306,6 +306,9 @@ func (s *MFAService) VerifyAndEnableTOTP(ctx context.Context, userID uuid.UUID, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
+	if user == nil {
+		return nil, fmt.Errorf("failed to get user: user not found")
+	}
 
 	// Enable MFA on user
 	user.MFAEnabled = true

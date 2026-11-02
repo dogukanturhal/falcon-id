@@ -104,6 +104,9 @@ func (s *DelegationService) CreateDelegation(ctx context.Context, delegatorID, t
 	if err != nil {
 		return nil, fmt.Errorf("delegatee user not found: %w", err)
 	}
+	if delegatee == nil {
+		return nil, fmt.Errorf("delegatee user not found")
+	}
 	if delegatee.TenantID != tenantID {
 		return nil, fmt.Errorf("delegatee must be in the same tenant")
 	}
@@ -223,6 +226,9 @@ func (s *DelegationService) ListMyDelegations(ctx context.Context, userID uuid.U
 	userCache := make(map[uuid.UUID]string)
 	for userID := range userIDs {
 		user, err := s.userRepo.GetByID(ctx, userID)
+		if err == nil && user == nil {
+			err = fmt.Errorf("user not found")
+		}
 		if err != nil {
 			s.logger.Warn("Failed to load user for delegation",
 				zap.String("user_id", userID.String()),
