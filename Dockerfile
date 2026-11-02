@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 RUN apk add --no-cache git ca-certificates
@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
  && go build -o schema-writer      ./schema
 
 # Final stage
-FROM alpine:3.21 AS production
+FROM alpine:3.24 AS production
 
 WORKDIR /app
 RUN apk upgrade --no-cache \
