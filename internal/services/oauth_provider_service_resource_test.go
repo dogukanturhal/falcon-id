@@ -21,7 +21,7 @@ import (
 // shared identifiers + the per-resource narrowing. The migration
 // transitions every .NET / Go service in the mesh off the legacy
 // hard-coded `hexxlock-services` audience onto the canonical
-// `PlatformAPIAudienceURI` (= "https://api.hexxlock.com") without
+// `PlatformAPIAudienceURI` (= "https://api.example.com") without
 // requiring lock-step deploys.
 //
 // `aud` SHAPE CONTRACTS (locked 2026-05-30):
@@ -70,7 +70,7 @@ func TestGenerateTokens_Resource_OverridesAudClaim(t *testing.T) {
 	client := authzCodeClient([]string{"openid"})
 	user := subjectUser()
 
-	ctx := WithOAuthResource(context.Background(), "https://api.hexxlock.com/v1")
+	ctx := WithOAuthResource(context.Background(), "https://api.example.com/v1")
 
 	resp, err := svc.generateTokens(
 		ctx,
@@ -85,7 +85,7 @@ func TestGenerateTokens_Resource_OverridesAudClaim(t *testing.T) {
 	claims := decodeJWTUnverified(t, resp.AccessToken)
 	aud := audSlice(t, claims)
 
-	assert.Contains(t, aud, "https://api.hexxlock.com/v1",
+	assert.Contains(t, aud, "https://api.example.com/v1",
 		"explicit RFC 8707 resource MUST appear in aud")
 	assert.Contains(t, aud, LegacyServiceMeshAudience,
 		"LegacyServiceMeshAudience MUST stay in aud during the migration window")

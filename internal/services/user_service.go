@@ -17,10 +17,53 @@ import (
 	"github.com/dogukanturhal/platform-shared/quota"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/crypto"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
+
+// userServiceSpiceDBClient is the narrow SpiceDB dependency needed to keep
+// role *membership* relationships in sync with iam_user_roles when a tenant
+// admin changes a team member's roles via SetUserRoles. *spicedb.Client
+// satisfies this interface structurally — see jitSpiceDBClient for the same
+// pattern.
+//
+// Before this was wired in, SetUserRoles only wrote Postgres, published a
+// Kafka event nothing consumed for SpiceDB purposes, and invalidated the
+// session cache. The ONLY thing that ever wrote the "member" relation SpiceDB
+// checks against was SpiceDBReconciler's scheduled pass — SPICEDB_RECONCILER_INTERVAL,
+// which defaults to 24h and is not overridden in falcon-id's prod deployment
+// (confirmed via the running pod's "Starting SpiceDB reconciler scheduler"
+// log line: interval=86400). That meant a freshly assigned role could sit in
+// Postgres — and any self-service UI reading Postgres, i.e. GET /api/v1/roles
+// via ListManageableSelfService, would show it as assigned — for up to a day
+// before SpiceDB-backed authorization (AuthorizationEngine.CheckPermission,
+// the sole runtime authority since v2 tokens carry Permissions: nil) actually
+// granted anything. Writing synchronously here makes the daily reconciler a
+// safety net instead of the primary sync mechanism, matching how
+// JITAccessService and TenantBootstrapService already treat SpiceDB as the
+// real enforcement boundary rather than a side effect.
+type userServiceSpiceDBClient interface {
+	WriteUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) (string, error)
+	DeleteUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) (string, error)
+}
+
+type roleRevokeDrain interface {
+	Drain(context.Context, uuid.UUID) error
+}
+
+// SetRoleRevokeDrainer wires the post-commit fast path. The repository always
+// enqueues removals even when SpiceDB/the drainer is temporarily unavailable.
+func (s *UserService) SetRoleRevokeDrainer(d roleRevokeDrain) { s.roleRevokes = d }
+
+// userServiceRoleAssignmentWriter is the optional role_assignment extension
+// of userServiceSpiceDBClient (spec 23 section 4.2). *spicedb.Client
+// implements it; test fakes that do not simply skip these writes.
+type userServiceRoleAssignmentWriter interface {
+	WriteRoleAssignment(ctx context.Context, tenantID, userID uuid.UUID, moduleCode string) error
+	DeleteRoleAssignment(ctx context.Context, tenantID, userID uuid.UUID, moduleCode string) error
+}
 
 // ErrSeatLimitExceeded indicates the tenant's plan has no available seats
 // left to create another active user. Matches errors.Is against this
@@ -69,6 +112,12 @@ type userServiceUserRepo interface {
 	GetUserRoles(ctx context.Context, userID uuid.UUID) ([]models.Role, error)
 	GetUserPermissions(ctx context.Context, userID uuid.UUID) ([]models.Permission, error)
 	UnlockUser(ctx context.Context, userID uuid.UUID) error
+
+	// Admin lifecycle (soft-delete / restore / hard-delete) additions.
+	SetDeletionState(ctx context.Context, userID uuid.UUID, activationStatus string, deletionScheduledAt, deletionGracePeriodEndsAt *time.Time, deletionReason *string) error
+	CountActiveOwners(ctx context.Context, tenantID uuid.UUID) (int, error)
+	HasRole(ctx context.Context, userID uuid.UUID, roleName string) (bool, error)
+	HardDeleteUser(ctx context.Context, userID uuid.UUID) (map[string]int, error)
 }
 
 // userServiceRoleRepo defines the role repository methods needed by UserService.
@@ -131,11 +180,33 @@ type UserService struct {
 	eventPublisher          EventPublisher               // Optional: for SpiceDB sync events
 	sessionCache            SessionCache                 // Optional: for real-time permission invalidation
 	redisCache              RedisCache                   // Optional: for user lookup caching
-	integrationBusPublisher *IntegrationBusPublisher     // Optional: publishes user lifecycle events to the integration bus
+	integrationBusPublisher UserLifecyclePublisher       // Optional: publishes example.iam.user.* lifecycle events (Kafka, internal/iamevents)
 	backchannelLogout       userServiceBackchannelLogout // Optional: fans out OIDC BCL on admin-disable
+	accessTerminator        accessTerminator             // Optional: single access-termination path (preferred over the legacy token+BCL fan-out)
 	breachChecker           breachChecker                // Optional: HIBP breach-password check on create/set-password
 	quotaClient             userServiceQuotaClient       // Optional: enforces/tracks per-tenant seat (resource_type="users") quota
+	seatMemberships         SeatMembershipLifecycle      // Optional: keeps tenant_seat_counters in step with disable/restore
+	seatFree                SeatFreeChecker              // Optional: employee-class (ESS) users never count against the seat quota
+	spicedbClient           userServiceSpiceDBClient     // Optional: synchronous role-membership write on SetUserRoles (see userServiceSpiceDBClient doc)
+	roleRevokes             roleRevokeDrain
+	sodService              userServiceSoDEvaluator // Optional: ADR-A10 SoD warn-mode evaluation on every role-assignment write
 	logger                  *zap.Logger
+}
+
+// userServiceSoDEvaluator is the narrow interface UserService depends on
+// for ADR-A10 SoD (Separation of Duties) evaluation
+// (23-authorization-rbac-abac-rebac.md §5.2: "evaluation on EVERY
+// role-assignment write"). Satisfied by *SoDService. Nil-safe: when unset,
+// SetUserRoles silently skips SoD evaluation (never blocks the role write
+// either way — SoD is warn-mode-only in R1 regardless).
+type userServiceSoDEvaluator interface {
+	EvaluateUserAsync(ctx context.Context, tenantID, userID uuid.UUID, roleIDs []uuid.UUID)
+}
+
+// SetSoDService wires ADR-A10 SoD evaluation into UserService. Safe to
+// call with nil (evaluation is then simply skipped).
+func (s *UserService) SetSoDService(svc userServiceSoDEvaluator) {
+	s.sodService = svc
 }
 
 // UserEventPayload is the event payload for user created/updated events published
@@ -150,6 +221,9 @@ type UserEventPayload struct {
 	DisplayName string `json:"display_name"`
 	Phone       string `json:"phone"`
 	IsActive    bool   `json:"is_active"`
+	// EmailVerified lets HCM auto-link an employee by email only when the
+	// mailbox ownership was proven (xm F3).
+	EmailVerified bool `json:"email_verified"`
 	// Source identifies the origin of this event. It is always set to "iam" so
 	// that the HCM employee consumer can skip events it did not originate from
 	// HCM, preventing circular synchronisation loops.
@@ -164,7 +238,7 @@ type UserStatusEventPayload struct {
 	Email    string `json:"email"`
 	IsActive bool   `json:"is_active"`
 	IsLocked bool   `json:"is_locked"`
-	Action   string `json:"action"` // "deleted", "locked", "unlocked"
+	Action   string `json:"action"` // "deleted", "locked", "unlocked", "admin_soft_deleted", "admin_restored"
 	// Source identifies the origin of this event. Always "iam" so that
 	// downstream consumers can detect events originating from this service
 	// and skip them to prevent circular synchronisation loops.
@@ -204,6 +278,14 @@ func (s *UserService) SetRedisCache(cache RedisCache) {
 	s.redisCache = cache
 }
 
+// SetSpiceDBClient wires the SpiceDB dependency used by SetUserRoles to
+// write role-membership changes synchronously instead of relying solely on
+// the (24h-interval) SpiceDBReconciler. Optional: when unset, SetUserRoles
+// falls back to the pre-existing Postgres-only + reconciler-repair behavior.
+func (s *UserService) SetSpiceDBClient(client userServiceSpiceDBClient) {
+	s.spicedbClient = client
+}
+
 // SetEmailVerifier sets the email verifier for sending verification emails on user creation
 func (s *UserService) SetEmailVerifier(verifier userServiceEmailVerifier) {
 	s.emailVerifier = verifier
@@ -226,6 +308,76 @@ func (s *UserService) SetQuotaClient(client userServiceQuotaClient) {
 	s.quotaClient = client
 }
 
+// SeatFreeChecker reports whether a user holds a seat-free (employee-class) membership; the quota
+// decrement/increment paths skip such users because they were never counted.
+type SeatFreeChecker interface {
+	IsSeatFree(ctx context.Context, tenantID, userID uuid.UUID) (bool, error)
+}
+
+// SetSeatFreeChecker wires the employee-seat lookup. nil (the zero value) treats every user as seat-consuming.
+func (s *UserService) SetSeatFreeChecker(c SeatFreeChecker) {
+	s.seatFree = c
+}
+
+// isSeatFree is fail-toward-counting: a lookup error is logged and the user is treated as seat-consuming (the
+// seat-quota reconciler corrects any resulting drift).
+func (s *UserService) isSeatFree(ctx context.Context, tenantID, userID uuid.UUID) bool {
+	if s.seatFree == nil {
+		return false
+	}
+	free, err := s.seatFree.IsSeatFree(ctx, tenantID, userID)
+	if err != nil {
+		s.logger.Warn("seat-free lookup failed; treating the user as seat-consuming",
+			zap.String("tenant_id", tenantID.String()), zap.String("user_id", userID.String()), zap.Error(err))
+		return false
+	}
+	return free
+}
+
+// SeatMembershipLifecycle moves the seat ledger with a user's active state: Deactivate frees a member seat once,
+// Reactivate re-occupies one and returns repositories.ErrSeatLimitReached when the tenant is full.
+type SeatMembershipLifecycle interface {
+	Deactivate(ctx context.Context, tenantID, userID uuid.UUID) (bool, error)
+	Reactivate(ctx context.Context, tenantID, userID uuid.UUID) (bool, error)
+}
+
+// SetSeatMembershipLifecycle wires the seat-ledger hooks of disable/restore. nil (the zero value) skips them.
+func (s *UserService) SetSeatMembershipLifecycle(m SeatMembershipLifecycle) { s.seatMemberships = m }
+
+// occupyMemberSeat re-occupies the user's member seat before a reactivation is persisted; a full tenant yields
+// repositories.ErrSeatLimitReached (callers map it to 409).
+func (s *UserService) occupyMemberSeat(ctx context.Context, tenantID, userID uuid.UUID) error {
+	if s.seatMemberships == nil {
+		return nil
+	}
+	if _, err := s.seatMemberships.Reactivate(ctx, tenantID, userID); err != nil {
+		if errors.Is(err, repositories.ErrSeatLimitReached) {
+			return err
+		}
+		return fmt.Errorf("occupy seat: %w", err)
+	}
+	return nil
+}
+
+// releaseMemberSeat frees the user's member seat after a disable/soft-delete committed. Best-effort and
+// idempotent (only an active membership releases); a failure is logged and the seat-quota reconciler recomputes it.
+func (s *UserService) releaseMemberSeat(ctx context.Context, tenantID, userID uuid.UUID) {
+	if s.seatMemberships == nil {
+		return
+	}
+	if _, err := s.seatMemberships.Deactivate(ctx, tenantID, userID); err != nil {
+		s.logger.Warn("failed to release member seat; reconciler will recompute",
+			zap.String("tenant_id", tenantID.String()), zap.String("user_id", userID.String()), zap.Error(err))
+	}
+}
+
+// SetAccessTerminator wires the single access-termination path used by
+// admin-disable and hard-delete; when set it supersedes the legacy
+// token-revoke + BCL fan-out below.
+func (s *UserService) SetAccessTerminator(t accessTerminator) {
+	s.accessTerminator = t
+}
+
 // SetBackchannelLogout wires the OIDC Back-Channel Logout fan-out so
 // that admin-disable cascades evict every IdP session (and via the
 // per-RP receiver chain, every downstream RP session) without having
@@ -241,10 +393,17 @@ func (s *UserService) SetBackchannelLogout(bcl userServiceBackchannelLogout) {
 	s.backchannelLogout = bcl
 }
 
-// SetIntegrationBusPublisher sets the integration bus publisher used to propagate
-// user lifecycle events to downstream modules such as HCM. The publisher is
-// optional; when nil, no integration bus events are emitted.
-func (s *UserService) SetIntegrationBusPublisher(p *IntegrationBusPublisher) {
+// UserLifecyclePublisher publishes example.iam.user.{created,updated,status-changed}.
+// Production implementation: internal/iamevents.Publisher (Kafka; consumed by
+// example-business HR IamUserEventConsumer).
+type UserLifecyclePublisher interface {
+	PublishEvent(ctx context.Context, tenantID, eventType string, payload interface{}) error
+}
+
+// SetIntegrationBusPublisher sets the publisher used to propagate user
+// lifecycle events (create / update / status) to downstream consumers. It is
+// optional; when nil, no lifecycle events are emitted.
+func (s *UserService) SetIntegrationBusPublisher(p UserLifecyclePublisher) {
 	s.integrationBusPublisher = p
 }
 
@@ -277,6 +436,9 @@ func (s *UserService) publishUserRoleEvent(ctx context.Context, topic string, te
 	}
 }
 
+// lifecyclePublishTimeout bounds one fire-and-forget lifecycle publish.
+const lifecyclePublishTimeout = 10 * time.Second
+
 // publishUserLifecycleEvent publishes a example.iam.user.* event to the integration
 // bus. It is always called inside a goroutine (fire-and-forget) so it uses
 // context.Background() rather than the request context, which may already be
@@ -291,11 +453,12 @@ func (s *UserService) publishUserLifecycleEvent(user *models.User, eventType str
 
 	go func() {
 		payload := UserEventPayload{
-			UserID:   userID,
-			TenantID: tenantID,
-			Username: user.Username,
-			Email:    user.Email,
-			IsActive: user.IsActive,
+			UserID:        userID,
+			TenantID:      tenantID,
+			Username:      user.Username,
+			Email:         user.Email,
+			IsActive:      user.IsActive,
+			EmailVerified: user.IsEmailVerified,
 			// Source is always "iam" so downstream consumers (e.g. HCM employee
 			// consumer) can detect events originating from this service and skip
 			// them to prevent circular synchronisation loops.
@@ -314,8 +477,10 @@ func (s *UserService) publishUserLifecycleEvent(user *models.User, eventType str
 			payload.Phone = *user.Phone
 		}
 
+		pubCtx, cancel := context.WithTimeout(context.Background(), lifecyclePublishTimeout)
+		defer cancel()
 		if err := s.integrationBusPublisher.PublishEvent(
-			context.Background(),
+			pubCtx,
 			tenantID,
 			eventType,
 			payload,
@@ -350,8 +515,10 @@ func (s *UserService) publishUserStatusEvent(user *models.User, action string) {
 			Source:   "iam",
 		}
 
+		pubCtx, cancel := context.WithTimeout(context.Background(), lifecyclePublishTimeout)
+		defer cancel()
 		if err := s.integrationBusPublisher.PublishEvent(
-			context.Background(),
+			pubCtx,
 			tenantID,
 			"example.iam.user.status-changed",
 			payload,
@@ -405,7 +572,13 @@ func (s *UserService) Create(ctx context.Context, req *models.CreateUserRequest,
 		}
 		passwordHash = &hash
 	}
-	return s.create(ctx, req, createdBy, passwordHash)
+	return s.create(ctx, req, createdBy, passwordHash, false)
+}
+
+// CreateSeatFree creates an employee-class (ESS) user: no quota check and no usage increment, and no password (the
+// account is activated through a password-setup invitation). The caller must record the employee membership.
+func (s *UserService) CreateSeatFree(ctx context.Context, req *models.CreateUserRequest, createdBy *uuid.UUID) (*models.UserResponse, error) {
+	return s.create(ctx, req, createdBy, nil, true)
 }
 
 // CreatePreparedForSignup persists a credential that was already validated
@@ -416,10 +589,10 @@ func (s *UserService) CreatePreparedForSignup(ctx context.Context, req *models.C
 		subtle.ConstantTimeCompare(credential.passwordDigest[:], digest[:]) != 1 {
 		return nil, errors.New("invalid prepared signup credential")
 	}
-	return s.create(ctx, req, nil, &credential.passwordHash)
+	return s.create(ctx, req, nil, &credential.passwordHash, false)
 }
 
-func (s *UserService) create(ctx context.Context, req *models.CreateUserRequest, createdBy *uuid.UUID, passwordHash *string) (*models.UserResponse, error) {
+func (s *UserService) create(ctx context.Context, req *models.CreateUserRequest, createdBy *uuid.UUID, passwordHash *string, seatFree bool) (*models.UserResponse, error) {
 	// Check if username already exists
 	existing, err := s.userRepo.GetByUsername(ctx, req.TenantID, req.Username)
 	if err != nil {
@@ -450,6 +623,7 @@ func (s *UserService) create(ctx context.Context, req *models.CreateUserRequest,
 		FederationID:     req.FederationID,
 		FederationSource: req.FederationSource,
 		IsActive:         true,
+		IsEmailVerified:  req.EmailVerified,
 		CreatedBy:        createdBy,
 	}
 
@@ -501,7 +675,7 @@ func (s *UserService) create(ctx context.Context, req *models.CreateUserRequest,
 	// wiring) — nil-safe no-op for callers/tests that don't wire it, e.g.
 	// admin bootstrap and every existing unit test that constructs
 	// UserService directly.
-	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled {
+	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled && !seatFree {
 		if err := s.quotaClient.MustCheckQuota(ctx, req.TenantID, quota.ResourceTypeUsers, 1); err != nil {
 			var quotaExceeded *quota.QuotaExceededError
 			if quota.IsQuotaExceededError(err) && errors.As(err, &quotaExceeded) {
@@ -581,7 +755,7 @@ func (s *UserService) create(ctx context.Context, req *models.CreateUserRequest,
 	// just makes it count. A failure here does not fail the request — it
 	// would deny the user something already created — but is logged loudly
 	// since a persistent failure means usage drifts from reality.
-	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled {
+	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled && !seatFree {
 		go func(tenantID uuid.UUID) { //nolint:gosec // goroutine must outlive request context
 			incCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -721,7 +895,18 @@ func (s *UserService) Update(ctx context.Context, id uuid.UUID, req *models.Upda
 
 	user.UpdatedBy = updatedBy
 
+	// Re-enabling a disabled member re-occupies a seat first, so a full tenant is refused before anything changes.
+	reoccupied := !wasActive && user.IsActive
+	if reoccupied {
+		if err := s.occupyMemberSeat(ctx, user.TenantID, id); err != nil {
+			return nil, fmt.Errorf("Update: %w", err)
+		}
+	}
+
 	if err := s.userRepo.Update(ctx, user); err != nil {
+		if reoccupied {
+			s.releaseMemberSeat(ctx, user.TenantID, id)
+		}
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -740,7 +925,13 @@ func (s *UserService) Update(ctx context.Context, id uuid.UUID, req *models.Upda
 	// regardless of whether revocation reached every RP. BCL closes
 	// the user-side latency to <5s when the cascade succeeds.
 	if wasActive && !user.IsActive {
+		s.releaseMemberSeat(ctx, user.TenantID, id)
 		s.cascadeAdminDisable(ctx, user)
+	}
+	if !wasActive && user.IsActive && s.accessTerminator != nil {
+		// The disable wrote a short-lived user-wide blacklist; drop it so the
+		// re-enabled user can log in immediately.
+		s.accessTerminator.ClearUserBlock(ctx, id)
 	}
 
 	// Update roles if provided
@@ -800,6 +991,19 @@ func (s *UserService) cascadeAdminDisable(ctx context.Context, user *models.User
 	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	if s.accessTerminator != nil {
+		// Ends sessions, OAuth tokens, SSO cookies, blacklists JWTs, fans out
+		// BCL and publishes CAE in one place (best-effort per step).
+		if err := s.accessTerminator.TerminateUserAccess(bgCtx, user.ID, user.TenantID, "admin_disable", nil); err != nil {
+			s.logger.Error("UserService.cascadeAdminDisable: access termination incomplete",
+				zap.String("user_id", user.ID.String()), zap.Error(err))
+		}
+		if s.auditService != nil {
+			s.auditService.LogUserAction(bgCtx, user.TenantID, user.UpdatedBy, &user.ID, "user_admin_disabled", true, nil)
+		}
+		return
+	}
+
 	if s.tokenService != nil {
 		if err := s.tokenService.RevokeAllUserOAuthTokens(bgCtx, user.ID, "admin_disable"); err != nil {
 			s.logger.Error("UserService.cascadeAdminDisable: RevokeAllUserOAuthTokens failed",
@@ -856,6 +1060,7 @@ func (s *UserService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 		return fmt.Errorf("user not found")
 	}
 
+	seatFree := s.isSeatFree(ctx, user.TenantID, id) // before the delete: the membership row may go with the user
 	if err := s.userRepo.Delete(ctx, id); err != nil {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
@@ -868,7 +1073,7 @@ func (s *UserService) Delete(ctx context.Context, id uuid.UUID, deletedBy *uuid.
 
 	// Release the seat back to the tenant's plan (fire-and-forget,
 	// best-effort — same posture as the lifecycle-event publishes above).
-	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled {
+	if s.quotaClient != nil && s.config.QuotaEnforcementEnabled && !seatFree {
 		go func(tenantID uuid.UUID) { //nolint:gosec // goroutine must outlive request context
 			decCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -983,7 +1188,13 @@ func (s *UserService) SetPassword(ctx context.Context, id uuid.UUID, newPassword
 	// Phase 3 (mig 233), so the OAuth-token sweep is the canonical
 	// post-password-set revoke path. Best-effort; failures here don't
 	// block the password update from completing.
-	_ = s.tokenService.RevokeAllUserOAuthTokens(ctx, id, "password_reset")
+	if s.accessTerminator != nil {
+		termCtx, cancel := detachedTerminationCtx()
+		defer cancel()
+		_ = s.accessTerminator.TerminateUserAccessWith(termCtx, id, user.TenantID, "password_reset", TerminateOptions{})
+	} else {
+		_ = s.tokenService.RevokeAllUserOAuthTokens(ctx, id, "password_reset")
+	}
 
 	// Audit log
 	s.auditService.LogUserAction(ctx, user.TenantID, setBy, &id, "user_password_set", true, nil)
@@ -1105,7 +1316,10 @@ func (s *UserService) SetUserRoles(ctx context.Context, userID uuid.UUID, roleID
 	}
 
 	// Get existing roles before assignment for diff
-	existingRoles, _ := s.userRepo.GetUserRoles(ctx, userID)
+	existingRoles, err := s.userRepo.GetUserRoles(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("SetUserRoles: failed to get existing roles: %w", err)
+	}
 	existingRoleIDs := make(map[uuid.UUID]bool)
 	for _, r := range existingRoles {
 		existingRoleIDs[r.ID] = true
@@ -1121,6 +1335,15 @@ func (s *UserService) SetUserRoles(ctx context.Context, userID uuid.UUID, roleID
 	if user != nil {
 		s.publishRoleDiffEvents(ctx, user, userID, roleIDs, existingRoles, existingRoleIDs)
 		s.invalidateRoleSessionsAndPublish(ctx, user, userID)
+		s.syncSpiceDBRoleMembership(ctx, user.TenantID, userID, roleIDs, existingRoles, existingRoleIDs)
+
+		// ADR-A10 SoD (23-authorization-rbac-abac-rebac.md §5.2):
+		// evaluate on every role-assignment write. Warn-mode only —
+		// never blocks this write, and any evaluation failure is
+		// logged internally by EvaluateUserAsync, never surfaced here.
+		if s.sodService != nil {
+			s.sodService.EvaluateUserAsync(ctx, user.TenantID, userID, roleIDs)
+		}
 	}
 
 	// Invalidate cache when roles change
@@ -1130,6 +1353,92 @@ func (s *UserService) SetUserRoles(ctx context.Context, userID uuid.UUID, roleID
 	}
 
 	return nil
+}
+
+// syncSpiceDBRoleMembership writes the role diff to SpiceDB synchronously so
+// authorization checks (AuthorizationEngine.CheckPermission — the sole
+// runtime authority for v2 tokens) reflect the change immediately, rather
+// than waiting for SpiceDBReconciler's next scheduled pass (24h in
+// production). Grants stay best-effort. Removals are already durably queued
+// by the repository in the role transaction and are drained after commit.
+func (s *UserService) syncSpiceDBRoleMembership(
+	ctx context.Context, tenantID, userID uuid.UUID,
+	roleIDs []uuid.UUID, existingRoles []models.Role, existingRoleIDs map[uuid.UUID]bool,
+) {
+	if s.roleRevokes != nil {
+		if err := s.roleRevokes.Drain(ctx, userID); err != nil {
+			logger.Warn("Role revokes remain durably queued", zap.Error(err))
+		}
+	}
+	if s.spicedbClient == nil {
+		return
+	}
+	newRoleIDs := make(map[uuid.UUID]bool, len(roleIDs))
+	for _, roleID := range roleIDs {
+		newRoleIDs[roleID] = true
+		if existingRoleIDs[roleID] {
+			continue
+		}
+		s.writeRoleAssignmentFor(ctx, tenantID, userID, roleID)
+		if _, err := s.spicedbClient.WriteUserRole(ctx, tenantID, userID, roleID); err != nil {
+			logger.Warn("Failed to write SpiceDB role membership on SetUserRoles",
+				zap.String("tenant_id", tenantID.String()),
+				zap.String("user_id", userID.String()),
+				zap.String("role_id", roleID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+	for _, existingRole := range existingRoles {
+		if newRoleIDs[existingRole.ID] {
+			continue
+		}
+		s.deleteRoleAssignmentIfLast(ctx, tenantID, userID, existingRole, newRoleIDs)
+	}
+}
+
+// writeRoleAssignmentFor records role_assignment#assigned for the role's
+// module (module-scoped roles only). Best effort like the surrounding sync:
+// Postgres stays the system of record.
+func (s *UserService) writeRoleAssignmentFor(ctx context.Context, tenantID, userID, roleID uuid.UUID) {
+	w, ok := s.spicedbClient.(userServiceRoleAssignmentWriter)
+	if !ok || s.roleRepo == nil {
+		return
+	}
+	role, err := s.roleRepo.GetByIDAndTenant(ctx, roleID, tenantID)
+	if err != nil || role == nil || role.Module == nil || *role.Module == "" {
+		return
+	}
+	if err := w.WriteRoleAssignment(ctx, tenantID, userID, *role.Module); err != nil {
+		logger.Warn("Failed to write SpiceDB role_assignment on SetUserRoles",
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("user_id", userID.String()),
+			zap.String("module", *role.Module),
+			zap.Error(err),
+		)
+	}
+}
+
+// deleteRoleAssignmentIfLast removes role_assignment for the removed role's
+// module when the user keeps no other role of that module.
+func (s *UserService) deleteRoleAssignmentIfLast(ctx context.Context, tenantID, userID uuid.UUID, removed models.Role, remainingRoleIDs map[uuid.UUID]bool) {
+	w, ok := s.spicedbClient.(userServiceRoleAssignmentWriter)
+	if !ok || s.roleRepo == nil || removed.Module == nil || *removed.Module == "" {
+		return
+	}
+	for id := range remainingRoleIDs {
+		if r, err := s.roleRepo.GetByIDAndTenant(ctx, id, tenantID); err == nil && r != nil && r.Module != nil && *r.Module == *removed.Module {
+			return
+		}
+	}
+	if err := w.DeleteRoleAssignment(ctx, tenantID, userID, *removed.Module); err != nil {
+		logger.Warn("Failed to delete SpiceDB role_assignment on SetUserRoles",
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("user_id", userID.String()),
+			zap.String("module", *removed.Module),
+			zap.Error(err),
+		)
+	}
 }
 
 // publishRoleDiffEvents publishes assignment/revocation events for the role diff.
@@ -1213,6 +1522,9 @@ func (s *UserService) ForceVerifyEmail(ctx context.Context, userID uuid.UUID) er
 		zap.String("user_id", userID.String()),
 		zap.String("email", user.Email),
 	)
+
+	// HCM links employees to IAM users by verified email only (xm F3).
+	s.publishUserLifecycleEvent(user, "example.iam.user.updated")
 
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -60,10 +61,14 @@ func (r *TeamInvitationRepository) Create(ctx context.Context, inv *models.TeamI
 		inv.ID = uuid.New()
 	}
 
+	if inv.SeatClass == "" {
+		inv.SeatClass = models.SeatClassMember
+	}
+
 	query := `
 		INSERT INTO iam_team_invitations
-		    (id, tenant_id, email, role_ids, invited_by, token, status, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		    (id, tenant_id, email, role_ids, invited_by, token, status, expires_at, seat_class)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING created_at`
 
 	err := r.db.QueryRow(ctx, query,
@@ -75,6 +80,7 @@ func (r *TeamInvitationRepository) Create(ctx context.Context, inv *models.TeamI
 		inv.Token,
 		inv.Status,
 		inv.ExpiresAt,
+		inv.SeatClass,
 	).Scan(&inv.CreatedAt)
 	if IsPendingInvitationUniqueViolation(err) {
 		return fmt.Errorf("Create: %w", ErrDuplicatePendingInvitation)
@@ -82,18 +88,67 @@ func (r *TeamInvitationRepository) Create(ctx context.Context, inv *models.TeamI
 	return err
 }
 
-// ExpirePendingForEmail releases an expired pending row before a re-invite.
-// It runs in the same transaction as Create, leaving the partial unique index
-// as the authoritative concurrency control for an active invitation.
-func (r *TeamInvitationRepository) ExpirePendingForEmail(ctx context.Context, tenantID uuid.UUID, email string) error {
-	_, err := r.db.Exec(ctx, `UPDATE iam_team_invitations
+// ExpirePendingForEmail expires an expired pending row before a re-invite and
+// returns how many of the rows it expired held a seat reservation
+// (seat_class='member'), which the caller must release in the same
+// transaction. It runs in the same transaction as Create, leaving the partial
+// unique index as the authoritative concurrency control for an active
+// invitation.
+//
+// The background sweeper (ExpirePendingAndReleaseSeats) releases reservations
+// only for rows it flips itself; a row flipped here is no longer 'pending', so
+// the sweeper never sees it and its reservation would leak without this count.
+func (r *TeamInvitationRepository) ExpirePendingForEmail(ctx context.Context, tenantID uuid.UUID, email string) (int, error) {
+	rows, err := r.db.Query(ctx, `UPDATE iam_team_invitations
 		SET status = 'expired'
 		WHERE tenant_id = $1 AND lower(btrim(email)) = lower(btrim($2))
-		  AND status = 'pending' AND expires_at <= NOW()`, tenantID, email)
+		  AND status = 'pending' AND expires_at <= NOW()
+		RETURNING seat_class`, tenantID, email)
 	if err != nil {
-		return fmt.Errorf("ExpirePendingForEmail: %w", err)
+		return 0, fmt.Errorf("ExpirePendingForEmail: %w", err)
 	}
-	return nil
+	defer rows.Close()
+	reserved := 0
+	for rows.Next() {
+		var seatClass models.SeatClass
+		if err := rows.Scan(&seatClass); err != nil {
+			return 0, fmt.Errorf("ExpirePendingForEmail: scan: %w", err)
+		}
+		if seatClass == models.SeatClassMember {
+			reserved++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("ExpirePendingForEmail: %w", err)
+	}
+	return reserved, nil
+}
+
+// ListPendingByEmail returns the unexpired pending invitations addressed to the
+// canonical (trimmed, lower-cased) email in every tenant, newest first. It backs
+// the signed-in "my invitations" view; the caller must already have proved the
+// mailbox (verified email).
+func (r *TeamInvitationRepository) ListPendingByEmail(ctx context.Context, canonicalEmail string) ([]*models.TeamInvitation, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, tenant_id, email, role_ids, invited_by, token,
+		       status, expires_at, created_at, accepted_at, seat_class, last_resent_at
+		FROM iam_team_invitations
+		WHERE lower(btrim(email)) = $1 AND status = 'pending' AND expires_at > NOW()
+		ORDER BY created_at DESC, id DESC`, canonicalEmail)
+	if err != nil {
+		return nil, fmt.Errorf("ListPendingByEmail: %w", err)
+	}
+	defer rows.Close()
+	var invs []*models.TeamInvitation
+	for rows.Next() {
+		inv := &models.TeamInvitation{}
+		if err := rows.Scan(&inv.ID, &inv.TenantID, &inv.Email, &inv.RoleIDs, &inv.InvitedBy, &inv.Token,
+			&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.SeatClass, &inv.LastResentAt); err != nil {
+			return nil, fmt.Errorf("ListPendingByEmail: scan: %w", err)
+		}
+		invs = append(invs, inv)
+	}
+	return invs, rows.Err()
 }
 
 // GetByID retrieves a team invitation by primary key.
@@ -111,11 +166,11 @@ func (r *TeamInvitationRepository) getByID(ctx context.Context, id uuid.UUID, lo
 	inv := &models.TeamInvitation{}
 	err := r.db.QueryRow(ctx, `
 		SELECT id, tenant_id, email, role_ids, invited_by, token,
-		       status, expires_at, created_at, accepted_at
+		       status, expires_at, created_at, accepted_at, seat_class, last_resent_at
 		FROM iam_team_invitations WHERE id = $1`+lock, id,
 	).Scan(
 		&inv.ID, &inv.TenantID, &inv.Email, &inv.RoleIDs, &inv.InvitedBy, &inv.Token,
-		&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt,
+		&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.SeatClass, &inv.LastResentAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -143,14 +198,14 @@ func (r *TeamInvitationRepository) getByToken(ctx context.Context, token, lock s
 	inv := &models.TeamInvitation{}
 	err := r.db.QueryRow(ctx, `
 		SELECT id, tenant_id, email, role_ids, invited_by, token,
-		       status, expires_at, created_at, accepted_at
+		       status, expires_at, created_at, accepted_at, seat_class, last_resent_at
 		FROM iam_team_invitations
 		WHERE token = $1
 		   OR (token NOT LIKE 'sha256:%' AND token = $2)`+lock,
 		models.TeamInvitationTokenDigest(token), token,
 	).Scan(
 		&inv.ID, &inv.TenantID, &inv.Email, &inv.RoleIDs, &inv.InvitedBy, &inv.Token,
-		&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt,
+		&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.SeatClass, &inv.LastResentAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -190,14 +245,14 @@ func (r *TeamInvitationRepository) ListByTenantPage(ctx context.Context, tenantI
 	if status != "" {
 		rows, err = r.db.Query(ctx, `
 			SELECT id, tenant_id, email, role_ids, invited_by, token,
-			       status, expires_at, created_at, accepted_at
+			       status, expires_at, created_at, accepted_at, seat_class, last_resent_at
 			FROM iam_team_invitations
 			WHERE tenant_id = $1 AND status = $2
 			ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4`, tenantID, status, pageSize, (page-1)*pageSize)
 	} else {
 		rows, err = r.db.Query(ctx, `
 			SELECT id, tenant_id, email, role_ids, invited_by, token,
-			       status, expires_at, created_at, accepted_at
+			       status, expires_at, created_at, accepted_at, seat_class, last_resent_at
 			FROM iam_team_invitations
 			WHERE tenant_id = $1
 			ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`, tenantID, pageSize, (page-1)*pageSize)
@@ -212,7 +267,7 @@ func (r *TeamInvitationRepository) ListByTenantPage(ctx context.Context, tenantI
 		inv := &models.TeamInvitation{}
 		if err := rows.Scan(
 			&inv.ID, &inv.TenantID, &inv.Email, &inv.RoleIDs, &inv.InvitedBy, &inv.Token,
-			&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt,
+			&inv.Status, &inv.ExpiresAt, &inv.CreatedAt, &inv.AcceptedAt, &inv.SeatClass, &inv.LastResentAt,
 		); err != nil {
 			return nil, 0, fmt.Errorf("ListByTenantPage: scan: %w", err)
 		}
@@ -280,4 +335,71 @@ func (r *TeamInvitationRepository) HasPendingInvitation(ctx context.Context, ten
 		return false, fmt.Errorf("HasPendingInvitation: %w", err)
 	}
 	return count > 0, nil
+}
+
+// TeamInvitationResendRateLimit is the minimum interval between two resends
+// of the same invitation (the product specification §13.17:
+// "max 1 resend per invitation per 5 minutes").
+const TeamInvitationResendRateLimit = 5 * time.Minute
+
+// ErrResendRateLimited is returned by Resend when called again inside the
+// rate-limit window. Callers translate this into 429.
+var ErrResendRateLimited = errors.New("resend rate limited")
+
+// Resend is an atomic compare-and-set: only a still-pending invitation whose
+// last_resent_at (or never resent) is older than the rate limit window gets
+// its expires_at pushed to newExpiry and last_resent_at set to now(). Returns
+// false (no error) if the row is missing, not pending, or was resent too
+// recently — callers distinguish "not found"/"not pending" from "rate
+// limited" via a follow-up GetByID if they need a more specific response.
+func (r *TeamInvitationRepository) Resend(ctx context.Context, id uuid.UUID, newExpiry time.Time, newTokenDigest string) (bool, error) {
+	result, err := r.db.Exec(ctx, `
+		UPDATE iam_team_invitations
+		SET expires_at = $2, last_resent_at = NOW(), token = $3
+		WHERE id = $1 AND status = 'pending'
+		  AND (last_resent_at IS NULL OR last_resent_at <= NOW() - INTERVAL '5 minutes')`,
+		id, newExpiry, newTokenDigest,
+	)
+	if err != nil {
+		return false, fmt.Errorf("Resend: %w", err)
+	}
+	return result.RowsAffected() == 1, nil
+}
+
+// ExpirePendingAndReleaseSeats sweeps all pending invitations past
+// expires_at to 'expired' and returns, per tenant, how many of them were
+// seat_class='member' (i.e. how many pending seat reservations the caller
+// must release via SeatCounterRepository.ReleaseReservationsBulk).
+//
+// This intentionally selects the affected rows in the SAME statement as the
+// status flip (a single UPDATE ... RETURNING), so there is no window where a
+// row could be re-read as still-pending by a concurrent accept between an
+// expire-scan and an update — the row's own lock during the UPDATE is what
+// accept's GetByTokenForUpdate contends with.
+func (r *TeamInvitationRepository) ExpirePendingAndReleaseSeats(ctx context.Context) (map[uuid.UUID]int, error) {
+	rows, err := r.db.Query(ctx, `
+		UPDATE iam_team_invitations
+		SET status = 'expired'
+		WHERE status = 'pending' AND expires_at <= NOW()
+		RETURNING tenant_id, seat_class`)
+	if err != nil {
+		return nil, fmt.Errorf("ExpirePendingAndReleaseSeats: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[uuid.UUID]int)
+	for rows.Next() {
+		var tenantID uuid.UUID
+		var seatClass models.SeatClass
+		if err := rows.Scan(&tenantID, &seatClass); err != nil {
+			return nil, fmt.Errorf("ExpirePendingAndReleaseSeats: scan: %w", err)
+		}
+		if seatClass == models.SeatClassMember {
+			counts[tenantID]++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ExpirePendingAndReleaseSeats: rows: %w", err)
+	}
+	return counts, nil
 }

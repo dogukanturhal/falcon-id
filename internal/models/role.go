@@ -35,6 +35,15 @@ type Role struct {
 	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
 	UpdatedBy *uuid.UUID `json:"updated_by,omitempty" db:"updated_by"`
 
+	// Template provenance — added by migration 0012 (iam_role_templates).
+	// All three are nil together for a tenant-custom role; a non-nil
+	// TemplateKey means this role was instantiated from (and is reconciled
+	// against) iam_role_templates. Never populate these on a role created
+	// through the ordinary RoleService.Create path.
+	TemplateKey     *string `json:"template_key,omitempty" db:"template_key"`
+	TemplateVersion *int    `json:"template_version,omitempty" db:"template_version"`
+	Module          *string `json:"module,omitempty" db:"module"`
+
 	// Related data (not in DB)
 	Permissions []Permission `json:"permissions,omitempty"`
 }
@@ -76,6 +85,10 @@ type RoleResponse struct {
 	Locked      bool                 `json:"locked"`
 	Reason      string               `json:"reason,omitempty"`
 	Permissions []PermissionResponse `json:"permissions,omitempty"`
+
+	TemplateKey     *string `json:"template_key,omitempty"`
+	TemplateVersion *int    `json:"template_version,omitempty"`
+	Module          *string `json:"module,omitempty"`
 }
 
 // RoleListResponse is an exported type.
@@ -122,6 +135,10 @@ func (r *Role) ToResponse() *RoleResponse {
 		Source:      source,
 		Editable:    !r.IsSystem,
 		Locked:      r.IsSystem,
+
+		TemplateKey:     r.TemplateKey,
+		TemplateVersion: r.TemplateVersion,
+		Module:          r.Module,
 	}
 
 	for _, perm := range r.Permissions {

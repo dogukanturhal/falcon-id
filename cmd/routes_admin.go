@@ -57,6 +57,11 @@ const (
 )
 
 // registerAdminRoutes registers all admin routes.
+// scopeServiceRegister is the baseline scope every platform service client holds
+// (the token client defaults to it); internal routes without a more specific
+// scope require it.
+const scopeServiceRegister = "service:register"
+
 func registerAdminRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	admin := api.Group("/admin")
 	admin.Use(authMiddleware.RequireAuth())
@@ -311,7 +316,7 @@ func registerAdminRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewar
 		registerRiskRoutes(admin, handlers)
 
 		// ABAC Policy Management (Admin)
-		registerPolicyRoutes(admin, handlers)
+		registerPolicyRoutes(admin, handlers, authMiddleware)
 
 		// Tenant Configuration (Admin)
 		admin.GET("/tenant-config", handlers.TenantConfig.ListConfig)
@@ -340,11 +345,11 @@ func registerAdminRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewar
 		registerAccessReviewRoutes(admin, handlers)
 
 		// Email Domain Registry (Admin)
-		registerEmailDomainRoutes(admin, handlers)
+		registerEmailDomainRoutes(admin, handlers, authMiddleware)
 
 		// Tenant Custom-Domain Registry (Admin) — host-based discovery
 		// claim/verify/suspend/delete for SaaS app custom domains.
-		registerTenantHostAdminRoutes(admin, handlers)
+		registerTenantHostAdminRoutes(admin, handlers, authMiddleware)
 
 		// Guest User Management (Admin)
 		registerGuestUserRoutes(admin, handlers)
@@ -353,10 +358,10 @@ func registerAdminRoutes(api *gin.RouterGroup, handlers *Handlers, authMiddlewar
 		registerJITAccessRoutes(admin, handlers)
 
 		// Tenant Branding (Admin)
-		registerTenantBrandingRoutes(admin, handlers)
+		registerTenantBrandingRoutes(admin, handlers, authMiddleware)
 
 		// Tenant Quotas (Admin)
-		registerTenantQuotaRoutes(admin, handlers)
+		registerTenantQuotaRoutes(admin, handlers, authMiddleware)
 
 		// IDP Routing Rules (Admin)
 		registerIDPRoutingRoutes(admin, handlers)
@@ -588,18 +593,17 @@ func registerRiskRoutes(admin *gin.RouterGroup, handlers *Handlers) {
 }
 
 // registerPolicyRoutes registers ABAC policy management routes.
-func registerPolicyRoutes(admin *gin.RouterGroup, handlers *Handlers) {
+func registerPolicyRoutes(admin *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	admin.GET(pathPolicies, handlers.Policy.List)
-	admin.POST(pathPolicies, handlers.Policy.Create)
+	admin.POST(pathPolicies, authMiddleware.RequirePlatformAdmin(), handlers.Policy.Create)
 	admin.GET(pathPoliciesByID, handlers.Policy.GetByID)
-	admin.PUT(pathPoliciesByID, handlers.Policy.Update)
-	admin.DELETE(pathPoliciesByID, handlers.Policy.Delete)
-	admin.POST("/policies/test", handlers.Policy.TestPolicy)
-	admin.POST("/policies/reload", handlers.Policy.ReloadPolicies)
+	admin.PUT(pathPoliciesByID, authMiddleware.RequirePlatformAdmin(), handlers.Policy.Update)
+	admin.DELETE(pathPoliciesByID, authMiddleware.RequirePlatformAdmin(), handlers.Policy.Delete)
+	admin.POST("/policies/test", authMiddleware.RequirePlatformAdmin(), handlers.Policy.TestPolicy)
+	admin.POST("/policies/reload", authMiddleware.RequirePlatformAdmin(), handlers.Policy.ReloadPolicies)
 
 	// ABAC Status
 	admin.GET("/abac/status", handlers.Policy.GetABACStatus)
-	admin.POST("/abac/toggle", handlers.Policy.ToggleABAC)
 
 	// Default Access Policies
 	admin.POST("/default-access-policies", handlers.DefaultAccessPolicy.Create)
@@ -791,7 +795,13 @@ func registerPlatformManagementRoutes(platformAdmin *gin.RouterGroup, handlers *
 			tenantMgmt.POST("", handlers.Stub.CreateTenant)
 			tenantMgmt.GET(pathTenantID, authMiddleware.RequirePermission("platform:tenants:read"), handlers.PlatformManagement.GetTenant)
 			tenantMgmt.PUT(pathTenantID, authMiddleware.RequirePermission("platform:tenants:update"), handlers.PlatformManagement.UpdateTenant)
-			tenantMgmt.DELETE(pathTenantID, handlers.Stub.DeleteTenant)
+			// Previously ungated (any authenticated caller, any role) and
+			// returned a fake 200 success. Gated now, and the handler
+			// itself reports 501 honestly — see StubHandler.DeleteTenant.
+			tenantMgmt.DELETE(pathTenantID, authMiddleware.RequirePermission("platform:tenants:delete"), handlers.Stub.DeleteTenant)
+			// Backfill of workspaces still named "My Company": dry run by default,
+			// {"dryRun": false} applies. Idempotent; reports tenants with no legal entity.
+			tenantMgmt.POST("/placeholder-names/backfill", authMiddleware.RequirePermission("platform:tenants:update"), handlers.TenantWorkspaceName.Backfill)
 			tenantMgmt.POST("/:tenant_id/suspend", authMiddleware.RequirePermission("platform:tenants:suspend"), handlers.PlatformManagement.SuspendTenant)
 			tenantMgmt.POST("/:tenant_id/reactivate", authMiddleware.RequirePermission("platform:tenants:update"), handlers.PlatformManagement.ReactivateTenant)
 
@@ -801,6 +811,15 @@ func registerPlatformManagementRoutes(platformAdmin *gin.RouterGroup, handlers *
 			tenantMgmt.GET(pathTenantIDUserUserID, authMiddleware.RequirePermission(permPlatformUsersRead), handlers.PlatformManagement.GetTenantUser)
 			tenantMgmt.PUT(pathTenantIDUserUserID, authMiddleware.RequirePermission(permPlatformUsersUpdate), handlers.PlatformManagement.UpdateTenantUser)
 			tenantMgmt.DELETE(pathTenantIDUserUserID, authMiddleware.RequirePermission("platform:users:delete"), handlers.PlatformManagement.DeleteTenantUser)
+			// Admin lifecycle: reversible soft-delete/restore share the
+			// existing "platform:users:delete" grant; irreversible
+			// hard-delete requires the separate, stricter
+			// "platform:users:hard_delete" grant so that authority can
+			// be handed out independently (an operator who can soft-
+			// delete/restore does not automatically get erasure power).
+			tenantMgmt.POST(pathTenantIDUserUserID+"/soft-delete", authMiddleware.RequirePermission("platform:users:delete"), handlers.PlatformManagement.SoftDeleteTenantUser)
+			tenantMgmt.POST(pathTenantIDUserUserID+"/restore", authMiddleware.RequirePermission("platform:users:delete"), handlers.PlatformManagement.RestoreTenantUser)
+			tenantMgmt.POST(pathTenantIDUserUserID+"/hard-delete", authMiddleware.RequirePermission("platform:users:hard_delete"), handlers.PlatformManagement.HardDeleteTenantUser)
 			tenantMgmt.POST("/:tenant_id/users/:user_id/reset-password", authMiddleware.RequirePermission(permPlatformUsersUpdate), handlers.PlatformManagement.ResetUserPassword)
 			tenantMgmt.POST("/:tenant_id/users/:user_id/unlock", authMiddleware.RequirePermission(permPlatformUsersUpdate), handlers.PlatformManagement.UnlockUser)
 			tenantMgmt.PUT("/:tenant_id/users/:user_id/roles", authMiddleware.RequirePermission(permPlatformUsersUpdate), handlers.PlatformManagement.SetUserRoles)
@@ -808,7 +827,15 @@ func registerPlatformManagementRoutes(platformAdmin *gin.RouterGroup, handlers *
 			// Per-tenant role management
 			tenantMgmt.GET("/:tenant_id/roles", authMiddleware.RequirePermission("platform:roles:read"), handlers.PlatformManagement.ListTenantRoles)
 			tenantMgmt.POST("/:tenant_id/roles", authMiddleware.RequirePermission("platform:roles:create"), handlers.PlatformManagement.CreateTenantRole)
+
+			// Module-access reconcile for one tenant: materializes the role
+			// templates of every module the tenant is entitled to and grants
+			// the module-admin roles to its owners. Idempotent.
+			tenantMgmt.POST("/:tenant_id/module-access/reconcile", authMiddleware.RequirePermission("platform:roles:create"), handlers.PlatformManagement.ReconcileModuleAccess)
 		}
+
+		// Same reconcile across every tenant (rollout / recovery).
+		platformMgmt.POST("/module-access/reconcile", authMiddleware.RequirePermission("platform:roles:create"), handlers.PlatformManagement.ReconcileModuleAccess)
 
 		// Platform-wide permissions
 		platformMgmt.GET("/permissions", authMiddleware.RequirePermission("platform:permissions:read"), handlers.PlatformManagement.ListPlatformPermissions)
@@ -843,6 +870,12 @@ func registerRealmManagementRoutes(platformAdmin *gin.RouterGroup, handlers *Han
 		// Security policies
 		realms.GET("/:id/security-policy", authMiddleware.RequirePermission(permPlatformRealmsRead), handlers.Realm.GetSecurityPolicy)
 		realms.PUT("/:id/security-policy", authMiddleware.RequirePermission(permPlatformRealmsUpdate), handlers.Realm.UpdateSecurityPolicy)
+
+		// Device witness policy (authenticator-app fallback for ZTNA enrollment)
+		realms.GET("/:id/device-witness-policy", authMiddleware.RequirePermission(permPlatformRealmsRead), handlers.Realm.GetDeviceWitnessPolicy)
+		realms.PUT("/:id/device-witness-policy", authMiddleware.RequirePermission(permPlatformRealmsUpdate), handlers.Realm.UpdateDeviceWitnessPolicy)
+		realms.GET("/:id/session-policy", authMiddleware.RequirePermission(permPlatformRealmsRead), handlers.Realm.GetSessionPolicy)
+		realms.PUT("/:id/session-policy", authMiddleware.RequirePermission(permPlatformRealmsUpdate), handlers.Realm.UpdateSessionPolicy)
 
 		// Identity providers
 		realms.GET("/:id/identity-providers", authMiddleware.RequirePermission(permPlatformRealmsRead), handlers.Realm.ListIdentityProviders)
@@ -954,11 +987,21 @@ func registerAccessReviewRoutes(admin *gin.RouterGroup, handlers *Handlers) {
 
 // registerEmailDomainRoutes registers email domain registry admin routes.
 // Routes are nested under /admin/tenants/:tenant_id/domains.
-func registerEmailDomainRoutes(admin *gin.RouterGroup, handlers *Handlers) {
+//
+// SECURITY (R0 platform-admin audit finding F2): this group used to inherit
+// only the blanket admin.Use(RequireRole("admin","platform_admin","iam_admin"))
+// gate from the parent /admin group, with no check that :tenant_id matches
+// the caller's own tenant. Any customer tenant's own "admin" role holder
+// could pass a DIFFERENT tenant_id in the URL and manage that tenant's
+// email domains. RequireTenantScopedAdmin (CVE-HEXX-IAM-001 fix, previously
+// built but never wired to any route) closes this: platform admins bypass,
+// everyone else must match tenant_id to their own tenant.
+func registerEmailDomainRoutes(admin *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	if handlers.EmailDomain == nil {
 		return
 	}
 	tenantDomains := admin.Group("/tenants/:tenant_id/domains")
+	tenantDomains.Use(authMiddleware.RequireTenantScopedAdmin("tenant_id"))
 	{
 		tenantDomains.GET("", handlers.EmailDomain.ListDomains)
 		tenantDomains.POST("", handlers.EmailDomain.RegisterDomain)
@@ -973,11 +1016,16 @@ func registerEmailDomainRoutes(admin *gin.RouterGroup, handlers *Handlers) {
 // routes under /api/v1/admin/tenants/:tenant_id/hosts. Mirror of
 // registerEmailDomainRoutes — same auth envelope, same parameter
 // names, parallel flow (claim → publish TXT → verify).
-func registerTenantHostAdminRoutes(admin *gin.RouterGroup, handlers *Handlers) {
+//
+// SECURITY (R0 platform-admin audit finding F2): same cross-tenant IDOR as
+// registerEmailDomainRoutes — see that comment. RequireTenantScopedAdmin
+// closes it.
+func registerTenantHostAdminRoutes(admin *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	if handlers.TenantHostAdmin == nil {
 		return
 	}
 	tenantHosts := admin.Group("/tenants/:tenant_id/hosts")
+	tenantHosts.Use(authMiddleware.RequireTenantScopedAdmin("tenant_id"))
 	{
 		tenantHosts.GET("", handlers.TenantHostAdmin.ListHosts)
 		tenantHosts.POST("", handlers.TenantHostAdmin.ClaimHost)
@@ -1022,11 +1070,16 @@ func registerJITAccessRoutes(admin *gin.RouterGroup, handlers *Handlers) {
 
 // registerTenantBrandingRoutes registers tenant branding admin routes.
 // Routes are nested under /admin/tenants/:tenant_id/branding.
-func registerTenantBrandingRoutes(admin *gin.RouterGroup, handlers *Handlers) {
+//
+// SECURITY (R0 platform-admin audit finding F2): same cross-tenant IDOR as
+// registerEmailDomainRoutes — see that comment. RequireTenantScopedAdmin
+// closes it.
+func registerTenantBrandingRoutes(admin *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	if handlers.TenantBranding == nil {
 		return
 	}
 	tenantBranding := admin.Group("/tenants/:tenant_id/branding")
+	tenantBranding.Use(authMiddleware.RequireTenantScopedAdmin("tenant_id"))
 	{
 		tenantBranding.GET("", handlers.TenantBranding.GetBranding)
 		tenantBranding.PUT("", handlers.TenantBranding.UpdateBranding)
@@ -1035,19 +1088,31 @@ func registerTenantBrandingRoutes(admin *gin.RouterGroup, handlers *Handlers) {
 }
 
 // registerTenantQuotaRoutes registers tenant quota admin routes.
-func registerTenantQuotaRoutes(admin *gin.RouterGroup, handlers *Handlers) {
+//
+// SECURITY (R0 platform-admin audit finding F2 / F3):
+//   - Per-tenant quota: same cross-tenant IDOR as registerEmailDomainRoutes
+//     — see that comment. RequireTenantScopedAdmin closes it.
+//   - Tier defaults (/admin/quota/tiers) are platform-global (no :tenant_id
+//     at all) — they set the default quota for every tenant on a tier, so
+//     ANY tenant's own "admin" role holder reaching them (as before, via
+//     just the parent group's RequireRole gate) could alter quotas for
+//     every OTHER tenant on the platform. This is genuinely platform-plane
+//     and requires RequirePlatformAdmin, not tenant-scoping.
+func registerTenantQuotaRoutes(admin *gin.RouterGroup, handlers *Handlers, authMiddleware *middleware.AuthMiddleware) {
 	if handlers.TenantQuota == nil {
 		return
 	}
 	// Per-tenant quota endpoints
 	tenantQuota := admin.Group("/tenants/:tenant_id/quota")
+	tenantQuota.Use(authMiddleware.RequireTenantScopedAdmin("tenant_id"))
 	{
 		tenantQuota.GET("", handlers.TenantQuota.GetTenantQuota)
 		tenantQuota.PUT("", handlers.TenantQuota.UpsertTenantQuota)
 		tenantQuota.DELETE("", handlers.TenantQuota.DeleteTenantQuota)
 	}
-	// Tier defaults
+	// Tier defaults — platform-global, not tenant-scoped.
 	tierDefaults := admin.Group("/quota/tiers")
+	tierDefaults.Use(authMiddleware.RequirePlatformAdmin())
 	{
 		tierDefaults.GET("", handlers.TenantQuota.GetTierDefaults)
 		tierDefaults.PUT("/:tier", handlers.TenantQuota.UpdateTierDefault)
@@ -1374,12 +1439,13 @@ func registerInfrastructureStubRoutes(api *gin.RouterGroup, handlers *Handlers, 
 }
 
 // registerInternalAPIRoutes registers internal service-to-service API routes.
-func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middleware.AuthMiddleware, _ *middleware.InternalAuthMiddleware, _ *middleware.APIKeyAuthMiddleware, serviceAuthMiddleware *middleware.ServiceAuthMiddleware) {
+func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, authMiddleware *middleware.AuthMiddleware, _ *middleware.InternalAuthMiddleware, _ *middleware.APIKeyAuthMiddleware, serviceAuthMiddleware *middleware.ServiceAuthMiddleware) {
 	// Internal API for service-to-service communication
 	// Accepts: OAuth2 client_credentials Bearer JWT (composite key validation)
 	//          OR legacy X-Internal-Key header (migration period fallback)
 	internal := router.Group("/internal")
 	internal.Use(serviceAuthMiddleware.ServiceAuth())
+	internal.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 	{
 		// Kept for backward compatibility -- nothing in this codebase or any
 		// sibling repo calls this bare path (checked: every caller goes
@@ -1402,7 +1468,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 	// each sub-group's auth requirement is locally visible at the route site
 	// — matches the pre-migration shape and reads correctly under code review.
 	//
-	// Memory: internal engineering notes — "delete
+	// operational notes — "delete
 	// INTERNAL_API_KEY config/middleware/env on sight". The legacy
 	// InternalAuthMiddleware will be ripped in a follow-up MR once telemetry
 	// confirms no traffic uses X-Internal-Key (track via Prometheus counter
@@ -1411,6 +1477,10 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 	//
 	// Uses /internal/v1 prefix to avoid route conflicts with public /api/v1 routes.
 	internalV1 := router.Group("/internal/v1")
+	if handlers.ApprovalDirectory != nil {
+		router.POST("/api/v1/authorization/lookup-subjects", serviceAuthMiddleware.ServiceAuth(), middleware.RequireScope("authz:lookup"), handlers.ApprovalDirectory.LookupSubjects)
+		router.POST("/api/v1/authorization/check-batch", serviceAuthMiddleware.ServiceAuth(), middleware.RequireScope("authz:check"), handlers.ApprovalDirectory.BatchCheck)
+	}
 	{
 		// Module permission-catalogue self-registration. Every service that
 		// links platform-shared/permissions.Client posts here at startup
@@ -1425,13 +1495,30 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// that would have created them never landed.
 		internalPermissions := internalV1.Group("/permissions")
 		internalPermissions.Use(serviceAuthMiddleware.ServiceAuth())
+	internalPermissions.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			internalPermissions.POST("/register", handlers.Permission.RegisterModule)
+		}
+
+		// Role-templates module-revoke fallback trigger (the product roadmap
+		// §4.1) — see RoleTemplateHandler.RevokeModule's doc comment: there
+		// is no existing Kafka "module revoked" event, only the
+		// subscription-activated one (wired into the grant side via
+		// services.WithTemplateRoleProvisioner in cmd/services.go).
+		internalRoleTemplates := internalV1.Group("/role-templates")
+		internalRoleTemplates.Use(serviceAuthMiddleware.ServiceAuth())
+		// Revoke strips grants from every template-derived role of a tenant, so a
+		// valid service token alone is not enough: the caller (the entitlement
+		// owner) must hold this scope via its ServiceClientClaim.
+		internalRoleTemplates.Use(middleware.RequireScope("iam:role-templates:revoke"))
+		{
+			internalRoleTemplates.POST("/revoke", handlers.RoleTemplate.RevokeModule)
 		}
 
 		// Internal user management
 		internalUsers := internalV1.Group("/users")
 		internalUsers.Use(serviceAuthMiddleware.ServiceAuth())
+	internalUsers.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			internalUsers.POST("", handlers.User.Create)
 		}
@@ -1439,17 +1526,47 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// Internal role management
 		internalRoles := internalV1.Group("/roles")
 		internalRoles.Use(serviceAuthMiddleware.ServiceAuth())
+		internalRoles.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			internalRoles.POST("", handlers.Role.Create)
 			internalRoles.GET("", handlers.Role.List)
+
+			// ADR-A10 delegated-admin guard (17-module-account.md §12.2,
+			// 23-authorization-rbac-abac-rebac.md §3.2): additive
+			// single-permission grant, enforcing the entitlement +
+			// platform-tenant boundary server-side regardless of caller.
+			// Stricter than the group: dedicated scope on top of service:register, and
+			// the handler requires a JWT and checks the role tenant against the token.
+			internalRoles.POST("/:id/actions/grant-permission", middleware.RequireScope("iam:roles:grant-permission"), handlers.Role.GrantPermission)
+		}
+
+		// Internal SoD evaluation (23-authorization-rbac-abac-rebac.md
+		// §5.2/§8.3): re-evaluates a user's current role assignments
+		// against the seeded iam_sod_rules ruleset and upserts
+		// iam_sod_violations. Warn mode only in R1 — never blocks.
+		internalSoD := internalV1.Group("/sod")
+		internalSoD.Use(serviceAuthMiddleware.ServiceAuth())
+	internalSoD.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
+		{
+			internalSoD.POST("/evaluate", handlers.SoD.Evaluate)
 		}
 
 		// Internal tenant management
 		internalTenants := internalV1.Group("/tenants")
 		internalTenants.Use(serviceAuthMiddleware.ServiceAuth())
 		{
-			internalTenants.POST("", handlers.Tenant.CreateTenant)
-			internalTenants.GET("/:id/connection-info", handlers.Tenant.GetTenantConnectionInfoByID)
+			if handlers.ApprovalDirectory != nil {
+				internalTenants.GET("/:id/approval-membership-summary", middleware.RequireScope("iam:members:read"), handlers.ApprovalDirectory.MembershipSummary)
+				internalTenants.GET("/:id/approval-members/:user_id", middleware.RequireScope("iam:members:read"), handlers.ApprovalDirectory.ApprovalMember)
+			}
+			if handlers.TeamScope != nil {
+				internalTenants.GET("/:id/users/:user_id/team-scope", middleware.RequireScope(scopeTeamsRead), handlers.TeamScope.GetTeamScope)
+			}
+			if handlers.NotifRecipients != nil {
+				internalTenants.POST("/:id/notification-recipients", middleware.RequireScope("iam:members:read"), handlers.NotifRecipients.Resolve)
+			}
+			internalTenants.POST("", middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister), handlers.Tenant.CreateTenant)
+			internalTenants.GET("/:id/connection-info", middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister), handlers.Tenant.GetTenantConnectionInfoByID)
 
 			// Resolved SMTP configuration for a tenant. notification-service
 			// calls this at send preflight, and until it was registered the
@@ -1466,7 +1583,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 			// GetInternalSMTPConfig reads c.Param("id") regardless of what its
 			// own doc comment says.
 			if handlers.TenantConfig != nil {
-				internalTenants.GET("/:id/smtp-config", handlers.TenantConfig.GetInternalSMTPConfig)
+				internalTenants.GET("/:id/smtp-config", middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister), handlers.TenantConfig.GetInternalSMTPConfig)
 			}
 
 			// Active user (seat) count for a tenant — feat/seat-quota-
@@ -1477,12 +1594,78 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 			// the count excludes inactive users and users in their
 			// deletion_scheduled_at grace period (see
 			// UserRepository.CountActiveByTenant).
-			internalTenants.GET("/:id/users/count", handlers.Tenant.GetTenantUserCount)
+			internalTenants.GET("/:id/users/count", middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister), handlers.Tenant.GetTenantUserCount)
+			// Point membership check for S2S callers (business lead-owner validation
+			// fallback when core.users has not synced yet): 200 {"active":bool} / 404.
+			// Scope-gated; same :id wildcard as the siblings, no listing.
+			internalTenants.GET("/:id/members/:userId",
+				middleware.RequireScope("iam:members:read"),
+				handlers.Tenant.GetTenantMember)
+			// Employee-class (ESS) accounts for the business HR module (R-HR WP-21): seat-free, hr:employee role only.
+			// Wildcards stay :id/:userId (Gin rejects a different name under the same prefix).
+			internalTenants.POST("/:id/employee-accounts",
+				middleware.RequireScope("iam:employee-accounts:write"),
+				handlers.TeamInvitation.ProvisionEmployeeAccount)
+			internalTenants.PUT("/:id/employee-accounts/:userId/access-expiry",
+				middleware.RequireScope("iam:employee-accounts:write"),
+				handlers.TeamInvitation.SetEmployeeAccessExpiry)
+			// Source-owned HR projection. Deliberately independent from ESS expiry, which
+			// deactivates an employee account globally and is not safe for employment exit.
+			internalTenants.PUT("/:id/hr-employment-sync/scopes", middleware.RequireScope("iam:hr-employment-sync:write"), handlers.HREmploymentSync.PutScope)
+			internalTenants.PUT("/:id/hr-employments/:employeeId", middleware.RequireScope("iam:hr-employment-sync:write"), handlers.HREmploymentSync.PutEmployment)
+
+			// Interim seat_limit source (the product roadmap §2.1/§4.9,
+			// the product specification §13.2): falcon-id has
+			// no queryable included-seats/entitlement-plan data yet (no
+			// subscription-management/quota-service sync exists for it), so
+			// until that lands, an operator or an eventual
+			// subscription-management sync sets seat_limit directly via
+			// this endpoint. GET is read-only (iam:seats:read); PUT requires
+			// iam:seats:write since it changes enforcement for a tenant.
+			// This path is already exempt from the X-Tenant-ID gate — see
+			// internal/middleware/tenant.go's publicEndpoints, which lists
+			// "/internal/v1/tenants/" (prefix match).
+			if handlers.SeatLimit != nil {
+				internalTenants.GET("/:id/seat-limit", middleware.RequireScope("iam:seats:read"), handlers.SeatLimit.GetSeatLimit)
+				internalTenants.PUT("/:id/seat-limit", middleware.RequireScope("iam:seats:write"), handlers.SeatLimit.SetSeatLimit)
+			}
+
+			// Placeholder workspace name replacement ("My Company"). business
+			// calls this after a tenant's first legal entity is created; it only
+			// renames while the tenant is still on the placeholder, so repeat or
+			// racing calls are harmless no-ops.
+			if handlers.TenantWorkspaceName != nil {
+				internalTenants.PUT("/:id/workspace-name",
+					middleware.RequireScope("iam:tenants:workspace-name:write"),
+					handlers.TenantWorkspaceName.RenameIfPlaceholder)
+			}
+
+			// Tenant module entitlements (the product roadmap §4.1). Read is
+			// available to any authenticated S2S caller holding
+			// iam:entitlements:read; write additionally requires
+			// iam:entitlements:write, since PUT is the out-of-band
+			// ops/backfill/replay path that can rewrite a tenant's
+			// entitlement state outright (the normal path is the
+			// example.tenant.modules.sync Kafka consumer in
+			// internal/entitlementsync, which needs no HTTP scope at
+			// all). This path is already covered by the
+			// /internal/v1/tenants/ prefix exemption in
+			// internal/middleware/tenant.go's publicEndpoints list, so no
+			// new entry is needed there.
+			if handlers.Entitlement != nil {
+				internalTenants.GET("/:id/module-entitlements",
+					middleware.RequireScope("iam:entitlements:read"),
+					handlers.Entitlement.GetModuleEntitlements)
+				internalTenants.PUT("/:id/module-entitlements",
+					middleware.RequireScope("iam:entitlements:write"),
+					handlers.Entitlement.PutModuleEntitlements)
+			}
 		}
 
 		// Internal authorization endpoints
 		internalAuthorize := internalV1.Group("/authorize")
 		internalAuthorize.Use(serviceAuthMiddleware.ServiceAuth())
+	internalAuthorize.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			internalAuthorize.POST("", handlers.Authorization.Authorize)
 			internalAuthorize.POST("/batch", handlers.Authorization.AuthorizeBatch)
@@ -1491,6 +1674,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// Subscription event bridge (receives events from subscription-management)
 		internalSubEvents := internalV1.Group("/subscription-events")
 		internalSubEvents.Use(serviceAuthMiddleware.ServiceAuth())
+	internalSubEvents.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			internalSubEvents.POST("/activated", handlers.SubscriptionEvent.HandleActivated)
 		}
@@ -1518,6 +1702,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		//       internal routes above) — service-to-service only.
 		internalDiscovery := internalV1.Group("/tenant-discovery")
 		internalDiscovery.Use(serviceAuthMiddleware.ServiceAuth())
+	internalDiscovery.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			if handlers.HostDiscovery != nil {
 				internalDiscovery.GET("", handlers.HostDiscovery.Discover)
@@ -1545,6 +1730,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// Route: POST /internal/v1/tenant-hosts
 		internalTenantHosts := internalV1.Group("/tenant-hosts")
 		internalTenantHosts.Use(serviceAuthMiddleware.ServiceAuth())
+	internalTenantHosts.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			if handlers.InternalTenantHost != nil {
 				internalTenantHosts.POST("", handlers.InternalTenantHost.Register)
@@ -1572,6 +1758,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		if handlers.IAMDevices != nil {
 			internalIAMDevices := internalV1.Group("/iam-devices")
 			internalIAMDevices.Use(serviceAuthMiddleware.ServiceAuth())
+			internalIAMDevices.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister, "iam-devices:enroll"))
 			{
 				internalIAMDevices.POST("/enroll", handlers.IAMDevices.Enroll)
 				internalIAMDevices.GET("/by-ek-hash/:hash", handlers.IAMDevices.GetByEKHash)
@@ -1600,6 +1787,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		if handlers.IAMDevicePreReg != nil {
 			preReg := internalV1.Group("/iam-devices")
 			preReg.Use(serviceAuthMiddleware.ServiceAuth())
+			preReg.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister, "iam-devices:enroll"))
 			{
 				preReg.GET("/corp-asset/by-ek-hash/:hash", handlers.IAMDevicePreReg.CorpAssetByEKHash)
 				preReg.POST("/pre-registrations/bulk", handlers.IAMDevicePreReg.BulkPreRegister)
@@ -1615,6 +1803,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// (see config/apisix/apisix-dev.yaml — the C# client uses /api/v1/internal/…).
 		internalStorage := internalV1.Group("/storage")
 		internalStorage.Use(serviceAuthMiddleware.ServiceAuth())
+	internalStorage.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		{
 			if handlers.InternalStorage != nil {
 				internalStorage.POST(pathPresignedDownload, handlers.InternalStorage.PresignedDownload)
@@ -1627,6 +1816,78 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 				})
 			}
 		}
+
+		// R1 platform plane: JIT elevation + break-glass + standing
+		// platform-role admin. Two-layer auth per this rollout's hard
+		// rule ("tenant/user from the validated JWT only"):
+		//   1. ServiceAuth()+RequireScope("platform:jit-elevations") —
+		//      authenticates the CALLING SERVICE (the acmeweb BFF).
+		//   2. RequireActorAuth()+RequirePlatformInternalActor() —
+		//      authenticates the HUMAN OPERATOR acting through it (see
+		//      internal/middleware/actor_auth.go's doc comment) and
+		//      rejects any actor whose OWN tenant isn't the
+		//      Platform-internal tenant, fail-closed, before the handler
+		//      runs at all. Every handler method derives requester_id/
+		//      approver_id from middleware.GetActorUserID(c) exclusively
+		//      — never a body field.
+		//
+		// Exempted from ExtractTenant's X-Tenant-ID requirement in
+		// internal/middleware/tenant.go (see the "/internal/v1/jit-
+		// elevations/" and "/internal/v1/break-glass/" entries there);
+		// tenant context here is always the internal tenant, sourced
+		// from the actor JWT, never a header.
+		platformJITAuth := []gin.HandlerFunc{
+			serviceAuthMiddleware.ServiceAuth(),
+			middleware.RequireScope("platform:jit-elevations"),
+			authMiddleware.RequireActorAuth(),
+			middleware.RequirePlatformInternalActor(),
+		}
+
+		internalJITElevations := internalV1.Group("/jit-elevations")
+		internalJITElevations.Use(platformJITAuth...)
+		{
+			internalJITElevations.POST("", handlers.PlatformJIT.RequestElevation)
+			internalJITElevations.GET("", handlers.PlatformJIT.ListElevations)
+			internalJITElevations.POST("/:id/approve", handlers.PlatformJIT.ApproveElevation)
+			internalJITElevations.POST("/:id/activate", handlers.PlatformJIT.ActivateElevation)
+			internalJITElevations.POST("/:id/revoke", handlers.PlatformJIT.RevokeElevation)
+			// Read-only audit view over the append-only hash-chain
+			// transition log for one elevation (migration 0016's
+			// iam_jit_elevation_transitions) — R1 lead-review requirement,
+			// added alongside the GET list routes below.
+			internalJITElevations.GET("/:id/transitions", handlers.PlatformJIT.ListTransitions)
+		}
+
+		internalBreakGlass := internalV1.Group("/break-glass")
+		internalBreakGlass.Use(platformJITAuth...)
+		{
+			internalBreakGlass.POST("", handlers.PlatformJIT.RequestBreakGlass)
+			internalBreakGlass.GET("", handlers.PlatformJIT.ListBreakGlass)
+			internalBreakGlass.POST("/:id/retroactive-approve", handlers.PlatformJIT.RetroactivelyApprove)
+		}
+
+		// Standing platform-role admin (platform_viewer only — every
+		// other role_key 403s with platform_role_not_standing_assignable,
+		// enforced in services.PlatformJITService.GrantStandingRole AND
+		// belt-and-suspenders by the iam_platform_roles_enforce() DB
+		// trigger from migration 0016).
+		internalPlatformRoles := internalV1.Group("/platform-roles")
+		internalPlatformRoles.Use(platformJITAuth...)
+		{
+			internalPlatformRoles.POST("", handlers.PlatformJIT.GrantStandingRole)
+			internalPlatformRoles.GET("", handlers.PlatformJIT.ListStandingRoles)
+			// OPS_STRICT_PLATFORM_ROLES readiness: who relies on the legacy
+			// tenant-role path (read-only) and the standing-viewer seed
+			// (DRY-RUN unless the body says {"apply":true}).
+			if handlers.PlatformAuth != nil {
+				internalPlatformRoles.GET("/legacy-report", handlers.PlatformAuth.LegacyReport)
+				internalPlatformRoles.POST("/seed-viewers", handlers.PlatformAuth.SeedViewers)
+			}
+		}
+
+		// Staff console "people" surface on the operator chain (assertion-
+		// verified actor, per-area scopes). Nil unless the operator exchange is on.
+		registerOpsConsoleRoutes(internalV1, handlers, serviceAuthMiddleware.ServiceAuth())
 	}
 
 	// Register the same storage endpoint under /api/v1/internal/… so that
@@ -1637,6 +1898,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 	apiV1Internal.Use(serviceAuthMiddleware.ServiceAuth())
 	{
 		apiV1InternalStorage := apiV1Internal.Group("/storage")
+		apiV1InternalStorage.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 		if handlers.InternalStorage != nil {
 			apiV1InternalStorage.POST(pathPresignedDownload, handlers.InternalStorage.PresignedDownload)
 		} else {
@@ -1651,6 +1913,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 		// Used by marketing module to sync sender domains to Workspace Email Domains.
 		if handlers.EmailDomain != nil {
 			apiV1InternalDomains := apiV1Internal.Group("/tenants/:tenant_id/domains")
+			apiV1InternalDomains.Use(middleware.RequireAnyScopeOrInternalKey(scopeServiceRegister))
 			{
 				apiV1InternalDomains.GET("", handlers.EmailDomain.ListDomains)
 				apiV1InternalDomains.POST("", handlers.EmailDomain.RegisterDomain)
@@ -1743,7 +2006,7 @@ func registerInternalAPIRoutes(router *gin.Engine, handlers *Handlers, _ *middle
 // DPoP-bound token` regardless of whether the client sent a proof
 // — which broke every ServiceClientClaim using the
 // `admin:oauth-clients` scope after c91c10d landed.
-func registerOAuthRoutes(router *gin.Engine, handlers *Handlers, authMiddleware *middleware.AuthMiddleware, dpopMW *middleware.DPoPMiddleware) {
+func registerOAuthRoutes(router *gin.Engine, handlers *Handlers, authMiddleware *middleware.AuthMiddleware, dpopMW *middleware.DPoPMiddleware, tokenPerUserClientIDs []string, authRateLimiter *middleware.AuthRateLimiter) {
 	router.GET("/.well-known/openid-configuration", handlers.OAuthProvider.GetOpenIDConfiguration)
 	router.GET("/.well-known/jwks.json", handlers.OAuthProvider.GetJWKS)
 	// Unified platform JWKS: includes both OAuth keys and the platform RS256 session-token key.
@@ -1773,7 +2036,7 @@ func registerOAuthRoutes(router *gin.Engine, handlers *Handlers, authMiddleware 
 	//      requires a DPoP-bound token` even when the client sent a
 	//      perfectly-valid DPoP header — verified empirically
 	//      2026-05-02 against the live ServiceClient provisioner Job.
-	tokenMWs := []gin.HandlerFunc{middleware.OAuthTokenRateLimit()}
+	tokenMWs := []gin.HandlerFunc{middleware.OAuthTokenRateLimit(tokenPerUserClientIDs)}
 	if dpopMW != nil {
 		tokenMWs = append(tokenMWs, dpopMW.OptionalDPoP())
 	}
@@ -1801,7 +2064,13 @@ func registerOAuthRoutes(router *gin.Engine, handlers *Handlers, authMiddleware 
 
 	// OAuth login/consent pages (browser flow)
 	router.GET("/oauth/login", handlers.OAuthProvider.LoginPage)
-	router.POST("/oauth/login", handlers.OAuthProvider.LoginSubmit)
+	// Hosted login is a password-guessing surface just like /api/v1/auth/login:
+	// same per-IP/per-account auth limiter (5/min/IP default).
+	loginSubmitMWs := []gin.HandlerFunc{}
+	if authRateLimiter != nil {
+		loginSubmitMWs = append(loginSubmitMWs, authRateLimiter.Middleware())
+	}
+	router.POST("/oauth/login", append(loginSubmitMWs, handlers.OAuthProvider.LoginSubmit)...)
 	router.GET("/oauth/consent", authMiddleware.OptionalAuth(), handlers.OAuthProvider.ConsentPage)
 
 	// OIDC End-Session (RP-Initiated Logout)
@@ -1809,6 +2078,13 @@ func registerOAuthRoutes(router *gin.Engine, handlers *Handlers, authMiddleware 
 
 	// Service Account OAuth2 token endpoint
 	router.POST("/oauth/token/service-account", handlers.ServiceAccount.TokenEndpoint)
+
+	// Tenant API key exchange (WO#20): lgk_live_ key -> 10-minute RS256 token.
+	// The handler authenticates the key itself and 404s while the flag is off.
+	if handlers.TenantAPIKey != nil {
+		// Rate limited per parsed key_id + IP (never the raw client_id).
+		router.POST("/oauth/token/api-key", handlers.TenantAPIKeyLimit, handlers.TenantAPIKey.TokenEndpoint)
+	}
 
 	// ZTNA Path B device-enrollment witness page (ADR 0043 §3.c.0).
 	//

@@ -63,7 +63,7 @@ type CAEPSigningKeyProvider interface {
 // when CAEP transmitter is enabled in deployment.
 type CAEPEmitterConfig struct {
 	// Issuer is the Falcon-ID iss claim populated on every SET.
-	// Typical: "https://id.hexxlock.com/".
+	// Typical: "https://id.example.com/".
 	Issuer string
 
 	// HTTPClient is the transport for push delivery. Defaults to a

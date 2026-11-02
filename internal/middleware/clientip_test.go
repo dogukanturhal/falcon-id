@@ -213,7 +213,7 @@ func TestClientIP_FallsThroughOnInvalidCFConnectingIP(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// ClientGeo — Cloudflare Worker `id-hexxlock-geo-stamp` X-Geo-* headers
+// ClientGeo — Cloudflare Worker `geo-stamp` X-Geo-* headers
 // ----------------------------------------------------------------------------
 
 // ClientGeo_PopulatesFromHeaders — happy path: every X-Geo-* header set,

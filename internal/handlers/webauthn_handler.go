@@ -4,6 +4,7 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -36,7 +37,8 @@ const (
 type WebAuthnHandler struct {
 	service     *services.WebAuthnService
 	authService *services.AuthService
-	sessionRepo *repositories.SessionRepository
+	sessionRepo passkeyStepUpSessionRepository
+	stepUpRepo  passkeyStepUpRecorder
 	// authHandler is injected (via SetAuthHandler) so the WebAuthn
 	// login-completion paths (FinishAuthentication +
 	// CompleteConditionalLogin) can write the same falcon_access_token
@@ -63,6 +65,11 @@ type WebAuthnHandler struct {
 	// injected here so tests can exercise the handler without the full
 	// service dependency graph.
 	witnessService witnessWebAuthnService
+	// witnessState holds the begin-time {device_uuid, ek_hash, state} binding
+	// the finish step trusts instead of the request. Nil -> witness 503.
+	witnessState witnessStateService
+	// witnessInfo reports which methods the witness page may offer (optional).
+	witnessInfo witnessStatusProvider
 	// csrfMiddleware is injected (via SetCSRFMiddleware) so the
 	// ZTNA Path B witness enrollment page can mint a per-session CSRF
 	// token to embed in its bootstrap payload. Optional — when unset
@@ -91,7 +98,18 @@ func NewWebAuthnHandler(service *services.WebAuthnService, authService *services
 // passkey assertion. Optional; when unset the step-up handlers return
 // 503 service-unavailable. Mirrors MFAHandler.SetSessionRepo.
 func (h *WebAuthnHandler) SetSessionRepo(repo *repositories.SessionRepository) {
+	if repo == nil {
+		h.sessionRepo = nil
+		return
+	}
 	h.sessionRepo = repo
+}
+func (h *WebAuthnHandler) SetStepUpRepo(repo *repositories.StepUpVerificationRepository) {
+	if repo == nil {
+		h.stepUpRepo = nil
+		return
+	}
+	h.stepUpRepo = repo
 }
 
 // SetAuthHandler injects the AuthHandler so login-completion paths can
@@ -265,7 +283,7 @@ func (h *WebAuthnHandler) FinishAuthentication(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
-	resp, err := h.authService.LoginViaWebAuthn(c.Request.Context(), user, GetClientIP(c), c.Request.UserAgent(), c.Query("client_id"))
+	resp, err := h.authService.LoginViaWebAuthn(c.Request.Context(), user, GetClientIP(c), c.Request.UserAgent(), c.Query("client_id"), webAuthnRememberMe(c))
 	if err != nil {
 		h.logger.Error("WebAuthn LoginViaWebAuthn failed",
 			zap.String("user_id", user.ID.String()),
@@ -333,7 +351,7 @@ func (h *WebAuthnHandler) CompleteConditionalLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		return
 	}
-	resp, err := h.authService.LoginViaWebAuthn(c.Request.Context(), user, GetClientIP(c), c.Request.UserAgent(), c.Query("client_id"))
+	resp, err := h.authService.LoginViaWebAuthn(c.Request.Context(), user, GetClientIP(c), c.Request.UserAgent(), c.Query("client_id"), webAuthnRememberMe(c))
 	if err != nil {
 		h.logger.Error("WebAuthn LoginViaWebAuthn (conditional) failed",
 			zap.String("user_id", user.ID.String()),
@@ -407,13 +425,18 @@ func (h *WebAuthnHandler) FinishStepUp(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-	if h.sessionRepo == nil {
+	if h.sessionRepo == nil || h.stepUpRepo == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "step-up not configured"})
 		return
 	}
 	sessionID := c.Query("wa_session_id")
 	if sessionID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": msgWebAuthnSessionIDRequired})
+		return
+	}
+	action := c.Query("action")
+	if len(action) > 100 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action too long"})
 		return
 	}
 	_, _, err := h.service.FinishAuthentication(c.Request.Context(), user.ID, user.TenantID, sessionID, c.Request)
@@ -441,22 +464,26 @@ func (h *WebAuthnHandler) FinishStepUp(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid session context"})
 		return
 	}
-	if _, elevErr := h.sessionRepo.AppendAuthMethod(c.Request.Context(), sid, "mfa"); elevErr != nil {
-		h.logger.Warn("WebAuthn step-up AMR(mfa) elevation failed (non-fatal)",
-			zap.String("session_id", sid.String()),
-			zap.Error(elevErr),
-		)
+	if err := recordPasskeyStepUp(c.Request.Context(), h.sessionRepo, h.stepUpRepo, sid, user.ID); err != nil {
+		respondMFAFlowError(c, err)
+		return
 	}
-	if _, elevErr := h.sessionRepo.AppendAuthMethod(c.Request.Context(), sid, "hwk"); elevErr != nil {
-		h.logger.Warn("WebAuthn step-up AMR(hwk) elevation failed (non-fatal)",
-			zap.String("session_id", sid.String()),
-			zap.Error(elevErr),
-		)
+	// Optional ?action=<name>: also satisfy the per-action StepUpMiddleware gate
+	// (e.g. admin_user_mutation) with this passkey assertion.
+	if action != "" {
+		if err := h.stepUpRepo.RecordVerification(c.Request.Context(), sid, user.ID, action, "webauthn", 5*time.Minute); err != nil {
+			respondMFAFlowError(c, err)
+			return
+		}
+	}
+	if h.authHandler != nil && !refreshStepUpIdpSession(c, h.authHandler.sessionCache) {
+		return
 	}
 
 	h.logger.Info("WebAuthn step-up succeeded",
 		zap.String("user_id", user.ID.String()),
 		zap.String("session_id", sid.String()),
+		zap.String("action", action),
 	)
 	c.JSON(http.StatusOK, gin.H{
 		"verified": true,
@@ -586,4 +613,11 @@ func (h *WebAuthnHandler) resolveTenantID(c *gin.Context) (uuid.UUID, bool) {
 		return uuid.Nil, false
 	}
 	return tenantID, true
+}
+
+// webAuthnRememberMe reads the "remember me" choice for passkey logins. The
+// request body is the raw WebAuthn assertion (consumed by go-webauthn), so
+// the flag travels as a query parameter, like the MFA-WebAuthn path.
+func webAuthnRememberMe(c *gin.Context) bool {
+	return c.Query("remember_me") == "true"
 }

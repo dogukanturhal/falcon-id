@@ -242,7 +242,7 @@ func TestNormalizeEndpoint(t *testing.T) {
 		// the consumer-tenant abuse-prevention design (ENT-5). A 5/min/IP
 		// override caps signup ATTEMPTS, not sub-calls.
 		{"/api/v1/auth/signup", "auth_signup"},
-		{"/api/v1/auth/signup/verify-email", "auth_signup"},
+		{"/api/v1/auth/signup/verify-email", "auth_signup_verify"},
 		{"/api/v1/auth/signup/complete", "auth_signup"},
 		{"/api/auth/signup", "auth_signup"},
 	}
@@ -569,4 +569,41 @@ func TestEndpointIsolation(t *testing.T) {
 	req2.RemoteAddr = testRemoteAddr1
 	router2.ServeHTTP(w2, req2)
 	assert.Equal(t, http.StatusOK, w2.Code, "Different endpoint should have separate rate limit")
+}
+
+// TestExtractClientIPTrustedProxyCIDRAndExact verifies that both a CIDR range
+// and an exact IP are honoured as trusted proxies, and that an untrusted peer
+// cannot spoof X-Forwarded-For.
+func TestExtractClientIPTrustedProxyCIDRAndExact(t *testing.T) {
+	limiter := NewAuthRateLimiter(DefaultAuthRateLimiterConfig(), nil)
+	limiter.SetTrustedProxies([]string{"10.42.0.0/16", "192.168.1.1"})
+
+	tests := []struct {
+		name       string
+		remoteAddr string
+		xff        string
+		want       string
+	}{
+		{"cidr peer trusted", "10.42.7.9:1234", "203.0.113.5", "203.0.113.5"},
+		{"exact peer trusted", "192.168.1.1:1234", "203.0.113.6", "203.0.113.6"},
+		{"untrusted peer ignores XFF", "172.16.0.1:1234", "203.0.113.7", "172.16.0.1"},
+		{"just outside cidr ignores XFF", "10.43.0.1:1234", "203.0.113.8", "10.43.0.1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+			c.Request.RemoteAddr = tt.remoteAddr
+			c.Request.Header.Set("X-Forwarded-For", tt.xff)
+			assert.Equal(t, tt.want, limiter.extractClientIP(c))
+		})
+	}
+}
+
+func TestDefaultAuthRateLimiterConfig_OAuthLoginPerAccountLoose(t *testing.T) {
+	cfg := DefaultAuthRateLimiterConfig()
+	ov, ok := cfg.EndpointOverrides[normalizeEndpoint("/oauth/login")]
+	require.True(t, ok, "oauth_login override missing")
+	assert.GreaterOrEqual(t, ov.PerAccount.MaxRequests, 100)
+	assert.Equal(t, 5, cfg.PerIP.MaxRequests, "per-IP stays strict")
 }

@@ -264,14 +264,14 @@ func TestExtractSubdomain_TableDriven(t *testing.T) {
 		host     string
 		expected string
 	}{
-		{"acme.hexxlock.com", "acme"},
+		{"acme.example.com", "acme"},
 		{"tenant1.example.com", "tenant1"},
-		{"www.hexxlock.com", ""},           // www is skipped
-		{"api.hexxlock.com", ""},           // api is skipped
-		{"hexxlock.com", ""},               // no subdomain
+		{"www.example.com", ""},           // www is skipped
+		{"api.example.com", ""},           // api is skipped
+		{"example.com", ""},               // no subdomain
 		{"localhost", ""},                  // single part
-		{"api.acme.hexxlock.com", "acme"},  // api prefix skipped, second part used
-		{"acme.hexxlock.com:8080", "acme"}, // port stripped
+		{"api.acme.example.com", "acme"},  // api prefix skipped, second part used
+		{"acme.example.com:8080", "acme"}, // port stripped
 	}
 
 	for _, tt := range tests {

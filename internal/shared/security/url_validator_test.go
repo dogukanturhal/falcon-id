@@ -158,9 +158,9 @@ func TestURLValidator_Validate(t *testing.T) {
 			config: URLValidatorConfig{
 				RequireHTTPS:    true,
 				BlockPrivateIPs: false, // Disable IP check for allowlist tests
-				AllowedDomains:  []string{"hexxlock.com", "example.com"},
+				AllowedDomains:  []string{"example.com", "example.com"},
 			},
-			url:         "https://hexxlock.com/callback",
+			url:         "https://example.com/callback",
 			expectedErr: nil,
 		},
 		{
@@ -168,9 +168,9 @@ func TestURLValidator_Validate(t *testing.T) {
 			config: URLValidatorConfig{
 				RequireHTTPS:    true,
 				BlockPrivateIPs: false,
-				AllowedDomains:  []string{"hexxlock.com"},
+				AllowedDomains:  []string{"example.com"},
 			},
-			url:         "https://app.hexxlock.com/callback",
+			url:         "https://app.example.com/callback",
 			expectedErr: nil,
 		},
 		{
@@ -178,7 +178,7 @@ func TestURLValidator_Validate(t *testing.T) {
 			config: URLValidatorConfig{
 				RequireHTTPS:    true,
 				BlockPrivateIPs: false,
-				AllowedDomains:  []string{"hexxlock.com"},
+				AllowedDomains:  []string{"example.com"},
 			},
 			url:         "https://evil.com/callback",
 			expectedErr: ErrDomainNotAllowed,
@@ -284,9 +284,16 @@ func TestValidateURL(t *testing.T) {
 }
 
 func TestValidateURLWithAllowlist(t *testing.T) {
-	// Skip this test as it requires DNS resolution
-	// In production, the allowlist feature works correctly
-	t.Skip("Skipping allowlist test that requires DNS resolution")
+	// Public IP literals exercise the entire validator without external DNS.
+	config := DefaultURLValidatorConfig()
+	config.AllowedDomains = []string{"8.8.8.8"}
+	validator := NewURLValidator(config)
+	if err := validator.Validate(context.Background(), "https://8.8.8.8/path"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validator.Validate(context.Background(), "https://9.9.9.9/path"); !errors.Is(err, ErrDomainNotAllowed) {
+		t.Fatalf("got %v, want allowlist denial", err)
+	}
 }
 
 func TestURLValidator_isLocalhost(t *testing.T) {
@@ -320,7 +327,7 @@ func TestURLValidator_isLocalhost(t *testing.T) {
 
 func TestURLValidator_isDomainAllowed(t *testing.T) {
 	config := URLValidatorConfig{
-		AllowedDomains: []string{"example.com", "hexxlock.com"},
+		AllowedDomains: []string{"example.com", "example.com"},
 	}
 	validator := NewURLValidator(config)
 
@@ -332,8 +339,8 @@ func TestURLValidator_isDomainAllowed(t *testing.T) {
 		{"EXAMPLE.COM", true},
 		{"app.example.com", true},
 		{"api.app.example.com", true},
-		{"hexxlock.com", true},
-		{"app.hexxlock.com", true},
+		{"example.com", true},
+		{"app.example.com", true},
 		{"evil.com", false},
 		{"examplecom.evil.com", false},
 	}

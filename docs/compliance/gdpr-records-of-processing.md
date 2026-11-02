@@ -3,7 +3,7 @@
 **Controller**: HexxLock Inc.
 **Last reviewed**: 2026-05-25
 **Review cadence**: Quarterly (next: 2026-08-25)
-**Owner**: Data Protection Officer (privacy@hexxlock.com)
+**Owner**: Data Protection Officer (privacy@example.com)
 **Lawful basis register**: see §4
 
 This document is the canonical GDPR Article 30(1) records artifact for the HexxLock identity platform (Falcon-ID IdP + Accounts portal). It is produced for inspection on demand by supervisory authorities (KVKK in Turkey, Datenschutzbehörden in EU member states) and supplied under NDA to enterprise customers conducting vendor due diligence.
@@ -18,7 +18,7 @@ The companion document `gdpr-records-of-processing-as-processor.md` (Article 30(
 |---|---|
 | Legal entity | HexxLock Inc. |
 | Registered office | _(Yes — fill in legal address before sharing externally)_ |
-| Data Protection Officer | privacy@hexxlock.com |
+| Data Protection Officer | privacy@example.com |
 | EU representative (Art. 27) | _(if no EU establishment)_ |
 | UK representative (UK GDPR Art. 27) | _(if no UK establishment)_ |
 | KVKK Data Controllers' Registry (VERBIS) | _(Turkish registration ID, mandatory if ≥100 employees or processes special-category data of Turkish residents)_ |
@@ -158,7 +158,7 @@ Detail per measure category. Each row maps to ISO 27001:2022 Annex A controls + 
 
 ## 5. Sub-processor list
 
-This list is publicly published at `https://hexxlock.com/legal/subprocessors` and changes are notified to customers with ≥30-day notice per our DPA.
+This list is publicly published at `https://example.com/legal/subprocessors` and changes are notified to customers with ≥30-day notice per our DPA.
 
 | Sub-processor | Role | Region | DPA | SCC 2021 |
 |---|---|---|---|---|
@@ -185,7 +185,7 @@ Any new sub-processor triggers a 30-day customer notice + change-log entry on th
 | Art. 17 erasure | `/api/portal/privacy/delete` with 30-day grace | 30 days from grace expiry |
 | Art. 18 restriction | `/api/portal/privacy/restrict` (todo — currently bulk via §2.7 consent revoke) | 30 days |
 | Art. 20 portability | Same bundle as Art. 15 (JSON, structured machine-readable) | 30 days |
-| Art. 21 objection | `/api/portal/notifications` for marketing; legitimate-interest objections via privacy@hexxlock.com | 30 days |
+| Art. 21 objection | `/api/portal/notifications` for marketing; legitimate-interest objections via privacy@example.com | 30 days |
 | Art. 7(3) consent withdrawal | `/api/portal/notifications` per category | Immediate |
 
 ---
@@ -224,7 +224,7 @@ Out-of-band changes are logged inline in this section with date + author + reaso
 - `docs/compliance/transfer-impact-assessment.md` — full TIA per Schrems II
 - `docs/compliance/data-protection-impact-assessment.md` — DPIA covering high-risk processing activities (Art. 35)
 - `docs/operator-runbooks/incident-response.md` — Art. 33/34 breach notification playbook
-- `https://hexxlock.com/legal/subprocessors` — public sub-processor list with 30-day change notification
+- `https://example.com/legal/subprocessors` — public sub-processor list with 30-day change notification
 
 ---
 

@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
@@ -237,25 +238,13 @@ func (c *Client) CheckPermission(ctx context.Context, tenantID, userID uuid.UUID
 		c.incrementCacheMisses()
 	}
 
-	// Build SpiceDB request
-	req := &v1.CheckPermissionRequest{
-		Resource: &v1.ObjectReference{
-			ObjectType: objectType,
-			ObjectId:   c.tenantScopedID(tenantID, objectID),
-		},
-		Permission: permission,
-		Subject: &v1.SubjectReference{
-			Object: &v1.ObjectReference{
-				ObjectType: spicedbObjectTypeUser,
-				ObjectId:   c.tenantScopedID(tenantID, userID.String()),
-			},
-		},
-		Consistency: &v1.Consistency{
-			Requirement: &v1.Consistency_MinimizeLatency{
-				MinimizeLatency: true,
-			},
-		},
-	}
+	// Build SpiceDB request (check-time caveat context is attached by the helper)
+	req := c.newCheckRequest(
+		&v1.Consistency{Requirement: &v1.Consistency_MinimizeLatency{MinimizeLatency: true}},
+		&v1.ObjectReference{ObjectType: objectType, ObjectId: c.tenantScopedID(tenantID, objectID)},
+		&v1.ObjectReference{ObjectType: spicedbObjectTypeUser, ObjectId: c.tenantScopedID(tenantID, userID.String())},
+		permission,
+	)
 
 	// Record consistency mode
 	RecordConsistencyMode("minimize_latency")
@@ -304,6 +293,31 @@ func (c *Client) CheckRolePermission(ctx context.Context, tenantID, userID uuid.
 	return c.CheckPermission(ctx, tenantID, userID, spicedbObjectTypeTenant, tenantID.String(), permission)
 }
 
+// CheckOutcome is the tri-state result of one SpiceDB check. Allowed is true
+// only for PERMISSIONSHIP_HAS_PERMISSION. Conditional means a caveat could not
+// be decided (required context was not supplied); MissingContext names the
+// caveat parameters that were absent. Errored marks a per-item failure. Every
+// non-Allowed outcome is a deny (fail closed); the extra fields only explain it.
+type CheckOutcome struct {
+	Allowed        bool
+	Conditional    bool
+	Errored        bool
+	MissingContext []string
+}
+
+// outcomeFromPermissionship maps a SpiceDB permissionship (plus its optional
+// partial-caveat info) to a CheckOutcome.
+func outcomeFromPermissionship(p v1.CheckPermissionResponse_Permissionship, partial *v1.PartialCaveatInfo) CheckOutcome {
+	switch p {
+	case v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION:
+		return CheckOutcome{Allowed: true}
+	case v1.CheckPermissionResponse_PERMISSIONSHIP_CONDITIONAL_PERMISSION:
+		return CheckOutcome{Conditional: true, MissingContext: partial.GetMissingRequiredContext()}
+	default:
+		return CheckOutcome{}
+	}
+}
+
 // CheckBulkPermissions checks multiple objects of the same type in a single
 // native SpiceDB CheckBulkPermissions gRPC call.
 // Returns a map of objectID -> allowed.
@@ -314,28 +328,41 @@ func (c *Client) CheckBulkPermissions(
 	objectIDs []string,
 	permission string,
 ) (map[string]bool, error) {
+	detailed, err := c.CheckBulkPermissionsDetailed(ctx, tenantID, userID, objectType, objectIDs, permission)
+	if err != nil {
+		return nil, err
+	}
+	results := make(map[string]bool, len(detailed))
+	for id, o := range detailed {
+		results[id] = o.Allowed
+	}
+	return results, nil
+}
+
+// CheckBulkPermissionsDetailed is CheckBulkPermissions that keeps the reason a
+// check was not allowed (caveat undecided, per-item error) instead of
+// collapsing it to false. Callers must still treat !Allowed as a deny.
+func (c *Client) CheckBulkPermissionsDetailed(
+	ctx context.Context,
+	tenantID, userID uuid.UUID,
+	objectType string,
+	objectIDs []string,
+	permission string,
+) (map[string]CheckOutcome, error) {
 	startTime := time.Now()
 
 	if len(objectIDs) == 0 {
-		return make(map[string]bool), nil
+		return make(map[string]CheckOutcome), nil
 	}
 
 	// Build bulk request items
 	items := make([]*v1.CheckBulkPermissionsRequestItem, len(objectIDs))
 	for i, objID := range objectIDs {
-		items[i] = &v1.CheckBulkPermissionsRequestItem{
-			Resource: &v1.ObjectReference{
-				ObjectType: objectType,
-				ObjectId:   c.tenantScopedID(tenantID, objID),
-			},
-			Permission: permission,
-			Subject: &v1.SubjectReference{
-				Object: &v1.ObjectReference{
-					ObjectType: spicedbObjectTypeUser,
-					ObjectId:   c.tenantScopedID(tenantID, userID.String()),
-				},
-			},
-		}
+		items[i] = c.newCheckBulkItem(
+			&v1.ObjectReference{ObjectType: objectType, ObjectId: c.tenantScopedID(tenantID, objID)},
+			&v1.ObjectReference{ObjectType: spicedbObjectTypeUser, ObjectId: c.tenantScopedID(tenantID, userID.String())},
+			permission,
+		)
 	}
 
 	var resp *v1.CheckBulkPermissionsResponse
@@ -360,10 +387,10 @@ func (c *Client) CheckBulkPermissions(
 	}
 
 	// Parse results — map objectID back to allowed/denied
-	results := make(map[string]bool, len(objectIDs))
+	results := make(map[string]CheckOutcome, len(objectIDs))
 	// Initialize all as denied (fail-closed default)
 	for _, objID := range objectIDs {
-		results[objID] = false
+		results[objID] = CheckOutcome{}
 	}
 
 	if resp != nil && resp.Pairs != nil {
@@ -375,9 +402,10 @@ func (c *Client) CheckBulkPermissions(
 
 			switch r := pair.Response.(type) {
 			case *v1.CheckBulkPermissionsPair_Item:
-				results[objID] = r.Item.Permissionship == v1.CheckPermissionResponse_PERMISSIONSHIP_HAS_PERMISSION
+				results[objID] = outcomeFromPermissionship(r.Item.Permissionship, r.Item.PartialCaveatInfo)
 			case *v1.CheckBulkPermissionsPair_Error:
-				// Per-item error — fail-closed (already false)
+				// Per-item error — fail-closed
+				results[objID] = CheckOutcome{Errored: true}
 				logger.Log.Warn("CheckBulkPermissions per-item error",
 					zap.String("object_id", objID),
 					zap.Int32("error_code", r.Error.GetCode()),
@@ -406,8 +434,24 @@ type PermissionCheck struct {
 	Permission string
 }
 
-// WriteUserRole writes a user-role relationship.
+// WriteUserRole writes a standing (non-expiring) user-role relationship.
 func (c *Client) WriteUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) (string, error) {
+	return c.writeUserRole(ctx, tenantID, userID, roleID, nil)
+}
+
+// WriteUserRoleUntil writes a time-bound (JIT) user-role relationship carrying
+// the active_elevation(now, expires_at) caveat, so the membership stops passing
+// checks the instant expiresAt is reached, independent of the expiry sweeper.
+func (c *Client) WriteUserRoleUntil(ctx context.Context, tenantID, userID, roleID uuid.UUID, expiresAt time.Time) (string, error) {
+	return c.writeUserRole(ctx, tenantID, userID, roleID, &v1.ContextualizedCaveat{
+		CaveatName: spicedbActiveElevationName,
+		Context: &structpb.Struct{Fields: map[string]*structpb.Value{
+			"expires_at": structpb.NewStringValue(expiresAt.UTC().Format(time.RFC3339)),
+		}},
+	})
+}
+
+func (c *Client) writeUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID, caveat *v1.ContextualizedCaveat) (string, error) {
 	startTime := time.Now()
 
 	resp, err := c.spicedb.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{
@@ -426,6 +470,7 @@ func (c *Client) WriteUserRole(ctx context.Context, tenantID, userID, roleID uui
 							ObjectId:   c.tenantScopedID(tenantID, userID.String()),
 						},
 					},
+					OptionalCaveat: caveat,
 				},
 			},
 		},
@@ -517,6 +562,7 @@ func (c *Client) WriteRolePermission(ctx context.Context, tenantID, roleID uuid.
 					},
 					Relation: relation,
 					Subject: &v1.SubjectReference{
+						OptionalRelation: rolePermissionSubjectRelation(objectType, relation),
 						Object: &v1.ObjectReference{
 							ObjectType: spicedbObjectTypeRole,
 							ObjectId:   c.tenantScopedID(tenantID, roleID.String()),
@@ -540,6 +586,14 @@ func (c *Client) WriteRolePermission(ctx context.Context, tenantID, roleID uuid.
 	return token, nil
 }
 
+// The narrow requester module relations take role#member, unlike access_grant's direct role subject.
+func rolePermissionSubjectRelation(objectType, relation string) string {
+	if objectType == "module" && (relation == "maintenance_request_creator" || relation == "maintenance_request_reader" || relation == "legal_entity_reader") {
+		return "member"
+	}
+	return ""
+}
+
 // RolePermissionRelationship identifies one direct role grant in SpiceDB.
 type RolePermissionRelationship struct {
 	RoleID     uuid.UUID
@@ -551,39 +605,45 @@ type RolePermissionRelationship struct {
 // LookupTenantRolePermissions returns direct access-grant relationships for
 // every role in a tenant, including roles since deleted from PostgreSQL.
 func (c *Client) LookupTenantRolePermissions(ctx context.Context, tenantID uuid.UUID) ([]RolePermissionRelationship, error) {
-	stream, err := c.spicedb.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
-		RelationshipFilter: &v1.RelationshipFilter{
-			ResourceType:             "access_grant",
-			OptionalResourceIdPrefix: tenantID.String() + "/",
-			OptionalRelation:         "granted_to_role",
-			OptionalSubjectFilter: &v1.SubjectFilter{
-				SubjectType: spicedbObjectTypeRole,
-			},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to read role permissions: %w", err)
-	}
-
 	var relationships []RolePermissionRelationship
-	for {
-		resp, recvErr := stream.Recv()
-		if recvErr == io.EOF {
-			break
-		}
-		if recvErr != nil {
-			return nil, fmt.Errorf("failed to receive role permissions: %w", recvErr)
-		}
-		roleID, parseErr := uuid.Parse(c.stripTenantPrefix(tenantID, resp.Relationship.Subject.Object.ObjectId))
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid tenant role subject %q: %w", resp.Relationship.Subject.Object.ObjectId, parseErr)
-		}
-		relationships = append(relationships, RolePermissionRelationship{
-			RoleID:     roleID,
-			ObjectType: resp.Relationship.Resource.ObjectType,
-			ObjectID:   c.stripTenantPrefix(tenantID, resp.Relationship.Resource.ObjectId),
-			Relation:   resp.Relationship.Relation,
+	for _, filter := range []struct{ objectType, relation string }{
+		{"access_grant", "granted_to_role"},
+		{"module", "maintenance_request_creator"},
+		{"module", "maintenance_request_reader"},
+		{"module", "legal_entity_reader"},
+	} {
+		stream, err := c.spicedb.ReadRelationships(ctx, &v1.ReadRelationshipsRequest{
+			Consistency: &v1.Consistency{Requirement: &v1.Consistency_FullyConsistent{FullyConsistent: true}},
+			RelationshipFilter: &v1.RelationshipFilter{
+				ResourceType:             filter.objectType,
+				OptionalResourceIdPrefix: tenantID.String() + "/",
+				OptionalRelation:         filter.relation,
+				OptionalSubjectFilter:    &v1.SubjectFilter{SubjectType: spicedbObjectTypeRole},
+			},
 		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to read role permissions: %w", err)
+		}
+
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr == io.EOF {
+				break
+			}
+			if recvErr != nil {
+				return nil, fmt.Errorf("failed to receive role permissions: %w", recvErr)
+			}
+			roleID, parseErr := uuid.Parse(c.stripTenantPrefix(tenantID, resp.Relationship.Subject.Object.ObjectId))
+			if parseErr != nil {
+				return nil, fmt.Errorf("invalid tenant role subject %q: %w", resp.Relationship.Subject.Object.ObjectId, parseErr)
+			}
+			relationships = append(relationships, RolePermissionRelationship{
+				RoleID:     roleID,
+				ObjectType: resp.Relationship.Resource.ObjectType,
+				ObjectID:   c.stripTenantPrefix(tenantID, resp.Relationship.Resource.ObjectId),
+				Relation:   resp.Relationship.Relation,
+			})
+		}
 	}
 	return relationships, nil
 }
@@ -599,7 +659,7 @@ func (c *Client) DeleteRolePermission(ctx context.Context, tenantID, roleID uuid
 					ObjectId:   c.tenantScopedID(tenantID, objectID),
 				},
 				Relation: relation,
-				Subject: &v1.SubjectReference{Object: &v1.ObjectReference{
+				Subject: &v1.SubjectReference{OptionalRelation: rolePermissionSubjectRelation(objectType, relation), Object: &v1.ObjectReference{
 					ObjectType: spicedbObjectTypeRole,
 					ObjectId:   c.tenantScopedID(tenantID, roleID.String()),
 				}},
@@ -733,23 +793,47 @@ func (c *Client) ReplaceUserTenant(ctx context.Context, tenantID, userID uuid.UU
 	return token, nil
 }
 
-// LookupUserRoles finds all roles assigned to a user.
-func (c *Client) LookupUserRoles(ctx context.Context, tenantID, userID uuid.UUID) ([]string, error) {
-	stream, err := c.spicedb.LookupResources(ctx, &v1.LookupResourcesRequest{
-		ResourceObjectType: spicedbObjectTypeRole,
-		Permission:         "member",
-		Subject: &v1.SubjectReference{
-			Object: &v1.ObjectReference{
+// SetTenantGuest touches (present=true) or deletes (present=false) the
+// tenant#guest relation of an external, seat-free member (an accountant
+// invited from their own partner tenant). Deliberately separate from
+// ReplaceUserTenant: guest is never folded into tenant view/manage, so it
+// grants nothing on its own; access comes only from the member's read-only
+// role grants.
+func (c *Client) SetTenantGuest(ctx context.Context, tenantID, userID uuid.UUID, present bool) (string, error) {
+	operation := v1.RelationshipUpdate_OPERATION_DELETE
+	if present {
+		operation = v1.RelationshipUpdate_OPERATION_TOUCH
+	}
+	resp, err := c.spicedb.WriteRelationships(ctx, &v1.WriteRelationshipsRequest{Updates: []*v1.RelationshipUpdate{{
+		Operation: operation,
+		Relationship: &v1.Relationship{
+			Resource: &v1.ObjectReference{ObjectType: spicedbObjectTypeTenant, ObjectId: tenantID.String()},
+			Relation: "guest",
+			Subject: &v1.SubjectReference{Object: &v1.ObjectReference{
 				ObjectType: spicedbObjectTypeUser,
 				ObjectId:   c.tenantScopedID(tenantID, userID.String()),
-			},
+			}},
 		},
-		Consistency: &v1.Consistency{
-			Requirement: &v1.Consistency_MinimizeLatency{
-				MinimizeLatency: true,
-			},
-		},
-	})
+	}}})
+	if err != nil {
+		return "", fmt.Errorf("failed to write tenant guest relationship: %w", err)
+	}
+	c.invalidateUserCache(ctx, tenantID, userID)
+	token := ""
+	if resp != nil && resp.WrittenAt != nil {
+		token = resp.WrittenAt.Token
+	}
+	return token, nil
+}
+
+// LookupUserRoles finds all roles assigned to a user.
+func (c *Client) LookupUserRoles(ctx context.Context, tenantID, userID uuid.UUID) ([]string, error) {
+	stream, err := c.spicedb.LookupResources(ctx, c.newLookupResourcesRequest(
+		&v1.Consistency{Requirement: &v1.Consistency_MinimizeLatency{MinimizeLatency: true}},
+		spicedbObjectTypeRole,
+		"member",
+		&v1.ObjectReference{ObjectType: spicedbObjectTypeUser, ObjectId: c.tenantScopedID(tenantID, userID.String())},
+	))
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup user roles: %w", err)
 	}
@@ -892,6 +976,16 @@ func (c *Client) invalidateUserCache(ctx context.Context, tenantID, userID uuid.
 	c.deleteByPattern(ctx, pattern)
 }
 
+// invalidateUserAllTenantsCache drops a user's cached checks in every tenant.
+// Platform elevation (hxl_platform) is not tenant-scoped, so granting or
+// revoking it can change the user's decision in any tenant.
+func (c *Client) invalidateUserAllTenantsCache(ctx context.Context, userID uuid.UUID) {
+	if c.redis == nil {
+		return
+	}
+	c.deleteByPattern(ctx, fmt.Sprintf("spicedb:check:*:%s:*", userID.String()))
+}
+
 func (c *Client) invalidateRoleCache(ctx context.Context, tenantID, _ uuid.UUID) {
 	if c.redis == nil {
 		return
@@ -1024,20 +1118,12 @@ func (c *Client) CheckPermissionWithConsistency(
 		}
 	}
 
-	req := &v1.CheckPermissionRequest{
-		Resource: &v1.ObjectReference{
-			ObjectType: resourceType,
-			ObjectId:   c.tenantScopedID(tenantID, resourceID),
-		},
-		Permission: permission,
-		Subject: &v1.SubjectReference{
-			Object: &v1.ObjectReference{
-				ObjectType: spicedbObjectTypeUser,
-				ObjectId:   c.tenantScopedID(tenantID, userID.String()),
-			},
-		},
-		Consistency: consistency,
-	}
+	req := c.newCheckRequest(
+		consistency,
+		&v1.ObjectReference{ObjectType: resourceType, ObjectId: c.tenantScopedID(tenantID, resourceID)},
+		&v1.ObjectReference{ObjectType: spicedbObjectTypeUser, ObjectId: c.tenantScopedID(tenantID, userID.String())},
+		permission,
+	)
 
 	var resp *v1.CheckPermissionResponse
 	err := c.runRead(ctx, func(ctx context.Context) error {
@@ -1098,6 +1184,9 @@ func (c *Client) WriteResourceRelationship(
 	if err != nil {
 		return "", fmt.Errorf("failed to write resource relationship: %w", err)
 	}
+
+	// Resource relationships can grant or revoke access for any user in the tenant.
+	c.invalidateRoleCache(ctx, tenantID, uuid.Nil)
 
 	token := ""
 	if resp != nil && resp.WrittenAt != nil {
@@ -1210,5 +1299,6 @@ func (c *Client) DeleteResourceRelationship(
 	if err != nil {
 		return fmt.Errorf("failed to delete resource relationship: %w", err)
 	}
+	c.invalidateRoleCache(ctx, tenantID, uuid.Nil)
 	return nil
 }

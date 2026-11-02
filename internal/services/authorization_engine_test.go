@@ -509,12 +509,15 @@ func TestBatchCheckPermissions_NilUserID_Error(t *testing.T) {
 func TestCheckContextualPermission_OPAEnabled_Allowed(t *testing.T) {
 	mockPermRepo := new(MockPermissionRepository)
 	mockOPA := new(MockOPAService)
-	engine := newTestEngine(mockPermRepo, mockOPA, nil)
+	mockSpiceDB := new(MockSpiceDBChecker)
+	engine := newTestEngine(mockPermRepo, mockOPA, mockSpiceDB)
 
 	userID := uuid.New()
 	tenantID := uuid.New()
 	resourceID := uuid.New().String()
 
+	// OPA is deny-only: a grant still needs ReBAC.
+	mockSpiceDB.On("CheckPermission", mock.Anything, tenantID, userID, "access_grant", "invoicing__invoices__approve", "check").Return(true, nil)
 	mockOPA.On("IsEnabled").Return(true)
 	mockPermRepo.On("GetUserRoles", mock.Anything, userID).Return([]string{"manager"}, nil)
 	mockPermRepo.On("GetUserPermissions", mock.Anything, userID).
@@ -779,8 +782,8 @@ func TestResourceToModulePermission(t *testing.T) {
 		{resourceType: "invoice", action: "edit", expected: "invoicing:invoices:edit"},
 		{resourceType: "contact", action: "delete", expected: "crm:contacts:delete"},
 		{resourceType: "document", action: "view", expected: "documents:documents:view"},
-		{resourceType: "project", action: "edit", expected: "pm:projects:edit"},
-		{resourceType: "task", action: "create", expected: "pm:tasks:create"},
+		{resourceType: "project", action: "edit", expected: "projects:projects:edit"},
+		{resourceType: "task", action: "create", expected: "projects:tasks:create"},
 		{resourceType: "account", action: "view", expected: "accounting:accounts:view"},
 		{resourceType: "lead", action: "manage", expected: "crm:leads:manage"},
 		{resourceType: "unknown", action: "read", expected: "unknown:unknowns:read"},

@@ -32,8 +32,8 @@ import (
 // during the 2026-05-10 audit
 // (docs/audits/2026-05-10-slo-bcl-fcl-regression.md).
 //
-// Per project memory internal engineering notes
-// + internal engineering notes, the
+// Per the operational notes
+// + operational notes, the
 // canonical place for sentinel-row data — including SLO endpoints
 // and token lifetimes — is the Go boot hook, NOT a SQL migration.
 // Boot hooks are:
@@ -277,13 +277,13 @@ func stringPtr(s string) *string {
 // `bootstrapProvisionerOAuthClient` owns its desired state and
 // applies its own m2m TTLs (cmd/oauth_provisioner_bootstrap.go:198-205).
 var oauthClientSLOSeedMatrix = []oauthClientSLOSeedDesired{
-	// Admin-tier IAP (Talon) — sole shipping BCL+FCL receiver for internal.example.com.
+	// Admin-tier IAP (Talon) — sole shipping BCL+FCL receiver for *.internal.example.com.
 	// Receivers: talon !30 + feat/tier1-frontchannel-logout-receiver.
 	{
 		ClientID:                          "svc-talon",
-		BackchannelLogoutURI:              stringPtr("https://internal.example.com/auth/backchannel-logout"),
+		BackchannelLogoutURI:              stringPtr("https://auth.internal.example.com/auth/backchannel-logout"),
 		BackchannelLogoutSessionRequired:  true,
-		FrontchannelLogoutURI:             stringPtr("https://internal.example.com/auth/frontchannel-logout"),
+		FrontchannelLogoutURI:             stringPtr("https://auth.internal.example.com/auth/frontchannel-logout"),
 		FrontchannelLogoutSessionRequired: true,
 		AccessTokenLifetime:               900,
 		IDTokenLifetime:                   900,
@@ -293,9 +293,9 @@ var oauthClientSLOSeedMatrix = []oauthClientSLOSeedDesired{
 	// Receivers: frontend !17 (validateBclClaims with 15 conformance tests).
 	{
 		ClientID:                          "svc-accounts",
-		BackchannelLogoutURI:              stringPtr("https://accounts.hexxlock.com/api/auth/backchannel-logout"),
+		BackchannelLogoutURI:              stringPtr("https://accounts.example.com/api/auth/backchannel-logout"),
 		BackchannelLogoutSessionRequired:  true,
-		FrontchannelLogoutURI:             stringPtr("https://accounts.hexxlock.com/api/auth/frontchannel-logout"),
+		FrontchannelLogoutURI:             stringPtr("https://accounts.example.com/api/auth/frontchannel-logout"),
 		FrontchannelLogoutSessionRequired: true,
 		AccessTokenLifetime:               3600,
 		IDTokenLifetime:                   3600,

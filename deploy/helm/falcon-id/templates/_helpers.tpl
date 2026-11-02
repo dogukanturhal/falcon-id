@@ -23,8 +23,8 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: hexxlock-platform
 app.kubernetes.io/component: identity-plane
-hexxlock.com/environment: {{ .Values.global.environment }}
-hexxlock.com/region: {{ .Values.global.region }}
+example.com/environment: {{ .Values.global.environment }}
+example.com/region: {{ .Values.global.region }}
 {{- end -}}
 
 {{- define "falcon-id.selectorLabels" -}}
@@ -88,6 +88,9 @@ template:
       - name: {{ .Values.global.imagePullSecret }}
     securityContext:
       {{- toYaml .Values.podSecurityContext | nindent 6 }}
+    {{- with .Values.terminationGracePeriodSeconds }}
+    terminationGracePeriodSeconds: {{ . }}
+    {{- end }}
     containers:
       - name: falcon-id
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -131,6 +134,10 @@ template:
           {{- toYaml .Values.livenessProbe | nindent 10 }}
         readinessProbe:
           {{- toYaml .Values.readinessProbe | nindent 10 }}
+        {{- with .Values.lifecycle }}
+        lifecycle:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
         volumeMounts:

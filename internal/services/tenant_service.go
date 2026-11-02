@@ -146,6 +146,7 @@ func (s *TenantService) ListAll(ctx context.Context, page, pageSize int, filters
 			continue
 		}
 		t.UserCount = &userCount
+		t.NamePlaceholder = models.IsPlaceholderTenantName(t.DisplayName)
 		s.decryptTenantOwnerFields(&t, ownerFirstName, ownerLastName, ownerUsername)
 		tenants = append(tenants, t)
 	}

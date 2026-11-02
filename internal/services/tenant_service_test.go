@@ -5,13 +5,16 @@ package services
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
@@ -77,15 +80,49 @@ func (m *MockTenantCache) Del(ctx context.Context, key string) error {
 }
 
 func TestTenantService_ListAll_Success(t *testing.T) {
-	// This test demonstrates the structure but would need full DB mock implementation
-	// For brevity, focusing on key test cases
-	t.Skip("Requires full database mocking - see integration tests instead")
+	service, id := tenantReadFixture(t)
+	rows, total, err := service.ListAll(context.Background(), 1, 10, models.TenantFilters{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, rows, 1)
+	require.Equal(t, id, rows[0].ID)
 }
 
 func TestTenantService_GetByID_Success(t *testing.T) {
-	// Note: Full DB mocking is complex. This shows the test structure.
-	// In practice, use integration tests with test database for repository/service tests
-	t.Skip("Requires full database mocking - see integration tests instead")
+	service, id := tenantReadFixture(t)
+	row, err := service.GetByID(context.Background(), id)
+	require.NoError(t, err)
+	require.Equal(t, id, row.ID)
+	require.EqualValues(t, 0, *row.UserCount)
+}
+
+// Real SQL replaces the pre-existing placeholder skips. It uses an isolated
+// schema in a throwaway database, never any tenant/operator credentials.
+func tenantReadFixture(t *testing.T) (*TenantService, uuid.UUID) {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL required")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	schema := "tenant_read_" + uuid.NewString()[:8]
+	quoted := pgx.Identifier{schema}.Sanitize()
+	_, err = admin.Exec(ctx, `CREATE SCHEMA `+quoted+`; SET search_path = `+quoted+`;
+	CREATE TABLE iam_tenants(id uuid PRIMARY KEY,name text,slug text,display_name text,domain text,status text,billing_exempt boolean,billing_email text,max_users int DEFAULT 10,max_storage bigint DEFAULT 100,trial_ends_at timestamptz,created_at timestamptz DEFAULT now(),updated_at timestamptz DEFAULT now(),suspended_at timestamptz,cancelled_at timestamptz);
+	CREATE TABLE iam_users(id uuid,tenant_id uuid,email text,username text,first_name text,last_name text,is_active boolean,created_at timestamptz);`)
+	require.NoError(t, err)
+	id := uuid.New()
+	_, err = admin.Exec(ctx, `INSERT INTO `+quoted+`.iam_tenants(id,name,slug,display_name,status) VALUES($1,'Test tenant','test-tenant','Test tenant','active')`, id)
+	require.NoError(t, err)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { pool.Close(); _, _ = admin.Exec(ctx, "DROP SCHEMA "+quoted+" CASCADE"); admin.Close() })
+	return NewTenantService(pool, zap.NewNop()), id
 }
 
 func TestTenantService_Suspend_Success(t *testing.T) {

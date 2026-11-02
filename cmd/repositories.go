@@ -14,6 +14,7 @@ type Repositories struct {
 	User               *repositories.UserRepository
 	Role               *repositories.RoleRepository
 	Permission         *repositories.PermissionRepository
+	RoleTemplate       *repositories.RoleTemplateRepository
 	Session            *repositories.SessionRepository
 	Token              *repositories.TokenRepository
 	IDP                *repositories.IdentityProviderRepository
@@ -48,6 +49,9 @@ type Repositories struct {
 	Realm              *repositories.RealmRepository
 	RealmForContext    *repositories.RealmRepository
 	TenantConfig       *repositories.TenantConfigRepository
+	// ADR-A10 SoD (Separation of Duties) rule matrix + violations
+	// (migration 0015).
+	SoD *repositories.SoDRepository
 	// Product & licensing
 	Product         *repositories.ProductRepository
 	License         *repositories.LicenseRepository
@@ -68,10 +72,17 @@ type Repositories struct {
 	RegistrationPolicy *repositories.RegistrationPolicyRepository
 	BootstrapToken     *repositories.BootstrapTokenRepository
 	// Identity & access
-	Delegation          *repositories.DelegationRepository
-	TempAccessPass      *repositories.TempAccessPassRepository
-	GuestUser           *repositories.GuestUserRepository
-	JITAccess           *repositories.JITAccessRepository
+	Delegation     *repositories.DelegationRepository
+	TempAccessPass *repositories.TempAccessPassRepository
+	GuestUser      *repositories.GuestUserRepository
+	JITAccess      *repositories.JITAccessRepository
+	JITEligible    *repositories.JITEligibleRepository
+	// PlatformElevation — R1 platform plane: JIT elevation + break-glass
+	// (iam_platform_roles / iam_jit_elevations, migration 0016).
+	PlatformElevation *repositories.PlatformElevationRepository
+	// PlatformAuthority — live iam_platform_roles reads (OPS_STRICT_PLATFORM_ROLES,
+	// operator token exchange, legacy-admin report).
+	PlatformAuthority   *repositories.PlatformAuthorityRepository
 	AccessReview        *repositories.AccessReviewRepository
 	EmailDomainRegistry *repositories.EmailDomainRegistryRepository
 	TenantBranding      *repositories.TenantBrandingRepository
@@ -120,11 +131,18 @@ type Repositories struct {
 	// AgentIdentity backs the AI-agent identity lifecycle surface
 	// (/api/v1/platform/agents/*). Distinct from ServiceAccount —
 	// agents are autonomous human-attended automation principals
-	// (think GitHub Actions, Claude-driven workflows), not
+	// (think GitHub Actions, agent-driven workflows), not
 	// service-to-service auth.
 	AgentIdentity *repositories.AgentIdentityRepository
 	// TeamInvitation — Phase 2 Team page invite/RSVP workflow.
 	TeamInvitation *repositories.TeamInvitationRepository
+	// UserMembership — tenant<->user membership + seat_class ledger
+	// (iam_user_memberships, migration 0013). Seat-counting source of truth.
+	UserMembership *repositories.UserMembershipRepository
+	HREmploymentSync *repositories.HREmploymentSyncRepository
+	// SeatCounter — race-free tenant_seat_counters reservation counter
+	// (migration 0013). See internal/repositories/seat_counter_repository.go.
+	SeatCounter *repositories.SeatCounterRepository
 	// IAMDevices — ZTNA Phase 3 device-cert enrollment registry.
 	// Introduced by migration 0004_iam_devices.sql (falcon-id!284) and
 	// the repository layer (falcon-id!285). Used by IAMDevicesHandler
@@ -138,6 +156,15 @@ type Repositories struct {
 	// reserved). Migration 0005_user_recovery_methods.sql. Backs the
 	// self-service /users/me/recovery endpoints via RecoveryService.
 	Recovery *repositories.RecoveryRepository
+	// ModuleEntitlement backs iam_tenant_module_entitlements +
+	// iam_tenant_entitlement_flags (migration
+	// 0014_iam_tenant_module_entitlements.sql, the product roadmap §4.1). Fed
+	// by the example.tenant.modules.sync Kafka consumer
+	// (internal/entitlementsync) and PUT
+	// /internal/v1/tenants/{id}/module-entitlements, read by GET
+	// /api/v1/tenant/entitlements via
+	// services.TenantEntitlementService.
+	ModuleEntitlement *repositories.ModuleEntitlementRepository
 }
 
 // initRepositories initializes all repositories.
@@ -147,6 +174,8 @@ func initRepositories(infra *Infrastructure) *Repositories {
 		User:               repositories.NewUserRepository(infra.DB.Pool),
 		Role:               repositories.NewRoleRepository(infra.DB.Pool),
 		Permission:         repositories.NewPermissionRepository(infra.DB.Pool),
+		RoleTemplate:       repositories.NewRoleTemplateRepository(infra.DB.Pool),
+		SoD:                repositories.NewSoDRepository(infra.DB.Pool),
 		Session:            repositories.NewSessionRepository(infra.DB.Pool),
 		Token:              repositories.NewTokenRepository(infra.DB.Pool),
 		IDP:                repositories.NewIdentityProviderRepository(infra.DB.Pool),
@@ -179,6 +208,7 @@ func initRepositories(infra *Infrastructure) *Repositories {
 		IPRule:             repositories.NewIPRuleRepository(infra.DB.Pool),
 		StepUpVerification: repositories.NewStepUpVerificationRepository(infra.DB.Pool),
 		AppAccess:          repositories.NewAppAccessRepository(infra.DB.Pool),
+		ModuleEntitlement:  repositories.NewModuleEntitlementRepository(infra.DB.Pool),
 		// Product & licensing
 		Product:         repositories.NewProductRepository(infra.DB.Pool),
 		License:         repositories.NewLicenseRepository(infra.DB.Pool),
@@ -203,6 +233,9 @@ func initRepositories(infra *Infrastructure) *Repositories {
 		TempAccessPass:             repositories.NewTempAccessPassRepository(infra.DB.Pool),
 		GuestUser:                  repositories.NewGuestUserRepository(infra.DB.Pool),
 		JITAccess:                  repositories.NewJITAccessRepository(infra.DB.Pool),
+		JITEligible:                repositories.NewJITEligibleRepository(infra.DB.Pool),
+		PlatformElevation:          repositories.NewPlatformElevationRepository(infra.DB.Pool),
+		PlatformAuthority:          repositories.NewPlatformAuthorityRepository(infra.DB.Pool),
 		AccessReview:               repositories.NewAccessReviewRepository(infra.DB.Pool),
 		EmailDomainRegistry:        repositories.NewEmailDomainRegistryRepository(infra.DB.Pool),
 		TenantBranding:             repositories.NewTenantBrandingRepository(infra.DB.Pool),
@@ -241,6 +274,9 @@ func initRepositories(infra *Infrastructure) *Repositories {
 		// AI-agent identity lifecycle store
 		AgentIdentity:  repositories.NewAgentIdentityRepository(infra.DB.Pool),
 		TeamInvitation: repositories.NewTeamInvitationRepository(infra.DB.Pool),
+		UserMembership: repositories.NewUserMembershipRepository(infra.DB.Pool),
+		HREmploymentSync: repositories.NewHREmploymentSyncRepository(infra.DB.Pool),
+		SeatCounter:    repositories.NewSeatCounterRepository(infra.DB.Pool),
 		// ZTNA Phase 3 — device-cert enrollment registry (ADR 0043).
 		IAMDevices: repositories.NewIAMDevicesRepository(infra.DB.Pool),
 		// Corporate device pre-registration allowlist (migration 0007).

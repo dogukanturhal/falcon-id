@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -124,7 +125,19 @@ func bootstrapAdminUser(services *Services, repos *Repositories) {
 	// Assign platform_admin and iam_admin roles.
 	// GetByName returns a single role; call it twice to keep the repository
 	// interface unchanged (no GetByNames batch method exists).
+	//
+	// OPS_STRICT_PLATFORM_ROLES: standing platform_admin / iam_admin is
+	// reserved for the single break-glass account (OPS_BREAK_GLASS_EMAIL;
+	// unset = the account created from FALCON_ADMIN_EMAIL). Any other
+	// bootstrap account is created without them and gets platform authority
+	// through JIT elevation only.
 	roleNames := []string{"platform_admin", "iam_admin"}
+	if opsStrictPlatformRoles() && !isBreakGlassBootstrap(adminEmail) {
+		logger.Warn("bootstrapAdminUser: OPS_STRICT_PLATFORM_ROLES is on and this account is not the break-glass account; not assigning standing platform_admin/iam_admin",
+			zap.String("email", adminEmail),
+		)
+		roleNames = nil
+	}
 	var roleIDs []uuid.UUID
 	for _, name := range roleNames {
 		role, roleErr := repos.Role.GetByName(ctx, tenantID, name)
@@ -161,6 +174,19 @@ func bootstrapAdminUser(services *Services, repos *Repositories) {
 		zap.String("user_id", user.ID.String()),
 		zap.String("tenant", "exampletenant"),
 	)
+}
+
+// opsStrictPlatformRoles reads OPS_STRICT_PLATFORM_ROLES (default false).
+func opsStrictPlatformRoles() bool {
+	v, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("OPS_STRICT_PLATFORM_ROLES")))
+	return err == nil && v
+}
+
+// isBreakGlassBootstrap reports whether email is the break-glass account:
+// OPS_BREAK_GLASS_EMAIL when set, otherwise the FALCON_ADMIN_EMAIL account.
+func isBreakGlassBootstrap(email string) bool {
+	bg := strings.TrimSpace(os.Getenv("OPS_BREAK_GLASS_EMAIL"))
+	return bg == "" || strings.EqualFold(bg, strings.TrimSpace(email))
 }
 
 // extractUsernameFromEmail derives a username from an email address by taking

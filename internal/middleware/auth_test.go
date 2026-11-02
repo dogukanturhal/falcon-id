@@ -900,3 +900,29 @@ func TestOptionalAuth_MalformedScheme_StillCallsNext(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.True(t, reached)
 }
+
+// A tenant API key token (type=api_key) is signed by the same provider key but
+// is not meant for falcon-id; RequireAuth must answer 401.
+func TestRequireAuth_APIKeyToken_Returns401(t *testing.T) {
+	cfg := authTestConfig()
+	m := NewAuthMiddleware(newAuthTestTokenService(cfg), cfg)
+	router := newAuthRouter(m)
+
+	keyID := uuid.New()
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iss": cfg.JWTIssuer, "aud": jwt.ClaimStrings{"business-api"},
+		"iat": now.Unix(), "nbf": now.Unix(), "exp": now.Add(10 * time.Minute).Unix(),
+		"jti": uuid.NewString(), "sub": keyID.String(), "tenant_id": uuid.NewString(),
+		"type": services.APIKeyTokenType, "api_key_id": keyID.String(), "scope": "erp.read",
+	}
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(cfg.JWTSecret))
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	router.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}

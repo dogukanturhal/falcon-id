@@ -20,7 +20,7 @@ func setupTestRouter() (*gin.Engine, *Middleware) {
 	router := gin.New()
 
 	config := &Config{
-		InternalAPIKey: "test-api-key-12345", // gitleaks:allow — test fixture, not a real credential
+		InternalAPIKey: "test-api-key-12345",
 		JWTSecret:      "test-secret-key",
 	}
 	middleware := NewMiddleware(config)

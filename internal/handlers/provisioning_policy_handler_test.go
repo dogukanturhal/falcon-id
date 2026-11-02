@@ -39,17 +39,13 @@ func TestProvisioningPolicyHandler_EvaluatePolicy_RejectsInvalidJSON(t *testing.
 }
 
 func TestProvisioningPolicyHandler_EvaluatePolicy_EmptyBody(t *testing.T) {
-	// Empty body is invalid because PolicyInput likely requires
-	// at least a tenant_id / plan / region — the JSON parse may
-	// succeed but the engine call would surface as nil-deref
-	// without the real engine. Test passes a nil engine and
-	// expects the panic to be caught by the test runner, OR a
-	// JSON-decode error if Content-Type/body shape is rejected
-	// early. ShouldBindJSON on an empty body succeeds with the
-	// zero PolicyInput, so this path WILL reach the engine —
-	// which is nil — and panic. Skip this test path; the
-	// invalid-JSON path above already proves the parse gate.
-	t.Skip("empty-body path reaches the engine; covered by service-side PolicyEngine tests")
+	// An actually empty stream is EOF, not the valid JSON object {}.
+	h := NewProvisioningPolicyHandler(nil, zap.NewNop())
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/policy/evaluate", nil)
+	h.EvaluatePolicy(c)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 func TestProvisioningPolicyHandler_ListRules_PanicWithoutEngine(t *testing.T) {

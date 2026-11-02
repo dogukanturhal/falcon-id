@@ -18,7 +18,7 @@ metadata:
   name: {{ include "falcon-id.fullname" $ }}-pprof-{{ $sa.namespace }}-{{ $sa.name }}
   labels:
     {{- include "falcon-id.labels" $ | nindent 4 }}
-    falcon-id.hexxlock.com/surface: pprof
+    falcon-id.example.com/surface: pprof
 spec:
   targetRef:
     group: policy.linkerd.io

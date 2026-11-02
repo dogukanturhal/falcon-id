@@ -3,12 +3,23 @@ services:
     build: .
     ports:
       - "8010:8010"
-    env_file: .env
+    env_file:
+      - .env.example
+      - path: .env
+        required: false
+    # Container-network addresses; these override localhost values from .env.
+    environment:
+      DATABASE_URL: postgres://falcon:falcon_dev@postgres:5432/falcon_id?sslmode=disable
+      CONTROL_PLANE_DATABASE_URL: postgres://falcon:falcon_dev@postgres:5432/falcon_id_control?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      SPICEDB_ENDPOINT: spicedb:50051
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      spicedb-schema:
+        condition: service_completed_successfully
 
   postgres:
     image: postgres:16-alpine
@@ -20,11 +31,36 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Schema baseline, loaded on first start only (see hack/schema/README.md).
+      - ./hack/schema:/schema:ro
+      - ./hack/schema/docker-init.sh:/docker-entrypoint-initdb.d/10-falcon-schema.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U falcon"]
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # In-memory SpiceDB for local use; state is lost on restart.
+  spicedb:
+    image: authzed/spicedb:v1.35.1
+    command: serve --grpc-preshared-key dev-spicedb-preshared-key --datastore-engine memory
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  spicedb-schema:
+    image: authzed/zed:v1.2.1
+    command: >
+      --endpoint spicedb:50051 --token dev-spicedb-preshared-key --insecure
+      schema write /schema/spicedb.zed
+    volumes:
+      - ./deploy/helm/spicedb-schema/files:/schema:ro
+    depends_on:
+      spicedb:
+        condition: service_healthy
+    restart: "no"
 
   redis:
     image: redis:7-alpine

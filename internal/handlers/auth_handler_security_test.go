@@ -38,18 +38,18 @@ func TestGetCookieDomain(t *testing.T) {
 		},
 		{
 			name:     "production domain returns domain",
-			host:     "api.hexxlock.com",
-			expected: "api.hexxlock.com",
+			host:     "api.example.com",
+			expected: "api.example.com",
 		},
 		{
 			name:     "production domain with port returns domain without port",
-			host:     "api.hexxlock.com:443",
-			expected: "api.hexxlock.com",
+			host:     "api.example.com:443",
+			expected: "api.example.com",
 		},
 		{
 			name:     "subdomain returns full domain",
-			host:     "tenant.hexxlock.com",
-			expected: "tenant.hexxlock.com",
+			host:     "tenant.example.com",
+			expected: "tenant.example.com",
 		},
 	}
 

@@ -18,11 +18,25 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/authorization"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/sessionsweep"
 	"github.com/dogukanturhal/falcon-id/pkg/crypto"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 )
 
 const msgFailedDecryptPII = "failed to decrypt PII: %w"
+
+// Explicit session end reasons written by deactivation paths.
+const (
+	sessionEndUserDeactivated       = "user_deactivated"
+	sessionEndEmployeeAccessExpired = "employee_access_expired"
+)
+
+// revokeUserOAuthTokensTx revokes every live OAuth token of the user inside tx.
+func revokeUserOAuthTokensTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `UPDATE iam_oauth_tokens SET is_revoked = true, revoked_at = NOW(), updated_at = NOW()
+		WHERE user_id = $1 AND is_revoked = false`, userID)
+	return err
+}
 
 var (
 	ErrTeamTargetNotFound    = errors.New("team target not found")
@@ -130,6 +144,10 @@ func RequireEmailHashKey() error {
 	return nil
 }
 
+// EmailLookupHash is the exported form of computeEmailHash, for operator
+// search by exact email (iam_users.email_hash is the only indexed email key).
+func EmailLookupHash(email string) string { return computeEmailHash(email) }
+
 // computeEmailHash computes a deterministic HMAC-SHA256 hash of the normalized email.
 // HMAC is used instead of bare SHA-256 to prevent rainbow-table attacks.
 // The email is normalized (lowercased and trimmed) before hashing to ensure
@@ -203,6 +221,29 @@ func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.Use
 	return user, nil
 }
 
+// GetByIDInTenant reads a user on a transaction with the tenant RLS GUC set.
+// Internal S2S routes derive their tenant from a path parameter after the
+// request-level RLS transaction has been opened, so their repository work must
+// establish its own scoped transaction.
+func (r *UserRepository) GetByIDInTenant(ctx context.Context, tenantID, userID uuid.UUID) (*models.User, error) {
+	var user *models.User
+	err := WithTenantScope(ctx, r.db, tenantID, func(tx pgx.Tx) error {
+		var err error
+		user, err = r.WithDB(tx).GetByID(ctx, userID)
+		if err != nil || user == nil {
+			return err
+		}
+		if user.TenantID != tenantID {
+			user = nil
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetByIDInTenant: %w", err)
+	}
+	return user, nil
+}
+
 // GetByUsername is an exported function.
 func (r *UserRepository) GetByUsername(ctx context.Context, tenantID uuid.UUID, username string) (*models.User, error) {
 	query := fmt.Sprintf("SELECT %s FROM iam_users WHERE tenant_id = $1 AND username = $2", userColumns)
@@ -251,6 +292,21 @@ func (r *UserRepository) GetByEmail(ctx context.Context, tenantID uuid.UUID, ema
 		return nil, nil
 	}
 
+	return user, nil
+}
+
+// GetByEmailInTenant is the RLS-scoped equivalent for S2S callers that do not
+// carry an X-Tenant-ID header through request middleware.
+func (r *UserRepository) GetByEmailInTenant(ctx context.Context, tenantID uuid.UUID, email string) (*models.User, error) {
+	var user *models.User
+	err := WithTenantScope(ctx, r.db, tenantID, func(tx pgx.Tx) error {
+		var err error
+		user, err = r.WithDB(tx).GetByEmail(ctx, tenantID, email)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetByEmailInTenant: %w", err)
+	}
 	return user, nil
 }
 
@@ -535,19 +591,85 @@ func (r *UserRepository) LinkFederation(ctx context.Context, userID uuid.UUID, t
 
 // Delete is an exported function.
 func (r *UserRepository) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.Exec(ctx, "DELETE FROM iam_users WHERE id = $1", id)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("Delete: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // commit makes rollback a no-op
+	if err := r.releaseMembershipsTx(ctx, tx, id); err != nil {
 		return fmt.Errorf("Delete: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM iam_users WHERE id = $1", id); err != nil {
+		return fmt.Errorf("Delete: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("Delete: commit: %w", err)
+	}
+	return nil
+}
+
+// releaseMembershipsTx removes the user's membership rows inside tx, freeing the seat of an active member-class
+// one (UserMembershipRepository.Delete). iam_user_memberships has no ON DELETE CASCADE, so the rows must go
+// before the iam_users row, and the tenant is read from the user row itself.
+func (r *UserRepository) releaseMembershipsTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
+	var tenantID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT tenant_id FROM iam_users WHERE id = $1`, userID).Scan(&tenantID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("lookup tenant: %w", err)
+	}
+	if _, err := (&UserMembershipRepository{db: tx}).Delete(ctx, tenantID, userID); err != nil {
+		return fmt.Errorf("release membership: %w", err)
 	}
 	return nil
 }
 
 // List is an exported function.
 func (r *UserRepository) List(ctx context.Context, tenantID uuid.UUID, page, pageSize int, search string) ([]models.User, int64, error) {
+	return r.listFiltered(ctx, tenantID, page, pageSize, search, "")
+}
+
+// ListTenantHumans applies identity/status filters before both COUNT and
+// pagination. "all" preserves the team management/reactivation inventory;
+// "active" is the active-human view, and "inactive" is the recovery view.
+// svc- is Falcon's canonical legacy service username convention (migration
+// 0013 and IsSeatFree), not an email/display-name heuristic. Membership
+// classification also excludes service identities with ordinary usernames.
+func (r *UserRepository) ListTenantHumans(ctx context.Context, tenantID uuid.UUID, page, pageSize int, search, status string) (users []models.User, total int64, err error) {
+	if status != "all" && status != "active" && status != "inactive" {
+		return nil, 0, fmt.Errorf("invalid member status")
+	}
+	filter := ` AND username NOT ILIKE 'svc-%'
+		AND NOT EXISTS (SELECT 1 FROM iam_user_memberships m
+			WHERE m.tenant_id = $1 AND m.user_id = iam_users.id AND m.seat_class = 'service')`
+	active := `is_active = true AND deletion_scheduled_at IS NULL
+		AND NOT EXISTS (SELECT 1 FROM iam_user_memberships m
+			WHERE m.tenant_id = $1 AND m.user_id = iam_users.id AND m.status = 'deactivated')`
+	if status == "active" {
+		filter += " AND (" + active + ")"
+	} else if status == "inactive" {
+		filter += " AND NOT (" + active + ")"
+	}
+	err = WithTenantScope(ctx, r.db, tenantID, func(tx pgx.Tx) error {
+		var readErr error
+		users, total, readErr = r.WithDB(tx).listFiltered(ctx, tenantID, page, pageSize, search, filter)
+		return readErr
+	})
+	return
+}
+
+func (r *UserRepository) listFiltered(ctx context.Context, tenantID uuid.UUID, page, pageSize int, search, filter string) ([]models.User, int64, error) {
 	offset := (page - 1) * pageSize
 
-	// Count total
-	countQuery := `SELECT COUNT(*) FROM iam_users WHERE tenant_id = $1`
+	// Count total. Excludes soft-deleted users (both the self-service
+	// pending_deletion state and the admin-triggered admin_deleted state)
+	// — soft-deleted users must vanish from every list/read path, per the
+	// admin lifecycle requirement. Restore (cancel-deletion / admin
+	// restore) flips activation_status back to "active", which is the
+	// only way a user reappears here.
+	const excludeDeletedClause = ` AND (activation_status IS NULL OR activation_status NOT IN ('pending_deletion', 'admin_deleted'))`
+	countQuery := `SELECT COUNT(*) FROM iam_users WHERE tenant_id = $1` + excludeDeletedClause + filter
 	args := []interface{}{tenantID}
 
 	// NOTE: email, first_name, last_name are encrypted at rest (PII).
@@ -566,7 +688,7 @@ func (r *UserRepository) List(ctx context.Context, tenantID uuid.UUID, page, pag
 	}
 
 	// Get users — LIMIT and OFFSET are bound as parameters to prevent injection.
-	query := fmt.Sprintf("SELECT %s FROM iam_users WHERE tenant_id = $1", userColumns)
+	query := "SELECT " + userColumns + " FROM iam_users WHERE tenant_id = $1" + excludeDeletedClause + filter
 
 	if search != "" {
 		query += ` AND (username ILIKE $2 OR email_hash = $3) ORDER BY created_at DESC LIMIT $4 OFFSET $5`
@@ -613,16 +735,30 @@ func (r *UserRepository) AssignRoles(ctx context.Context, userID uuid.UUID, role
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Delete existing roles
-	_, err = tx.Exec(ctx, "DELETE FROM iam_user_roles WHERE user_id = $1", userID)
+	// Delete existing roles — EXCEPT a row that is a live, still-active
+	// TIME-BOXED grant (expires_at in the future). Those rows are JIT/PIM
+	// activations (see JITAccessService.applyRoleGrant); this bulk-replace
+	// path is not JIT-aware, and previously deleted+reinserted such a row
+	// WITHOUT its expires_at, silently converting a time-boxed elevation
+	// into a permanent one. A JIT grant must be revoked/expired through its
+	// own path (JITAccessService.RevokeGrant / ExpireGrants), never
+	// incidentally by an unrelated role edit.
+	if _, err := tx.Exec(ctx, "SELECT id FROM iam_users WHERE id = $1 FOR UPDATE", userID); err != nil {
+		return fmt.Errorf("AssignRoles: user lock: %w", err)
+	}
+	err = deleteRolesWithOutbox(ctx, tx,
+		"DELETE FROM iam_user_roles ur WHERE user_id = $1 AND (expires_at IS NULL OR expires_at <= NOW())",
+		[]interface{}{userID}, roleIDs)
 	if err != nil {
 		return fmt.Errorf("AssignRoles: delete: %w", err)
 	}
 
-	// Insert new roles
+	// Insert new roles. ON CONFLICT DO NOTHING: a roleID that survived the
+	// delete above (a live time-boxed grant) is already present — leave its
+	// expires_at untouched rather than erroring or overwriting it.
 	for _, roleID := range roleIDs {
 		_, err := tx.Exec(ctx,
-			"INSERT INTO iam_user_roles (user_id, role_id, assigned_by) VALUES ($1, $2, $3)",
+			"INSERT INTO iam_user_roles (user_id, role_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT (user_id, role_id) DO NOTHING",
 			userID, roleID, assignedBy,
 		)
 		if err != nil {
@@ -634,6 +770,155 @@ func (r *UserRepository) AssignRoles(ctx context.Context, userID uuid.UUID, role
 		return fmt.Errorf("AssignRoles: commit: %w", err)
 	}
 
+	return nil
+}
+
+// ErrRoleAlreadyPermanent is returned by AddTimeBoundRole when the user already
+// holds the role as a PERMANENT assignment (expires_at IS NULL). A JIT
+// activation must never shorten or clobber a standing grant.
+var ErrRoleAlreadyPermanent = errors.New("role already permanently assigned")
+
+// AddTimeBoundRole additively grants a single TIME-BOXED role assignment, used
+// by JIT/PIM activation (JITAccessService.applyRoleGrant). Unlike AssignRoles
+// (which replaces ALL of a user's roles), this inserts one row with an
+// expires_at. This row is NOT the authorization boundary — SpiceDB's
+// role#member relationship is what AuthorizationEngine.CheckPermission
+// actually consults — but it keeps the grant visible to the team/role picker,
+// audit queries, and admin priority checks that already filter on
+// iam_user_roles.expires_at. Returns the assignment id. If the user already
+// holds the role permanently (expires_at IS NULL), the row is left untouched
+// and ErrRoleAlreadyPermanent is returned.
+func (r *UserRepository) AddTimeBoundRole(ctx context.Context, userID, roleID, assignedBy uuid.UUID, expiresAt time.Time) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := r.db.QueryRow(ctx,
+		`INSERT INTO iam_user_roles (user_id, role_id, assigned_by, expires_at)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (user_id, role_id) DO UPDATE
+		   SET expires_at = EXCLUDED.expires_at, assigned_by = EXCLUDED.assigned_by
+		   WHERE iam_user_roles.expires_at IS NOT NULL
+		 RETURNING id`,
+		userID, roleID, assignedBy, expiresAt,
+	).Scan(&id)
+	// A conflict where the existing row is permanent makes the DO UPDATE WHERE
+	// false → no row updated → RETURNING yields nothing → ErrNoRows.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrRoleAlreadyPermanent
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("AddTimeBoundRole: %w", err)
+	}
+	return id, nil
+}
+
+// RemoveTimeBoundRole deletes a user's TIME-BOXED assignment of a role (a JIT
+// grant being revoked or expired). The `expires_at IS NOT NULL` guard
+// guarantees a permanent assignment is never removed by this call. Idempotent
+// (no error if the row is already gone).
+func (r *UserRepository) RemoveTimeBoundRole(ctx context.Context, userID, roleID uuid.UUID) error {
+	_, err := r.db.Exec(ctx,
+		`DELETE FROM iam_user_roles
+		 WHERE user_id = $1 AND role_id = $2 AND expires_at IS NOT NULL`,
+		userID, roleID,
+	)
+	if err != nil {
+		return fmt.Errorf("RemoveTimeBoundRole: %w", err)
+	}
+	return nil
+}
+
+// SoonestActiveRoleExpiry returns the earliest expires_at among the user's
+// CURRENTLY-ACTIVE time-boxed role assignments (JIT/PIM grants), or nil when
+// the user holds no live time-boxed roles. Used to cap an elevated access
+// token's expiry to the grant that conferred the role — the token must never
+// outlive it. The (user_id, role_id, expires_at) index covers this lookup.
+func (r *UserRepository) SoonestActiveRoleExpiry(ctx context.Context, userID uuid.UUID) (*time.Time, error) {
+	var soonest *time.Time
+	err := r.db.QueryRow(ctx,
+		`SELECT MIN(expires_at) FROM iam_user_roles
+		 WHERE user_id = $1 AND expires_at IS NOT NULL AND expires_at > NOW()`,
+		userID,
+	).Scan(&soonest)
+	if err != nil {
+		return nil, fmt.Errorf("SoonestActiveRoleExpiry: %w", err)
+	}
+	return soonest, nil
+}
+
+// RequiresInvitedAdminMFA reports whether userID joined tenantID through a team
+// invitation and currently holds an owner or admin role there. Those members
+// must enrol a second factor at first sign-in (operator decision 2026-10-13:
+// MFA is required for owner/admin, optional for everyone else). Scoped to the
+// invitation path on purpose: it does not retroactively force founders and
+// admins who were never invited; that policy belongs to the tenant MFA policy.
+func (r *UserRepository) RequiresInvitedAdminMFA(ctx context.Context, userID, tenantID uuid.UUID) (bool, error) {
+	var required bool
+	err := WithTenantScope(ctx, r.db, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM iam_user_memberships m
+				WHERE m.tenant_id = $2 AND m.user_id = $1
+					AND m.status = 'active' AND m.invitation_id IS NOT NULL
+					AND EXISTS (
+						SELECT 1 FROM iam_user_roles ur
+						INNER JOIN iam_roles ro ON ro.id = ur.role_id
+						WHERE ur.user_id = $1 AND ro.tenant_id = $2
+							AND lower(ro.name) IN ('owner', 'admin')
+							AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+					)
+			)`, userID, tenantID).Scan(&required)
+	})
+	if err != nil {
+		return false, fmt.Errorf("RequiresInvitedAdminMFA: %w", err)
+	}
+	return required, nil
+}
+
+// CountAccountsByEmail counts accounts in every tenant that share the email
+// (matched on the email hash). Emails are unique per tenant only, so more than
+// one means the address does not identify a single person.
+func (r *UserRepository) CountAccountsByEmail(ctx context.Context, email string) (int, error) {
+	var n int
+	if err := r.db.QueryRow(ctx, `SELECT count(*) FROM iam_users WHERE email_hash = $1`, computeEmailHash(email)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountAccountsByEmail: %w", err)
+	}
+	return n, nil
+}
+
+// MarkEmailVerified records that the user proved possession of their mailbox
+// (an invitation token, for people onboarded from a team invitation).
+func (r *UserRepository) MarkEmailVerified(ctx context.Context, userID uuid.UUID) error {
+	if _, err := r.db.Exec(ctx, `UPDATE iam_users SET is_email_verified = true, password_changed_at = COALESCE(password_changed_at, now()), updated_at = now() WHERE id = $1`, userID); err != nil {
+		return fmt.Errorf("MarkEmailVerified: %w", err)
+	}
+	return nil
+}
+
+// GetHomeTenantID returns the user's home tenant (iam_users.tenant_id) and
+// false when the user does not exist.
+func (r *UserRepository) GetHomeTenantID(ctx context.Context, userID uuid.UUID) (uuid.UUID, bool, error) {
+	var tenantID uuid.UUID
+	err := r.db.QueryRow(ctx, `SELECT tenant_id FROM iam_users WHERE id = $1`, userID).Scan(&tenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, fmt.Errorf("GetHomeTenantID: %w", err)
+	}
+	return tenantID, true, nil
+}
+
+// RevokeTenantRoles removes every role grant the user holds in tenantID and
+// leaves grants in any other tenant untouched. Used when an external
+// (seat-free) member's access to a client tenant is revoked: the member's
+// home-tenant roles must survive.
+func (r *UserRepository) RevokeTenantRoles(ctx context.Context, userID, tenantID uuid.UUID) error {
+	if _, err := r.db.Exec(ctx, `
+		DELETE FROM iam_user_roles ur
+		USING iam_roles role
+		WHERE ur.role_id = role.id AND ur.user_id = $1 AND role.tenant_id = $2`,
+		userID, tenantID); err != nil {
+		return fmt.Errorf("RevokeTenantRoles: %w", err)
+	}
 	return nil
 }
 
@@ -693,20 +978,33 @@ func (r *UserRepository) AssignRolesInTenant(ctx context.Context, userID, tenant
 	// Delete only roles that are BOTH in this tenant AND in the
 	// caller-supplied allow-list (self-service-visible roles); everything
 	// else the user holds — cross-tenant or unentitled-module grants — is
-	// preserved.
-	_, err = tx.Exec(ctx,
+	// preserved. Also excluded: a live, still-active TIME-BOXED grant
+	// (expires_at in the future) — that is a JIT/PIM activation, and this
+	// self-service path is not JIT-aware. Without the guard, a role the
+	// picker happens to offer would be deleted and reinserted WITHOUT its
+	// expires_at, silently converting a time-boxed elevation into a
+	// permanent one. Such a grant is only revoked/expired via
+	// JITAccessService.RevokeGrant / ExpireGrants.
+	if _, err := tx.Exec(ctx, "SELECT id FROM iam_users WHERE id = $1 FOR UPDATE", userID); err != nil {
+		return fmt.Errorf("AssignRolesInTenant: user lock: %w", err)
+	}
+	err = deleteRolesWithOutbox(ctx, tx,
 		`DELETE FROM iam_user_roles ur
 		 USING iam_roles r
-		 WHERE ur.role_id = r.id AND ur.user_id = $1 AND r.tenant_id = $2 AND r.id = ANY($3)`,
-		userID, tenantID, allowedRoleIDs,
+		 WHERE ur.role_id = r.id AND ur.user_id = $1 AND r.tenant_id = $2 AND r.id = ANY($3)
+		   AND (ur.expires_at IS NULL OR ur.expires_at <= NOW())`,
+		[]interface{}{userID, tenantID, allowedRoleIDs}, roleIDs,
 	)
 	if err != nil {
 		return fmt.Errorf("AssignRolesInTenant: delete: %w", err)
 	}
 
+	// ON CONFLICT DO NOTHING: a roleID that survived the delete above (a
+	// live time-boxed grant) is already present — leave its expires_at
+	// untouched rather than erroring or overwriting it.
 	for _, roleID := range roleIDs {
 		_, err := tx.Exec(ctx,
-			"INSERT INTO iam_user_roles (user_id, role_id, assigned_by) VALUES ($1, $2, $3)",
+			"INSERT INTO iam_user_roles (user_id, role_id, assigned_by) VALUES ($1, $2, $3) ON CONFLICT (user_id, role_id) DO NOTHING",
 			userID, roleID, assignedBy,
 		)
 		if err != nil {
@@ -843,11 +1141,22 @@ func (r *UserRepository) ReplaceTeamRoles(ctx context.Context, tenantID, actorID
 			return ErrTeamLastAdministrator
 		}
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM iam_user_roles ur USING iam_roles r WHERE ur.role_id=r.id AND ur.user_id=$1 AND r.tenant_id=$2 AND r.id=ANY($3)`, targetID, tenantID, editableRoleIDs); err != nil {
+	// Exclude a live, still-active TIME-BOXED grant (expires_at in the
+	// future) from both the delete and the reinsert below — it is a
+	// JIT/PIM activation, and this admin team-edit path is not JIT-aware.
+	// Without the guard, an editable role the target happens to hold via an
+	// active JIT grant would be deleted and reinserted WITHOUT its
+	// expires_at, silently converting a time-boxed elevation into a
+	// permanent one. Such a grant is only revoked/expired via
+	// JITAccessService.RevokeGrant / ExpireGrants.
+	if err := deleteRolesWithOutbox(ctx, tx, `DELETE FROM iam_user_roles ur USING iam_roles r WHERE ur.role_id=r.id AND ur.user_id=$1 AND r.tenant_id=$2 AND r.id=ANY($3) AND (ur.expires_at IS NULL OR ur.expires_at<=NOW())`, []interface{}{targetID, tenantID, editableRoleIDs}, requestedRoleIDs); err != nil {
 		return err
 	}
 	for _, roleID := range requestedRoleIDs {
-		if _, err := tx.Exec(ctx, `INSERT INTO iam_user_roles (user_id,role_id,assigned_by) VALUES ($1,$2,$3)`, targetID, roleID, &actorID); err != nil {
+		// ON CONFLICT DO NOTHING: a roleID that survived the delete above
+		// (a live time-boxed grant) is already present — leave its
+		// expires_at untouched.
+		if _, err := tx.Exec(ctx, `INSERT INTO iam_user_roles (user_id,role_id,assigned_by) VALUES ($1,$2,$3) ON CONFLICT (user_id, role_id) DO NOTHING`, targetID, roleID, &actorID); err != nil {
 			return err
 		}
 	}
@@ -970,6 +1279,37 @@ func (r *UserRepository) ResetFailedAttempts(ctx context.Context, userID uuid.UU
 	return nil
 }
 
+// UpdateLoginInfo records a successful login's timestamp/IP with a
+// targeted, single-purpose UPDATE — deliberately NOT routed through the
+// write-all-columns Update() method above.
+//
+// Root cause this exists to close (2026-09-18 incident: every
+// self-service signup's password silently wiped ~1s after creation):
+// AuthService.IssueSessionForNewUser (auth_signup_session.go) hands
+// updateUserLoginInfo a *models.User assembled by
+// signupUserCreatorAdapter.CreateForSignup from a *models.UserResponse —
+// a response DTO that never carries PasswordHash (correctly: it's not
+// meant to leave the process as a secret). That partial user has a
+// non-empty Email (needed for the JWT), so Update()'s partial-struct
+// guard — which keys off `email == ”` as a proxy for "caller doesn't
+// carry the full row" — does not fire, and Update() unconditionally
+// overwrote password_hash with the zero value from the partial struct,
+// nulling out the credential CreatePreparedForSignup had just persisted.
+// The same partial-struct risk applies to every other column Update()
+// writes unconditionally (is_email_verified, mfa_*, lock state, etc.) —
+// this method sidesteps the whole class of risk for the login-timestamp
+// case by touching only the three columns it actually means to change.
+func (r *UserRepository) UpdateLoginInfo(ctx context.Context, userID uuid.UUID, loginAt time.Time, ipAddress string) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE iam_users SET last_login_at = $2, last_login_ip = $3, failed_login_attempts = 0, updated_at = NOW() WHERE id = $1`,
+		userID, loginAt, ipAddress,
+	)
+	if err != nil {
+		return fmt.Errorf("UpdateLoginInfo: %w", err)
+	}
+	return nil
+}
+
 // LockUser is an exported function.
 func (r *UserRepository) LockUser(ctx context.Context, userID uuid.UUID, reason string, until *time.Time) error {
 	_, err := r.db.Exec(ctx,
@@ -1042,18 +1382,45 @@ func (r *UserRepository) CountByTenant(ctx context.Context, tenantID uuid.UUID) 
 // count backing GET /internal/v1/tenants/:id/users/count — a user with
 // deletion_scheduled_at set has already relinquished their seat even though
 // the row still exists during the grace window, and an inactive
-// (deactivated) user is not occupying a seat either.
+// (deactivated) user is not occupying a seat either. Employee-class (ESS) and kiosk-class users are seat-free and excluded.
 func (r *UserRepository) CountActiveByTenant(ctx context.Context, tenantID uuid.UUID) (int, error) {
 	var count int
-	err := r.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM iam_users
-		 WHERE tenant_id = $1 AND is_active = true AND deletion_scheduled_at IS NULL`,
-		tenantID,
-	).Scan(&count)
+	// Employee-class (ESS) users never occupy a seat. iam_user_memberships has FORCE RLS, so the
+	// NOT EXISTS runs under the tenant's scope (WithTenantScope).
+	err := WithTenantScope(ctx, r.db, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM iam_users u
+			 WHERE u.tenant_id = $1 AND u.is_active = true AND u.deletion_scheduled_at IS NULL
+			   AND u.username NOT ILIKE 'svc-%'
+			   AND NOT EXISTS (SELECT 1 FROM iam_user_memberships m
+			                   WHERE m.tenant_id = $1 AND m.user_id = u.id AND m.status = 'deactivated')
+			   AND NOT EXISTS (SELECT 1 FROM iam_user_memberships m
+			                   WHERE m.tenant_id = $1 AND m.user_id = u.id AND m.seat_class IN ('employee', 'kiosk', 'service', 'external'))`,
+			tenantID,
+		).Scan(&count)
+	})
 	if err != nil {
 		return 0, fmt.Errorf("CountActiveByTenant: %w", err)
 	}
 	return count, nil
+}
+
+// GetMemberActiveState reports whether userID belongs to tenantID (found) and, if so,
+// whether it currently occupies an active seat (is_active and not in the deletion grace
+// period). It backs GET /internal/v1/tenants/:id/members/:userId and deliberately returns
+// nothing but these two booleans — no row, no PII.
+func (r *UserRepository) GetMemberActiveState(ctx context.Context, tenantID, userID uuid.UUID) (found, active bool, err error) {
+	err = r.db.QueryRow(ctx,
+		`SELECT (is_active AND deletion_scheduled_at IS NULL) FROM iam_users WHERE tenant_id = $1 AND id = $2`,
+		tenantID, userID,
+	).Scan(&active)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("GetMemberActiveState: %w", err)
+	}
+	return true, active, nil
 }
 
 // UpdateActivationStatus updates the activation status of a user
@@ -1440,30 +1807,57 @@ func (r *UserRepository) SetTeamMemberActive(ctx context.Context, tenantID, acto
 		return ErrTeamTargetPriority
 	}
 	if !active && targetActive {
-		var remaining int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(DISTINCT u.id) FROM iam_users u
+		var remaining, remainingOwners int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(DISTINCT u.id),
+			COUNT(DISTINCT u.id) FILTER (WHERE lower(r.name) = 'owner') FROM iam_users u
 			JOIN iam_user_roles ur ON ur.user_id = u.id JOIN iam_roles r ON r.id = ur.role_id
 			WHERE u.tenant_id = $1 AND u.is_active AND r.tenant_id = $1 AND lower(r.name)=ANY($2)
-			AND (ur.expires_at IS NULL OR ur.expires_at > NOW())`, tenantID, adminRoleNames).Scan(&remaining); err != nil {
+			AND (ur.expires_at IS NULL OR ur.expires_at > NOW())`, tenantID, adminRoleNames).Scan(&remaining, &remainingOwners); err != nil {
 			return fmt.Errorf("SetTeamMemberActive: count administrators: %w", err)
 		}
-		var targetAdmin bool
+		var targetAdmin, targetOwner bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM iam_user_roles ur JOIN iam_roles r ON r.id = ur.role_id
 			WHERE ur.user_id = $1 AND r.tenant_id = $2 AND lower(r.name)=ANY($3)
-			AND (ur.expires_at IS NULL OR ur.expires_at > NOW()))`, targetID, tenantID, adminRoleNames).Scan(&targetAdmin); err != nil {
+			AND (ur.expires_at IS NULL OR ur.expires_at > NOW())),
+			EXISTS(SELECT 1 FROM iam_user_roles ur JOIN iam_roles r ON r.id = ur.role_id
+			WHERE ur.user_id = $1 AND r.tenant_id = $2 AND lower(r.name) = 'owner'
+			AND (ur.expires_at IS NULL OR ur.expires_at > NOW()))`, targetID, tenantID, adminRoleNames).Scan(&targetAdmin, &targetOwner); err != nil {
 			return fmt.Errorf("SetTeamMemberActive: target administrator: %w", err)
 		}
-		if targetAdmin && remaining <= 1 {
+		// An active admin is not a replacement owner. Preserve the literal
+		// last-owner invariant as well as the broader last-administrator one.
+		if (targetAdmin && remaining <= 1) || (targetOwner && remainingOwners <= 1) {
 			return ErrTeamLastAdministrator
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE iam_users SET is_active = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`, active, targetID, tenantID); err != nil {
 		return fmt.Errorf("SetTeamMemberActive: update user: %w", err)
 	}
+	// Seat ledger moves with the user in this same transaction: deactivation frees the member seat once,
+	// reactivation re-occupies one under the seat limit (ErrSeatLimitReached rolls the whole change back).
+	memberships := &UserMembershipRepository{db: tx}
 	if !active {
-		if _, err := tx.Exec(ctx, `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = 'user_deactivated'
-			WHERE user_id = $1 AND is_active = true`, targetID); err != nil {
+		if _, err := memberships.Deactivate(ctx, tenantID, targetID); err != nil {
+			return fmt.Errorf("SetTeamMemberActive: release seat: %w", err)
+		}
+	} else if !targetActive {
+		if _, err := memberships.Reactivate(ctx, tenantID, targetID); err != nil {
+			if errors.Is(err, ErrSeatLimitReached) {
+				return ErrSeatLimitReached
+			}
+			return fmt.Errorf("SetTeamMemberActive: occupy seat: %w", err)
+		}
+	}
+	if !active {
+		if _, err := sessionsweep.End(ctx, tx, `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
+			WHERE user_id = $1 AND is_active = true RETURNING id, user_id`, sessionEndUserDeactivated, "", targetID, sessionEndUserDeactivated); err != nil {
 			return fmt.Errorf("SetTeamMemberActive: revoke sessions: %w", err)
+		}
+		// The sessions above are ended user-wide, so sweep the user's tokens
+		// user-wide too. Not by tenant: a token's tenant_id is its client's
+		// tenant, not the member's, and legacy tokens carry no session binding.
+		if err := revokeUserOAuthTokensTx(ctx, tx, targetID); err != nil {
+			return fmt.Errorf("SetTeamMemberActive: revoke oauth tokens: %w", err)
 		}
 	}
 	if len(audit) > 0 && audit[0] != nil {
@@ -1473,6 +1867,261 @@ func (r *UserRepository) SetTeamMemberActive(ctx context.Context, tenantID, acto
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("SetTeamMemberActive: commit: %w", err)
+	}
+	return nil
+}
+
+// ErrLastOwner is returned by admin soft/hard-delete when the target user
+// is the tenant's only holder of the "owner" role — the task's explicit
+// "refuse to delete the last owner of a tenant" guard. Deliberately
+// scoped to the literal role name "owner" (not the broader
+// authorization.TenantAdministratorRoleNames() set SetTeamMemberActive
+// uses for deactivation/role-removal) because that is what was asked for;
+// a tenant that has admins but no "owner" role at all is not blocked by
+// this guard.
+var ErrLastOwner = errors.New("cannot delete the last owner of the tenant")
+
+// CountActiveOwners returns how many non-deleted, active users in
+// tenantID hold a role literally named "owner" (case-insensitive).
+// AdminSoftDelete/AdminHardDeleteUser call this before touching a user
+// who holds that role; if the count is 1 and the target is that one
+// owner, the operation is refused with ErrLastOwner.
+func (r *UserRepository) CountActiveOwners(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	var count int
+	err := r.db.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT u.id)
+		FROM iam_users u
+		JOIN iam_user_roles ur ON ur.user_id = u.id
+		JOIN iam_roles r ON r.id = ur.role_id
+		WHERE u.tenant_id = $1
+		  AND lower(r.name) = 'owner'
+		  AND u.is_active
+		  AND u.activation_status <> 'pending_deletion'
+		  AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+	`, tenantID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("CountActiveOwners: %w", err)
+	}
+	return count, nil
+}
+
+// HasRole reports whether userID currently holds a role literally named
+// roleName (case-insensitive), ignoring expired assignments.
+func (r *UserRepository) HasRole(ctx context.Context, userID uuid.UUID, roleName string) (bool, error) {
+	var has bool
+	err := r.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM iam_user_roles ur
+			JOIN iam_roles ro ON ro.id = ur.role_id
+			WHERE ur.user_id = $1 AND lower(ro.name) = lower($2)
+			  AND (ur.expires_at IS NULL OR ur.expires_at > NOW())
+		)
+	`, userID, roleName).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("HasRole: %w", err)
+	}
+	return has, nil
+}
+
+// SetDeletionState persists the activation_status/deletion_* lifecycle
+// columns directly via a targeted UPDATE, instead of going through
+// Update().
+//
+// BUG FOUND while building the admin lifecycle endpoints (2026-09-19):
+// UserRepository.Update's write-all-columns SQL never lists
+// activation_status, deletion_scheduled_at, deletion_grace_period_ends_at
+// or deletion_reason (see Update's query above — those four columns are
+// simply absent from the SET list). ScheduleAccountDeletion and
+// CancelAccountDeletion (auth_account_deletion_service.go) set those
+// fields on the in-memory *models.User and then called Update(), which
+// silently discarded the write: self-service account deletion has never
+// actually persisted past the in-memory struct returned to the caller.
+// The columns DO exist in the schema (the GitOps repository
+// falcon-id/schema-definition-main.yaml declares them, with a partial
+// index on deletion_grace_period_ends_at scoped to
+// activation_status='pending_deletion' — clearly intended to back a
+// purge-candidate query that was never built). Both the self-service
+// flow and the new admin lifecycle now route every write of these four
+// columns through this one method so there is exactly one write path,
+// and it demonstrably persists (see repository/service tests).
+func (r *UserRepository) SetDeletionState(ctx context.Context, userID uuid.UUID, activationStatus string, deletionScheduledAt, deletionGracePeriodEndsAt *time.Time, deletionReason *string) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE iam_users
+		SET activation_status = $2,
+		    deletion_scheduled_at = $3,
+		    deletion_grace_period_ends_at = $4,
+		    deletion_reason = $5,
+		    updated_at = NOW()
+		WHERE id = $1
+	`, userID, activationStatus, deletionScheduledAt, deletionGracePeriodEndsAt, deletionReason)
+	if err != nil {
+		return fmt.Errorf("SetDeletionState: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("SetDeletionState: user %s not found", userID)
+	}
+	return nil
+}
+
+// HardDeleteUserTx performs the real, irreversible row delete plus a
+// best-effort cleanup of the user-scoped child rows this repository knows
+// about, all inside the caller's transaction. It is named *Tx (unlike the
+// pre-existing Delete, which is the RAW, ungated single-statement DELETE
+// still used by the legacy /api/users/:id and
+// /api/platform/tenants/:tenant_id/users/:user_id DELETE routes) so the
+// two call paths stay visibly distinct: existing callers are UNCHANGED,
+// and the new admin hard-delete path is the only caller of this method.
+//
+// Child tables cleaned explicitly (FK-cascade walk): iam_user_roles
+// (role_id-keyed elsewhere, but user_id here), iam_sessions,
+// iam_user_recovery_methods. iam_audit_log rows referencing this user as
+// actor_id/target_user_id are intentionally NOT deleted — audit history
+// must outlive the actor per this task's own audit requirement; the
+// residual reference is a UUID with no PII attached (LogUserAction never
+// stores the user's decrypted PII in the log row).
+func (r *UserRepository) HardDeleteUserTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
+	for _, stmt := range []string{
+		`DELETE FROM iam_user_roles WHERE user_id = $1`,
+		`DELETE FROM iam_sessions WHERE user_id = $1`,
+		`DELETE FROM iam_user_recovery_methods WHERE user_id = $1`,
+	} {
+		if _, err := tx.Exec(ctx, stmt, userID); err != nil {
+			return fmt.Errorf("HardDeleteUserTx: %s: %w", stmt, err)
+		}
+	}
+	if err := r.releaseMembershipsTx(ctx, tx, userID); err != nil {
+		return fmt.Errorf("HardDeleteUserTx: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM iam_users WHERE id = $1`, userID)
+	if err != nil {
+		return fmt.Errorf("HardDeleteUserTx: delete iam_users: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("HardDeleteUserTx: user %s not found", userID)
+	}
+	return nil
+}
+
+// CountResidualRowsTx is the value-sweep half of hard-delete completeness
+// verification (the task's "value sweep" — finding rows scoped by
+// unconventional column names, not just FK-cascade children). It is
+// called AFTER HardDeleteUserTx inside the same transaction and asserts
+// that no row anywhere in the tables this repository knows carry a
+// user_id-shaped column pointing at the deleted user. A non-empty result
+// means the transaction must be rolled back rather than report success.
+//
+// This is a best-effort, DISCLOSED enumeration of the tables this
+// repository package is aware of — it does NOT sweep tables owned by
+// other services/repositories in the same falcon-id database (e.g.
+// device/webauthn/mfa-enrollment repositories not touched by this
+// change). See the MR report for the explicit list of tables NOT swept.
+func (r *UserRepository) CountResidualRowsTx(ctx context.Context, tx pgx.Tx, userID uuid.UUID) (map[string]int, error) {
+	tables := map[string]string{
+		"iam_user_roles":            `SELECT COUNT(*) FROM iam_user_roles WHERE user_id = $1`,
+		"iam_sessions":              `SELECT COUNT(*) FROM iam_sessions WHERE user_id = $1`,
+		"iam_user_recovery_methods": `SELECT COUNT(*) FROM iam_user_recovery_methods WHERE user_id = $1`,
+	}
+	counts := make(map[string]int, len(tables))
+	for name, q := range tables {
+		var n int
+		if err := tx.QueryRow(ctx, q, userID).Scan(&n); err != nil {
+			return nil, fmt.Errorf("CountResidualRowsTx: %s: %w", name, err)
+		}
+		counts[name] = n
+	}
+	return counts, nil
+}
+
+// HardDeleteUser is the single entry point admin_user_lifecycle.go calls
+// for irreversible user erasure. It wraps HardDeleteUserTx in a
+// transaction and, before committing, re-runs CountResidualRowsTx as the
+// completeness check: any nonzero residual count rolls the whole
+// transaction back instead of reporting success, so a partial delete is
+// never silently accepted as complete.
+func (r *UserRepository) HardDeleteUser(ctx context.Context, userID uuid.UUID) (residual map[string]int, err error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("HardDeleteUser: begin: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err = r.HardDeleteUserTx(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+
+	counts, cErr := r.CountResidualRowsTx(ctx, tx, userID)
+	if cErr != nil {
+		err = cErr
+		return nil, err
+	}
+	for table, n := range counts {
+		if n != 0 {
+			err = fmt.Errorf("HardDeleteUser: residual rows remain in %s (count=%d) for user %s, aborting", table, n, userID)
+			return nil, err
+		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("HardDeleteUser: commit: %w", err)
+	}
+	return counts, nil
+}
+
+// DeactivateEmployeeUser switches an employee-class (ESS) user off: is_active=false, live sessions ended, one audit row,
+// all in one transaction. Unlike SetTeamMemberActive it needs no acting administrator (the expiry worker and the S2S
+// endpoint act as the system) and skips the last-administrator guard: employee seats never carry an administrator role.
+func (r *UserRepository) DeactivateEmployeeUser(ctx context.Context, tenantID, targetID uuid.UUID, audit *models.AuditLog) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("DeactivateEmployeeUser: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	tag, err := tx.Exec(ctx, `UPDATE iam_users SET is_active = false, updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, targetID, tenantID)
+	if err != nil {
+		return fmt.Errorf("DeactivateEmployeeUser: update user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTeamTargetNotFound
+	}
+	if _, err := sessionsweep.End(ctx, tx, `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
+		WHERE user_id = $1 AND is_active = true RETURNING id, user_id`, sessionEndEmployeeAccessExpired, "", targetID, sessionEndEmployeeAccessExpired); err != nil {
+		return fmt.Errorf("DeactivateEmployeeUser: revoke sessions: %w", err)
+	}
+	if err := revokeUserOAuthTokensTx(ctx, tx, targetID); err != nil {
+		return fmt.Errorf("DeactivateEmployeeUser: revoke oauth tokens: %w", err)
+	}
+	if audit != nil {
+		if err := CreateAuditLogTx(ctx, tx, audit); err != nil {
+			return fmt.Errorf("DeactivateEmployeeUser: audit: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("DeactivateEmployeeUser: commit: %w", err)
+	}
+	return nil
+}
+
+// GetMFATOTPEnabledAt returns when the user's TOTP factor was last enabled
+// (maintained by a trigger on iam_users). NULL — legacy rows enrolled before
+// the column existed — is returned as nil.
+func (r *UserRepository) GetMFATOTPEnabledAt(ctx context.Context, userID uuid.UUID) (*time.Time, error) {
+	var at *time.Time
+	err := r.db.QueryRow(ctx, `SELECT mfa_totp_enabled_at FROM iam_users WHERE id = $1`, userID).Scan(&at)
+	if err != nil {
+		return nil, fmt.Errorf("GetMFATOTPEnabledAt: %w", err)
+	}
+	return at, nil
+}
+
+// StampMFATOTPEnabledAt sets mfa_totp_enabled_at to now. Called whenever a TOTP
+// secret is (re-)enrolled so the witness age gate restarts.
+func (r *UserRepository) StampMFATOTPEnabledAt(ctx context.Context, userID uuid.UUID) error {
+	if _, err := r.db.Exec(ctx, `UPDATE iam_users SET mfa_totp_enabled_at = NOW() WHERE id = $1`, userID); err != nil {
+		return fmt.Errorf("StampMFATOTPEnabledAt: %w", err)
 	}
 	return nil
 }

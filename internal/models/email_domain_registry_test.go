@@ -88,7 +88,7 @@ func TestEmailDomainRegistry_JSONSerialization(t *testing.T) {
 		reg := &EmailDomainRegistry{
 			ID:                 id,
 			TenantID:           tenantID,
-			Domain:             "hexxlock.com",
+			Domain:             "example.com",
 			IsVerified:         true,
 			VerificationToken:  &token,
 			VerificationMethod: string(VerificationMethodDNSCNAME),
@@ -107,7 +107,7 @@ func TestEmailDomainRegistry_JSONSerialization(t *testing.T) {
 		assert.Contains(t, raw, "id")
 		assert.Contains(t, raw, "tenant_id")
 		assert.Contains(t, raw, "domain")
-		assert.Equal(t, "hexxlock.com", raw["domain"])
+		assert.Equal(t, "example.com", raw["domain"])
 		assert.Contains(t, raw, "is_verified")
 		assert.Equal(t, true, raw["is_verified"])
 		assert.Contains(t, raw, "verification_method")

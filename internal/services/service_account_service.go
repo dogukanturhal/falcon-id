@@ -49,6 +49,8 @@ type ServiceAccountService struct {
 	repo     serviceAccountServiceRepo
 	roleRepo serviceAccountRoleRepo
 	cfg      *config.Config
+
+	tokenSigner serviceAccountTokenSigner
 }
 
 // NewServiceAccountService is an exported function.
@@ -58,6 +60,29 @@ func NewServiceAccountService(repo serviceAccountServiceRepo, roleRepo serviceAc
 		roleRepo: roleRepo,
 		cfg:      cfg,
 	}
+}
+
+// serviceAccountTokenSigner signs service-account claims with the active
+// RS256 key (satisfied by *TokenService).
+type serviceAccountTokenSigner interface {
+	SignClaims(claims jwt.Claims) (string, error)
+}
+
+// SetTokenSigner wires the RS256 signer used for service-account access tokens.
+func (s *ServiceAccountService) SetTokenSigner(signer serviceAccountTokenSigner) {
+	s.tokenSigner = signer
+}
+
+// signAccessToken signs via the shared signer (RS256 + kid). Without a signer
+// it only falls back to HS256 while the migration fallback is still enabled.
+func (s *ServiceAccountService) signAccessToken(claims jwt.MapClaims) (string, error) {
+	if s.tokenSigner != nil {
+		return s.tokenSigner.SignClaims(claims)
+	}
+	if s.cfg == nil || !s.cfg.JWTHMACFallbackEnabled {
+		return "", fmt.Errorf("no token signer wired and HS256 fallback is disabled")
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(s.cfg.JWTSecret))
 }
 
 // resolvePermissions resolves the set of permission names granted by a service
@@ -316,7 +341,7 @@ func (s *ServiceAccountService) RegenerateSecret(ctx context.Context, tenantID, 
 //   - unknown client_id              → "authentication failed" (no audit)
 //   - wrong client_secret            → "authentication failed" (no audit)
 //   - client_id + secret OK, account deactivated
-//                                    → "authentication failed" + structured warn
+//     → "authentication failed" + structured warn
 //   - IP not on allow-list           → "IP address not allowed"
 //
 // SECURITY INVARIANT: the deactivated-account audit signal fires ONLY
@@ -396,8 +421,7 @@ func (s *ServiceAccountService) Authenticate(ctx context.Context, clientID, clie
 		"type":               "service_account",
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	accessToken, err := token.SignedString([]byte(s.cfg.JWTSecret))
+	accessToken, err := s.signAccessToken(claims)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign token: %w", err)
 	}

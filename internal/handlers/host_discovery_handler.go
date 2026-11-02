@@ -116,12 +116,12 @@ type TenantSlugDiscoveryServiceIface interface {
 // custom/vanity domains (tenants that completed the onboarding "choose
 // your subdomain" step). It does NOT hold an entry for every tenant's
 // `<slug>.<baseDomain>` subdomain, so routing subdomain traffic through
-// it would 404 real customers (e.g. `hexxlock.ligarbo.com`).
+// it would 404 real customers (e.g. `hexxlock.example.com`).
 //
 // This handler instead answers "is this SLUG a real tenant" against
 // iam_tenants directly — the check the Next.js SDK middleware's
 // subdomain branch needs to close its fail-open gap: today ANY
-// shape-valid, non-reserved `<label>.ligarbo.com` renders the full app
+// shape-valid, non-reserved `<label>.example.com` renders the full app
 // regardless of whether `label` is a real tenant slug.
 //
 // Mounted under the same /internal/v1/tenant-discovery group as

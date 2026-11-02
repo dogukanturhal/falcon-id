@@ -72,7 +72,7 @@ func NewDiscoverHandler(service DiscoverServiceInterface, logger *zap.Logger) *D
 // never logs AND returns — exactly one log line per request per Dave
 // Cheney's "handle errors once" principle.
 //
-// Memory: internal engineering notes — the
+// operational notes — the
 // previous shape collapsed every failure into a generic 500 with no
 // log line, making the underlying cause unrecoverable from telemetry.
 func (h *DiscoverHandler) Discover(c *gin.Context) {

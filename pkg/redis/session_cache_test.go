@@ -455,3 +455,92 @@ func TestSessionCache_Client(t *testing.T) {
 	cache, _ := newTestSessionCache(t)
 	assert.NotNil(t, cache.Client())
 }
+
+// The sliding IdP TTL must never extend past AuthTime + absolute cap, and a
+// record past the cap is deleted and reported missing.
+func TestGetIdpSession_SlidingTTLBoundedByAbsoluteCap(t *testing.T) {
+	cache, mr := newTestSessionCache(t)
+	cache.SetIdpAbsoluteCap(10 * 24 * time.Hour)
+	ctx := context.Background()
+
+	near, past, fresh := uuid.New(), uuid.New(), uuid.New()
+	mk := func(age time.Duration) *IdpSessionData {
+		return &IdpSessionData{UserID: uuid.New(), TenantID: uuid.New(), AuthTime: time.Now().Add(-age).Unix()}
+	}
+	require.NoError(t, cache.SetIdpSession(ctx, near, mk(9*24*time.Hour)))  // 1d left
+	require.NoError(t, cache.SetIdpSession(ctx, past, mk(11*24*time.Hour))) // over cap
+	require.NoError(t, cache.SetIdpSession(ctx, fresh, mk(time.Hour)))      // >7d left
+
+	d, err := cache.GetIdpSession(ctx, near)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+	assert.LessOrEqual(t, mr.TTL(cache.idpSessionKey(near)), 24*time.Hour+time.Minute, "TTL must be clamped to the cap")
+
+	d, err = cache.GetIdpSession(ctx, past)
+	require.NoError(t, err)
+	assert.Nil(t, d)
+	assert.False(t, mr.Exists(cache.idpSessionKey(past)), "past-cap record must be deleted")
+
+	_, err = cache.GetIdpSession(ctx, fresh)
+	require.NoError(t, err)
+	assert.Equal(t, idpSessionTTL, mr.TTL(cache.idpSessionKey(fresh)))
+}
+
+// A realm cap resolved at creation is recorded on the record: a 24h realm
+// session dies at 24h while a no-policy (30d default) session stays silent at 25h.
+func TestIdpSession_PerRealmAbsoluteCap(t *testing.T) {
+	cache, _ := newTestSessionCache(t)
+	cache.SetIdpAbsoluteCap(30 * 24 * time.Hour)
+	platform, customer := uuid.New(), uuid.New()
+	calls := 0
+	cache.SetRealmCapResolver(func(_ context.Context, tenantID uuid.UUID) (time.Duration, bool, error) {
+		calls++
+		if tenantID == platform {
+			return 24 * time.Hour, true, nil
+		}
+		return 0, false, nil
+	})
+	ctx := context.Background()
+	authAt := time.Now().Add(-25 * time.Hour).Unix()
+
+	pid, cid := uuid.New(), uuid.New()
+	require.NoError(t, cache.SetIdpSession(ctx, pid, &IdpSessionData{UserID: uuid.New(), TenantID: platform, AuthTime: authAt}))
+	require.NoError(t, cache.SetIdpSession(ctx, cid, &IdpSessionData{UserID: uuid.New(), TenantID: customer, AuthTime: authAt}))
+
+	d, err := cache.GetIdpSession(ctx, pid)
+	require.NoError(t, err)
+	assert.Nil(t, d, "24h realm: session older than 24h must require login")
+
+	d, err = cache.GetIdpSession(ctx, cid)
+	require.NoError(t, err)
+	require.NotNil(t, d, "30d realm: silent at 25h")
+	assert.Zero(t, d.AbsoluteCapSeconds)
+
+	// Fresh platform session records the cap; lookups are cached.
+	fid := uuid.New()
+	require.NoError(t, cache.SetIdpSession(ctx, fid, &IdpSessionData{UserID: uuid.New(), TenantID: platform, AuthTime: time.Now().Unix()}))
+	d, err = cache.GetIdpSession(ctx, fid)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+	assert.Equal(t, int64(86400), d.AbsoluteCapSeconds)
+	assert.Equal(t, 2, calls, "platform tenant resolved once, customer once (cached)")
+}
+
+// Legacy records (no recorded cap) and resolver errors keep the global cap.
+func TestIdpSession_RealmCapFallbacks(t *testing.T) {
+	cache, _ := newTestSessionCache(t)
+	cache.SetIdpAbsoluteCap(30 * 24 * time.Hour)
+	cache.SetRealmCapResolver(func(context.Context, uuid.UUID) (time.Duration, bool, error) {
+		return 0, false, assert.AnError
+	})
+	ctx := context.Background()
+	id := uuid.New()
+	require.NoError(t, cache.SetIdpSession(ctx, id, &IdpSessionData{UserID: uuid.New(), TenantID: uuid.New(), AuthTime: time.Now().Add(-25 * time.Hour).Unix()}))
+	d, err := cache.GetIdpSession(ctx, id)
+	require.NoError(t, err)
+	assert.NotNil(t, d)
+
+	deadline, ok := cache.IdpAbsoluteDeadline(&IdpSessionData{AuthTime: 1000})
+	require.True(t, ok)
+	assert.Equal(t, time.Unix(1000, 0).Add(30*24*time.Hour), deadline)
+}

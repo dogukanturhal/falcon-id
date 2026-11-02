@@ -218,7 +218,7 @@ func (s *OAuthProviderService) validateAuthorizeParams(client *models.OAuthClien
 	// Same matcher used by the authorize endpoint — without this the
 	// PAR path silently rejected native PKCE clients with OS-assigned
 	// ephemeral loopback ports, even when the authorize path accepted
-	// them. Caught live 2026-06-14 on hexxlock-access registration.
+	// them. Caught live 2026-06-14 on device-agent registration.
 	if !matchRedirectURI(client.RedirectURIs, req.RedirectURI) {
 		return nil, fmt.Errorf("invalid_request: redirect_uri is not registered for this client")
 	}

@@ -123,7 +123,7 @@ type LoginRiskEvent struct {
 
 	// Edge-stamped geo enrichment added in platform migration v0.232.247.
 	// Same source + shape as iam_sessions geo columns (v0.232.246) —
-	// X-Geo-* request headers from the id-hexxlock-geo-stamp Cloudflare
+	// X-Geo-* request headers from the geo-stamp Cloudflare
 	// Worker, read by middleware.ClientGeo, propagated via clientctx.
 	// All nullable: pre-migration rows + non-Cloudflare paths stay NULL.
 	ASN       *string `json:"asn,omitempty" db:"asn"`

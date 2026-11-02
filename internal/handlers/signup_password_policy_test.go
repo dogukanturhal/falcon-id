@@ -4,6 +4,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"testing"
 	"time"
@@ -43,12 +45,14 @@ func (r httpPolicyRepo) GetByID(context.Context, uuid.UUID) (*models.SignupReque
 
 func TestSignupPolicy_DirectHTTPBypassAndPublicContract(t *testing.T) {
 	p := services.SignupPasswordPolicy{Version: 1, LengthUnit: "unicode_code_points", MinLength: 12, RequireUpper: true, RequireLower: true, RequireDigit: true, RequireSpecial: true, BreachCheck: "disabled"}
-	req := &models.SignupRequest{ID: uuid.New(), Verified: true, AccountType: "business", ExpiresAt: time.Now().Add(time.Hour)}
-	svc := services.NewSignupService(httpPolicyRepo{req: req}, nil, nil, nil, httpPolicyCreator{p}, nil, "", "")
+	sum := sha256.Sum256([]byte("completion-secret"))
+	hash := hex.EncodeToString(sum[:])
+	req := &models.SignupRequest{ID: uuid.New(), Verified: true, CompletionSecretHash: &hash, AccountType: "business", ExpiresAt: time.Now().Add(time.Hour)}
+	svc := services.NewSignupService(httpPolicyRepo{req: req}, nil, nil, nil, httpPolicyCreator{p}, nil, "", "", testOTPKey)
 	router := newTestRouter(svc)
 	router.GET("/api/v1/auth/signup/password-policy", NewSignupHandler(svc, zap.NewNop()).PasswordPolicy)
 	for _, password := range []string{"", "Abcd123!", "aaaaaaaaaaaa", "Éé١😀abcd"} {
-		w := signupDoRequest(t, router, http.MethodPost, "/api/v1/auth/signup/complete", signupJSONBody(t, map[string]interface{}{"signup_request_id": req.ID, "password": password}))
+		w := signupDoRequest(t, router, http.MethodPost, "/api/v1/auth/signup/complete", signupJSONBody(t, map[string]interface{}{"signup_request_id": req.ID, "completion_secret": "completion-secret", "password": password}))
 		require.Equal(t, http.StatusUnprocessableEntity, w.Code)
 		body := signupDecodeJSON(t, w)
 		assert.Equal(t, "password_policy_violation", body["code"])
@@ -62,3 +66,4 @@ func TestSignupPolicy_DirectHTTPBypassAndPublicContract(t *testing.T) {
 	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
 	assert.Equal(t, "unicode_code_points", signupDecodeJSON(t, w)["length_unit"])
 }
+var testOTPKey = []byte("handlers-test-signup-otp-key-32b")

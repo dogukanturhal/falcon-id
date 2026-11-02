@@ -91,15 +91,15 @@ var ReservedTenantSlugs = map[string]struct{}{
 	"undefined": {},
 
 	// Brand reservation — product names. hexxlock/falcon were already here;
-	// these are the ones the estate gained since (mearax, and ligarbo as its
+	// these are the ones the estate gained since (acmeweb, and acmeapp as its
 	// apex from the 2026-08 rename). A tenant serving its own content from
-	// mearax.<apex> reads as the vendor speaking.
-	"mearax":  {},
-	"ligarbo": {},
+	// acmeweb.<apex> reads as the vendor speaking.
+	"acmeweb":  {},
+	"acmeapp": {},
 	"talon":   {},
 
 	// Identity and auth namespace. `id` is the sharpest entry in this file:
-	// the production IdP is id.hexxlock.com, so a tenant holding `id` collides
+	// the production IdP is id.example.com, so a tenant holding `id` collides
 	// with the identity provider's own hostname if auth ever moves apex.
 	// login/logout/signup/auth/oauth/sso were already reserved; these are the
 	// synonyms and adjacent identity nouns that were not.
@@ -152,7 +152,7 @@ var ReservedTenantSlugs = map[string]struct{}{
 	"invoice":  {},
 	"invoices": {},
 
-	// track.<apex> is the click-tracking host (see apps/mearax's
+	// track.<apex> is the click-tracking host (see apps/acmeweb's
 	// apex-domains config) — a tenant slug must never collide with it,
 	// since the tracking host is untrusted and reads any cookie scoped
 	// to the apex.

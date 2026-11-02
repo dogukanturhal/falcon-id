@@ -12,10 +12,14 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/dogukanturhal/falcon-id/internal/entitlementsync"
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	svc "github.com/dogukanturhal/falcon-id/internal/services"
 	"github.com/dogukanturhal/falcon-id/internal/shared/retention"
+	"github.com/dogukanturhal/falcon-id/internal/signupgap"
 	"github.com/dogukanturhal/falcon-id/internal/tenantprojection"
+	"github.com/dogukanturhal/falcon-id/internal/opsaudit"
+	"github.com/dogukanturhal/falcon-id/internal/tenantstatus"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/keys"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
@@ -31,6 +35,39 @@ type BackgroundTasks struct {
 	GDPRConsumerCancel   context.CancelFunc
 	BCLDrainerCancel     context.CancelFunc
 	TenantProjectionStop func() // graceful shutdown hook for Phase 1a consumer
+	// EntitlementSyncStop stops the example.tenant.modules.sync consumer
+	// (the product roadmap §4.1, internal/entitlementsync).
+	EntitlementSyncStop func()
+
+	// TenantStatusStop stops the example.tenant.status consumer
+	// (R1-GAPS row 27, internal/tenantstatus).
+	TenantStatusStop func()
+	// OpsAuditStop stops the platform.ops-audit.v1 consumer (internal/opsaudit,
+	// OPS_AUDIT_CONSUMER_ENABLED).
+	OpsAuditStop func()
+	// TenantPurgeStop stops the tenant purge saga participant
+	// (internal/tenantpurge, TENANT_PURGE_PARTICIPANT_ENABLED).
+	TenantPurgeStop func()
+	// SignupGapReconcilerStop stops the signup-abandonment-recovery
+	// reconcilers (reap + stall detection — see internal/signupgap).
+	SignupGapReconcilerStop func()
+	RoleRevokeDrainerStop   func()
+	// JITExpirySweeperCancel stops the JIT access grant expiry sweeper.
+	JITExpirySweeperCancel context.CancelFunc
+	// OriginRegistryRefreshCancel stops the Stage 3 dynamic CORS/CSRF
+	// origin registry's background refresh loop (svcs.OriginRegistry).
+	OriginRegistryRefreshCancel context.CancelFunc
+	// InvitationExpirySweeperCancel stops the team-invitation expiry sweep
+	// (flips overdue pending iam_team_invitations to 'expired' and releases
+	// their tenant_seat_counters.seats_pending reservations).
+	InvitationExpirySweeperCancel context.CancelFunc
+	// PlatformElevationSweeperCancel stops the R1 platform-plane JIT
+	// elevation auto-revoke sweeper (svcs.PlatformJIT.RunExpirySweep).
+	PlatformElevationSweeperCancel context.CancelFunc
+	// PlatformBreakGlassSLASweeperCancel stops the R1 platform-plane
+	// break-glass 24h retroactive-approval SLA sweeper
+	// (svcs.PlatformJIT.RunBreakGlassSLASweep).
+	PlatformBreakGlassSLASweeperCancel context.CancelFunc
 }
 
 // startBackgroundTasks initializes and starts all background tasks.
@@ -56,6 +93,10 @@ func startBackgroundTasks(svcs *Services, repos *Repositories, infra *Infrastruc
 	// Nil when outbound OAuth creds/QUOTA_SERVICE_URL are unset
 	// (buildSeatQuotaReconcilerHTTPClient in cmd/services.go); StartScheduler
 	// itself also no-ops when SEAT_QUOTA_RECONCILER_ENABLED=false.
+	if svcs.EmployeeAccessExpiry != nil {
+		svcs.EmployeeAccessExpiry.Start(context.Background())
+	}
+
 	if svcs.SeatQuotaReconciler != nil {
 		svcs.SeatQuotaReconciler.StartScheduler(context.Background())
 		logger.Info("Seat-quota reconciler scheduler started")
@@ -64,6 +105,19 @@ func startBackgroundTasks(svcs *Services, repos *Repositories, infra *Infrastruc
 	if svcs.SpiceDBReconciler != nil {
 		svcs.SpiceDBReconciler.StartScheduler(context.Background())
 		logger.Info("SpiceDB reconciler scheduler started")
+	}
+
+	if svcs.TenantAPIKey != nil {
+		svcs.TenantAPIKey.StartCompanySyncWorker(context.Background(), 30*time.Second)
+		logger.Info("Tenant API key company-sync worker started")
+	}
+	var roleRevokeDrainerStop func()
+	if svcs.RoleRevokeDrainer != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); svcs.RoleRevokeDrainer.Start(ctx) }()
+		roleRevokeDrainerStop = func() { cancel(); <-done }
+		logger.Info("Durable SpiceDB role revoke drainer started", zap.Duration("poll_interval", time.Second))
 	}
 
 	// Start config invalidation subscriber for per-tenant dynamic config
@@ -92,16 +146,17 @@ func startBackgroundTasks(svcs *Services, repos *Repositories, infra *Infrastruc
 	// (active + retired keys served simultaneously for verifier
 	// overlap) silently degrades.
 	//
-	// Check interval is 1 hour: rotation happens at most once a day in
-	// steady state (90-day key lifetime → ~13 days warning window
-	// after first cross of threshold), and 1h gives operators a
-	// generous detection window for "did the rotation fire today".
+	// Check interval is 5 minutes on every replica: KeyManager.Maintain
+	// elects one rotator via a Postgres advisory lock, publishes the next
+	// key as pending, and activates it after SIGNING_KEY_PUBLISH_DELAY, so
+	// the interval bounds activation lateness. Replicas also reload keys
+	// from the DB every SIGNING_KEY_RELOAD_INTERVAL.
 	var keyRotation *keys.RotationScheduler
 	if svcs.KeyManager != nil {
-		keyRotation = keys.NewRotationScheduler(svcs.KeyManager, 1*time.Hour, logger.Log)
+		keyRotation = keys.NewRotationScheduler(svcs.KeyManager, 5*time.Minute, logger.Log)
 		keyRotation.Start(context.Background())
 		logger.Info("JWT signing key rotation scheduler started",
-			zap.Duration("check_interval", 1*time.Hour),
+			zap.Duration("check_interval", 5*time.Minute),
 		)
 	} else {
 		logger.Warn("KeyManager not configured — JWT signing keys will not auto-rotate")
@@ -132,14 +187,277 @@ func startBackgroundTasks(svcs *Services, repos *Repositories, infra *Infrastruc
 		logger.Warn("BCL outbox drainer not started: OAuthLogoutOutbox repo not wired")
 	}
 
-	tenantProjectionStop := startTenantProjection(infra)
+	tenantProjectionStop := startTenantProjection(infra, svcs)
+	entitlementSyncStop := startEntitlementSync(infra, svcs)
+	startModuleAccessReconcile(infra, svcs)
+	startAcmeAppGrantSync(infra, svcs)
+	tenantStatusStop := startTenantStatus(infra, svcs)
+	opsAuditStop := startOpsAudit(infra)
+	tenantPurgeStop := startTenantPurge(infra)
+	signupGapReconcilerStop := startSignupGapReconciler(repos)
+	jitExpirySweeperCancel := startJITExpirySweeper(svcs)
+	if svcs.SoDReevaluator != nil {
+		svcs.SoDReevaluator.Start(context.Background())
+		logger.Info("SoD continuous re-evaluation started", zap.Duration("interval", svc.SoDReevaluationInterval))
+	}
+	invitationExpirySweeperCancel := startInvitationExpirySweeper(repos)
+	platformElevationSweeperCancel := startPlatformElevationSweeper(svcs)
+	platformBreakGlassSLASweeperCancel := startPlatformBreakGlassSLASweeper(svcs)
+
+	// Stage 3: dynamic CORS/CSRF origin registry background refresh.
+	// StartBackgroundRefresh is nil-safe (no-ops, starts no goroutine) when
+	// svcs.OriginRegistry has no lister configured — see
+	// buildTenantManagementOriginLister's fallback posture in
+	// cmd/services.go. The initial synchronous refresh it performs is
+	// itself bounded by the registry's configured timeout (10s — see
+	// NewDynamicOriginRegistry's call site), so this never blocks startup
+	// indefinitely.
+	originRegistryCtx, originRegistryCancel := context.WithCancel(context.Background())
+	svcs.OriginRegistry.StartBackgroundRefresh(originRegistryCtx)
+	logger.Info("Dynamic CORS/CSRF origin registry background refresh started")
 
 	return &BackgroundTasks{
-		RetentionScheduler:   retentionScheduler,
-		KeyRotation:          keyRotation,
-		GDPRConsumerCancel:   gdprCancel,
-		BCLDrainerCancel:     bclDrainerCancel,
-		TenantProjectionStop: tenantProjectionStop,
+		RetentionScheduler:                 retentionScheduler,
+		KeyRotation:                        keyRotation,
+		GDPRConsumerCancel:                 gdprCancel,
+		BCLDrainerCancel:                   bclDrainerCancel,
+		TenantProjectionStop:               tenantProjectionStop,
+		EntitlementSyncStop:                entitlementSyncStop,
+		TenantStatusStop:                   tenantStatusStop,
+		OpsAuditStop:                       opsAuditStop,
+		TenantPurgeStop:                    tenantPurgeStop,
+		SignupGapReconcilerStop:            signupGapReconcilerStop,
+		RoleRevokeDrainerStop:              roleRevokeDrainerStop,
+		JITExpirySweeperCancel:             jitExpirySweeperCancel,
+		OriginRegistryRefreshCancel:        originRegistryCancel,
+		InvitationExpirySweeperCancel:      invitationExpirySweeperCancel,
+		PlatformElevationSweeperCancel:     platformElevationSweeperCancel,
+		PlatformBreakGlassSLASweeperCancel: platformBreakGlassSLASweeperCancel,
+	}
+}
+
+// platformElevationSweepInterval controls how often
+// PlatformJIT.RunExpirySweep runs. Same rationale as jitExpirySweepInterval
+// above — bounds the over-grant window between an elevation's expires_at
+// and its SpiceDB hxl_platform relationship actually being deleted. The
+// active_elevation caveat already stops CheckPermission from honoring an
+// expired grant even if this sweep is delayed; this loop exists to make
+// the DB row status + the SpiceDB relationship converge to "revoked" /
+// absent promptly, not to be the sole enforcement boundary.
+const platformElevationSweepInterval = 30 * time.Second
+
+// startPlatformElevationSweeper runs PlatformJITService.RunExpirySweep on a
+// fixed interval, DB-driven and idempotent (see the service method's doc
+// comment) — safe to run from every replica without coordination.
+func startPlatformElevationSweeper(svcs *Services) context.CancelFunc {
+	if svcs == nil || svcs.PlatformJIT == nil {
+		logger.Warn("PlatformJITService not wired — platform elevation auto-revoke sweeper NOT started")
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(platformElevationSweepInterval)
+
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				revoked, err := svcs.PlatformJIT.RunExpirySweep(ctx, 100)
+				if err != nil {
+					logger.Error("Platform elevation auto-revoke sweep encountered errors", zap.Error(err), zap.Int("revoked", revoked))
+				} else if revoked > 0 {
+					logger.Info("Platform elevation auto-revoke sweep completed", zap.Int("revoked", revoked))
+				}
+			}
+		}
+	}()
+
+	logger.Info("Platform elevation auto-revoke sweeper started",
+		zap.Duration("interval", platformElevationSweepInterval),
+	)
+	return cancel
+}
+
+// platformBreakGlassSLASweepInterval controls how often
+// PlatformJIT.RunBreakGlassSLASweep runs. Checked far less often than the
+// expiry sweeper above: the SLA window it enforces is 24h
+// (models.BreakGlassRetroactiveApprovalSLA), so a 5-minute poll interval
+// gives ample margin without hammering the DB.
+const platformBreakGlassSLASweepInterval = 5 * time.Minute
+
+// startPlatformBreakGlassSLASweeper runs
+// PlatformJITService.RunBreakGlassSLASweep on a fixed interval. It flags
+// (never auto-revokes) any break-glass activation whose 24h
+// retroactive-approval SLA has lapsed with no approver — see the service
+// method's doc comment for why flagging, not revocation, is correct here.
+func startPlatformBreakGlassSLASweeper(svcs *Services) context.CancelFunc {
+	if svcs == nil || svcs.PlatformJIT == nil {
+		logger.Warn("PlatformJITService not wired — break-glass SLA sweeper NOT started")
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ticker := time.NewTicker(platformBreakGlassSLASweepInterval)
+
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				violations, err := svcs.PlatformJIT.RunBreakGlassSLASweep(ctx, 100)
+				if err != nil {
+					logger.Error("Break-glass SLA sweep encountered errors", zap.Error(err), zap.Int("violations", violations))
+				} else if violations > 0 {
+					logger.Error("PLATFORM BREAK-GLASS SLA VIOLATION(S) DETECTED — retroactive approval overdue", zap.Int("violations", violations))
+				}
+			}
+		}
+	}()
+
+	logger.Info("Break-glass 24h retroactive-approval SLA sweeper started",
+		zap.Duration("interval", platformBreakGlassSLASweepInterval),
+	)
+	return cancel
+}
+
+// jitExpirySweepInterval controls how often ExpireGrants runs. A JIT grant's
+// worst-case over-grant window (time between expires_at and the SpiceDB
+// relationship actually being deleted) is bounded by this interval, so it is
+// deliberately short relative to the minimum grant duration (60s).
+const jitExpirySweepInterval = 30 * time.Second
+
+// startJITExpirySweeper runs JITAccessService.ExpireGrants on a fixed
+// interval so that a grant's expires_at is actually enforced: without this
+// loop, an expired grant's SpiceDB role#member relationship (the boundary
+// AuthorizationEngine.CheckPermission consults) is never removed, and the
+// elevation silently outlives its own expiry. Returns a cancel func for
+// graceful shutdown; a nil JITAccess service (should not happen — wired
+// unconditionally in cmd/services.go) is handled defensively by not
+// starting the loop.
+func startJITExpirySweeper(svcs *Services) context.CancelFunc {
+	if svcs == nil || svcs.JITAccess == nil {
+		logger.Warn("JIT access expiry sweeper not started: JITAccessService unavailable")
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(jitExpirySweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := svcs.JITAccess.ExpireGrants(ctx); err != nil {
+					logger.Error("JIT access expiry sweep encountered errors", zap.Error(err))
+				}
+			}
+		}
+	}()
+	logger.Info("JIT access expiry sweeper started",
+		zap.Duration("interval", jitExpirySweepInterval),
+	)
+	return cancel
+}
+
+// invitationExpirySweepInterval controls how often overdue pending
+// iam_team_invitations are flipped to 'expired' and their
+// tenant_seat_counters.seats_pending reservations released. A 14-day
+// invitation expiry does not need second-level precision, so this runs far
+// less often than the JIT sweeper: an invitation sitting a few minutes past
+// its own expires_at before the sweep catches it only delays freeing a
+// pending seat by that long, and GetByTokenForUpdate/IsValid already refuse
+// an expired-but-not-yet-swept token synchronously either way.
+const invitationExpirySweepInterval = 5 * time.Minute
+
+// startInvitationExpirySweeper runs
+// TeamInvitationRepository.ExpirePendingAndReleaseSeats on a fixed interval
+// (the product roadmap §4.1 "invitations ... expiry job";
+// the product specification §13.2/§13.7). Without this loop, an
+// expired invitation's seat reservation would hold seats_pending forever
+// once its own status flip finally happens on next access (accept/list),
+// permanently shrinking a tenant's effective seat_limit headroom for
+// invitations nobody will ever accept.
+func startInvitationExpirySweeper(repos *Repositories) context.CancelFunc {
+	if repos == nil || repos.TeamInvitation == nil {
+		logger.Warn("Team invitation expiry sweeper not started: TeamInvitationRepository unavailable")
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(invitationExpirySweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				counts, err := repos.TeamInvitation.ExpirePendingAndReleaseSeats(ctx)
+				if err != nil {
+					logger.Error("Team invitation expiry sweep encountered errors", zap.Error(err))
+					continue
+				}
+				if len(counts) == 0 {
+					continue
+				}
+				if repos.SeatCounter == nil {
+					logger.Warn("Team invitation expiry sweep expired invitations but SeatCounterRepository is unavailable; pending reservations not released",
+						zap.Int("tenants_affected", len(counts)))
+					continue
+				}
+				if err := repos.SeatCounter.ReleaseReservationsBulk(ctx, counts); err != nil {
+					logger.Error("Team invitation expiry sweep: failed to release seat reservations", zap.Error(err))
+				}
+			}
+		}
+	}()
+	logger.Info("Team invitation expiry sweeper started",
+		zap.Duration("interval", invitationExpirySweepInterval),
+	)
+	return cancel
+}
+
+// startSignupGapReconciler wires and starts the two signup-abandonment-
+// recovery background workers (see internal/signupgap):
+//   - a Reconciler that reaps expired, never-completed signup requests
+//     (the genuinely-dead failure shape)
+//   - a GapReconciler that counts currently-recoverable, stalled signup
+//     requests (verified, not completed, not yet expired) and publishes
+//     that count as a gauge for operator visibility
+//
+// Both are driven off repos.SignupRequest directly — no new repository
+// construction needed, since *repositories.SignupRequestRepository
+// already implements both signupgap.ExpiredSignupReaper (DeleteExpired,
+// pre-existing) and signupgap.StallDetector (CountStalledSignups, added
+// alongside this package).
+//
+// Returns a stop function callers invoke on shutdown.
+func startSignupGapReconciler(repos *Repositories) func() {
+	if repos == nil || repos.SignupRequest == nil {
+		logger.Warn("Signup gap reconciler: SignupRequest repository unavailable, not started")
+		return func() {}
+	}
+
+	reapMetrics := signupgap.NewMetrics(prometheus.DefaultRegisterer)
+	reaper := signupgap.NewReconciler(repos.SignupRequest, reapMetrics, logger.Log.Sugar(), signupgap.Config{})
+	reaper.Start(context.Background())
+	logger.Info("Signup gap reap reconciler started")
+
+	gapMetrics := signupgap.NewGapMetrics(prometheus.DefaultRegisterer)
+	gapReconciler := signupgap.NewGapReconciler(repos.SignupRequest, gapMetrics, logger.Log.Sugar(), signupgap.GapConfig{})
+	gapReconciler.Start(context.Background())
+	logger.Info("Signup stall gap reconciler started")
+
+	return func() {
+		gapReconciler.Stop()
+		reaper.Stop()
 	}
 }
 
@@ -214,6 +532,28 @@ func (bt *BackgroundTasks) Stop(svcs *Services) {
 		logger.Info("Tenant projection consumer stopped")
 	}
 
+	if bt.TenantStatusStop != nil {
+		bt.TenantStatusStop()
+	}
+	if bt.OpsAuditStop != nil {
+		bt.OpsAuditStop()
+	}
+	if bt.TenantPurgeStop != nil {
+		bt.TenantPurgeStop()
+	}
+	if bt.EntitlementSyncStop != nil {
+		bt.EntitlementSyncStop()
+		logger.Info("Entitlement sync consumer stopped")
+	}
+
+	if bt.SignupGapReconcilerStop != nil {
+		bt.SignupGapReconcilerStop()
+		logger.Info("Signup gap reconcilers stopped")
+	}
+	if bt.RoleRevokeDrainerStop != nil {
+		bt.RoleRevokeDrainerStop()
+	}
+
 	// Stop BCL outbox drainer first so an in-flight drain tick has a
 	// chance to release its advisory lock cleanly before the rest of
 	// the shutdown cascade.
@@ -226,6 +566,40 @@ func (bt *BackgroundTasks) Stop(svcs *Services) {
 	if bt.GDPRConsumerCancel != nil {
 		bt.GDPRConsumerCancel()
 		logger.Info("GDPR deletion consumer stopped")
+	}
+
+	if svcs != nil && svcs.SoDReevaluator != nil {
+		svcs.SoDReevaluator.Stop()
+		logger.Info("SoD re-evaluation stopped")
+	}
+
+	// Stop JIT access expiry sweeper.
+	if bt.JITExpirySweeperCancel != nil {
+		bt.JITExpirySweeperCancel()
+		logger.Info("JIT access expiry sweeper stopped")
+	}
+
+	// Stop platform-plane JIT elevation auto-revoke + break-glass SLA
+	// sweepers.
+	if bt.PlatformElevationSweeperCancel != nil {
+		bt.PlatformElevationSweeperCancel()
+		logger.Info("Platform elevation auto-revoke sweeper stopped")
+	}
+	if bt.PlatformBreakGlassSLASweeperCancel != nil {
+		bt.PlatformBreakGlassSLASweeperCancel()
+		logger.Info("Break-glass SLA sweeper stopped")
+	}
+
+	// Stop the dynamic CORS/CSRF origin registry's background refresh.
+	if bt.OriginRegistryRefreshCancel != nil {
+		bt.OriginRegistryRefreshCancel()
+		logger.Info("Dynamic CORS/CSRF origin registry background refresh stopped")
+	}
+
+	// Stop the team-invitation expiry sweeper.
+	if bt.InvitationExpirySweeperCancel != nil {
+		bt.InvitationExpirySweeperCancel()
+		logger.Info("Team invitation expiry sweeper stopped")
 	}
 
 	// Stop the provisioning orchestrator's reconciliation loop.
@@ -266,6 +640,10 @@ func (bt *BackgroundTasks) Stop(svcs *Services) {
 	}
 
 	// Stop seat-quota reconciler scheduler
+	if svcs.EmployeeAccessExpiry != nil {
+		svcs.EmployeeAccessExpiry.Stop()
+	}
+
 	if svcs.SeatQuotaReconciler != nil {
 		svcs.SeatQuotaReconciler.StopScheduler()
 		logger.Info("Seat-quota reconciler scheduler stopped")
@@ -300,7 +678,7 @@ func (bt *BackgroundTasks) Stop(svcs *Services) {
 //  2. subscriber.Run  — durable consumer group joins and processes live events.
 //
 // Returns a stop function that callers invoke on shutdown.
-func startTenantProjection(infra *Infrastructure) func() {
+func startTenantProjection(infra *Infrastructure, svcs *Services) func() {
 	cfg := infra.Config
 	if !cfg.TenantProjectionEnabled {
 		logger.Info("Tenant projection consumer disabled (TENANT_PROJECTION_ENABLED=false)")
@@ -338,6 +716,9 @@ func startTenantProjection(infra *Infrastructure) func() {
 	bootstrapURL := cfg.TenantManagementInternalURL
 	bootstrapClient := buildTenantBootstrapClient(cfg, sugar)
 	b := tenantprojection.NewBootstrap(bootstrapClient, bootstrapURL, repo, sugar)
+	if svcs != nil && svcs.SignupTrialProvisioner != nil {
+		b.SetTrialReadyHook(svcs.SignupTrialProvisioner.EnsureTrialProduct)
+	}
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer bootstrapCancel()
 
@@ -362,6 +743,9 @@ func startTenantProjection(infra *Infrastructure) func() {
 		DLQTopic: tenantprojection.DLQTopic,
 	}
 	sub := tenantprojection.NewTenantSubscriber(subCfg, repo, metrics, sugar)
+	if svcs != nil && svcs.SignupTrialProvisioner != nil {
+		sub.SetTrialReadyHook(svcs.SignupTrialProvisioner.EnsureTrialProduct)
+	}
 
 	subCtx, subCancel := context.WithCancel(context.Background())
 	go func() {
@@ -372,6 +756,128 @@ func startTenantProjection(infra *Infrastructure) func() {
 	logger.Info("Tenant projection consumer started",
 		zap.Strings("brokers", brokers),
 		zap.String("group", tenantprojection.ConsumerGroup),
+		zap.Bool("enabled", true),
+	)
+
+	return func() {
+		subCancel()
+		sub.Stop()
+	}
+}
+
+// startModuleAccessReconcile runs the module-access reconcile once, shortly
+// after startup, so tenants whose entitlements predate the provisioner get
+// their module roles and owner grants without an operator step. Every replica
+// runs it; EnsureModuleAccess serializes per tenant with an advisory lock and
+// is idempotent. Disable with MODULE_ACCESS_RECONCILE_ON_STARTUP=false.
+func startModuleAccessReconcile(infra *Infrastructure, svcs *Services) {
+	if !infra.Config.ModuleAccessReconcileOnStartup {
+		logger.Info("Module access startup reconcile disabled (MODULE_ACCESS_RECONCILE_ON_STARTUP=false)")
+		return
+	}
+	if svcs == nil || svcs.ModuleAccess == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Module access startup reconcile panicked", zap.Any("panic", r))
+			}
+		}()
+		time.Sleep(60 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		sum, err := svcs.ModuleAccess.ReconcileAll(ctx)
+		if err != nil {
+			logger.Warn("Module access startup reconcile failed", zap.Error(err))
+			return
+		}
+		logger.Info("Module access startup reconcile finished",
+			zap.Int("tenants", sum.Tenants),
+			zap.Int("roles_provisioned", sum.RolesProvisioned),
+			zap.Int("grants_made", sum.GrantsMade),
+			zap.Int("failed", sum.Failed),
+		)
+	}()
+}
+
+// startAcmeAppGrantSync tops up catalog permission grants on every tenant's
+// existing AcmeApp system roles once, shortly after startup (new catalog
+// permissions such as core:settings:* otherwise never reach existing tenants,
+// since provisioning skips tenants that already have the owner role). Additive
+// and idempotent (DO NOTHING rows + SpiceDB TOUCH), safe on every replica.
+// Disable with ACMEAPP_GRANT_SYNC_ON_STARTUP=false.
+func startAcmeAppGrantSync(infra *Infrastructure, svcs *Services) {
+	if !infra.Config.AcmeAppGrantSyncOnStartup {
+		logger.Info("AcmeApp grant sync disabled (ACMEAPP_GRANT_SYNC_ON_STARTUP=false)")
+		return
+	}
+	if svcs == nil || svcs.AcmeAppRoleProvisioner == nil {
+		return
+	}
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("AcmeApp grant sync panicked", zap.Any("panic", r))
+			}
+		}()
+		time.Sleep(90 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		sum, err := svcs.AcmeAppRoleProvisioner.ReconcileAllTenantRolePermissions(ctx)
+		if err != nil {
+			logger.Warn("AcmeApp grant sync failed", zap.Error(err))
+			return
+		}
+		logger.Info("AcmeApp grant sync finished",
+			zap.Int("tenants", sum.Tenants),
+			zap.Int("failed", sum.Failed),
+		)
+	}()
+}
+
+// startEntitlementSync wires and starts the example.tenant.modules.sync
+// consumer (internal/entitlementsync, the product roadmap §4.1). Unlike
+// startTenantProjection, there is no REST bootstrap snapshot phase: the
+// entitlements table has no separate "authoritative REST source" to
+// cold-start from (tenant-management's mirror IS the snapshot producer),
+// so a fresh consumer simply reads from the earliest retained Kafka
+// offset it hasn't committed yet, or waits for the next periodic full
+// resync tenant-management publishes.
+func startEntitlementSync(infra *Infrastructure, svcs *Services) func() {
+	cfg := infra.Config
+	if !cfg.EntitlementSyncEnabled {
+		logger.Info("Entitlement sync consumer disabled (ENTITLEMENT_SYNC_ENABLED=false)")
+		return func() {}
+	}
+
+	if svcs == nil || svcs.Entitlement == nil {
+		logger.Warn("Entitlement sync: TenantEntitlementService unavailable, consumer not started")
+		return func() {}
+	}
+
+	sugar := logger.Log.Sugar()
+	metrics := entitlementsync.NewMetrics(prometheus.DefaultRegisterer, sugar)
+
+	brokers := splitCSV(cfg.KafkaBrokers)
+	saslCfg := sharedconfig.LoadKafkaSASLConfig()
+	subCfg := entitlementsync.SubscriberConfig{
+		Brokers:  brokers,
+		GroupID:  entitlementsync.ConsumerGroup,
+		SASLCfg:  saslCfg,
+		DLQTopic: entitlementsync.DLQTopic,
+	}
+	sub := entitlementsync.NewSubscriber(subCfg, svcs.Entitlement, metrics, sugar)
+
+	subCtx, subCancel := context.WithCancel(context.Background())
+	go func() {
+		if err := sub.Run(subCtx); err != nil {
+			logger.Error("Entitlement sync consumer exited unexpectedly", zap.Error(err))
+		}
+	}()
+	logger.Info("Entitlement sync consumer started",
+		zap.Strings("brokers", brokers),
+		zap.String("group", entitlementsync.ConsumerGroup),
 		zap.Bool("enabled", true),
 	)
 
@@ -452,4 +958,84 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// startTenantStatus wires and starts the example.tenant.status consumer
+// (internal/tenantstatus, R1-GAPS row 27). It persists tenant suspension state
+// and revokes the tenant's sessions + OAuth tokens on suspend. Like
+// startEntitlementSync there is no REST bootstrap: the consumer group starts at
+// the earliest retained offset and the gate fails open until state arrives.
+func startTenantStatus(infra *Infrastructure, svcs *Services) func() {
+	cfg := infra.Config
+	if !cfg.TenantStatusEnabled {
+		logger.Info("Tenant status consumer disabled (TENANT_STATUS_ENABLED=false)")
+		return func() {}
+	}
+	if svcs == nil || svcs.TenantStatusRepo == nil {
+		logger.Warn("Tenant status: repository unavailable, consumer not started")
+		return func() {}
+	}
+	sugar := logger.Log.Sugar()
+	metrics := tenantstatus.NewMetrics(prometheus.DefaultRegisterer, sugar)
+	brokers := splitCSV(cfg.KafkaBrokers)
+	consumer := tenantstatus.NewConsumer(svcs.TenantStatusRepo, svcs.TenantStatusGate, metrics, sugar)
+	sub := tenantstatus.NewSubscriber(tenantstatus.SubscriberConfig{
+		Brokers:  brokers,
+		GroupID:  tenantstatus.ConsumerGroup,
+		SASLCfg:  sharedconfig.LoadKafkaSASLConfig(),
+		DLQTopic: tenantstatus.DLQTopic,
+	}, consumer, metrics, sugar)
+	subCtx, subCancel := context.WithCancel(context.Background())
+	go func() {
+		if err := sub.Run(subCtx); err != nil {
+			logger.Error("Tenant status consumer exited unexpectedly", zap.Error(err))
+		}
+	}()
+	logger.Info("Tenant status consumer started",
+		zap.Strings("brokers", brokers),
+		zap.String("group", tenantstatus.ConsumerGroup),
+	)
+	return func() {
+		subCancel()
+		sub.Stop()
+	}
+}
+
+// startOpsAudit starts the platform.ops-audit.v1 consumer that appends
+// operator audit events to platform_admin_audit_log (internal/opsaudit,
+// migration 0035). OFF by default (OPS_AUDIT_CONSUMER_ENABLED=false): the
+// table's new columns, event_id index and INSERT-only trigger must be applied
+// first (Keystone bundle falcon-id v0.232.289). A no-op when KAFKA_BROKERS is
+// empty.
+func startOpsAudit(infra *Infrastructure) func() {
+	cfg := infra.Config
+	if !cfg.OpsAuditConsumerEnabled {
+		return func() {}
+	}
+	if infra.DB == nil || infra.DB.Pool == nil {
+		logger.Warn("Ops audit consumer: database unavailable, not started")
+		return func() {}
+	}
+	sugar := logger.Log.Sugar()
+	brokers := splitCSV(cfg.KafkaBrokers)
+	sub := opsaudit.NewSubscriber(opsaudit.SubscriberConfig{
+		Brokers: brokers,
+		GroupID: opsaudit.ConsumerGroup,
+		SASLCfg: sharedconfig.LoadKafkaSASLConfig(),
+	}, opsaudit.NewConsumer(infra.DB.Pool), sugar)
+	subCtx, subCancel := context.WithCancel(context.Background())
+	go func() {
+		if err := sub.Run(subCtx); err != nil {
+			logger.Error("Ops audit consumer exited unexpectedly", zap.Error(err))
+		}
+	}()
+	logger.Info("Ops audit consumer started",
+		zap.Strings("brokers", brokers),
+		zap.String("topic", opsaudit.Topic),
+		zap.String("group", opsaudit.ConsumerGroup),
+	)
+	return func() {
+		subCancel()
+		sub.Stop()
+	}
 }

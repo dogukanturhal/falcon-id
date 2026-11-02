@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/dogukanturhal/falcon-id/pkg/leaderelection"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ----------------------------------------------------------------------------
@@ -251,16 +252,18 @@ func TestNew_MethodRouting(t *testing.T) {
 				LockID:   999,
 			}
 
-			// A nil pool is used for advisory_lock tests that expect an error.
-			// For cases that need a pool but we cannot create a real pgxpool in
-			// a unit test, we pass nil and rely on the factory to validate it.
-			// The advisory_lock_with_pool case requires a real pool which is not
-			// available here, so skip the positive advisory_lock check.
-			if tc.pool && tc.method != "k8s_lease" {
-				t.Skip("positive advisory_lock test requires a live PostgreSQL pool — skipped in unit tests")
+			// Factory construction is lazy: it needs a real pool object, not a
+			// live server. No advisory-lock acquisition is performed here.
+			var pool *pgxpool.Pool
+			if tc.pool {
+				var err error
+				pool, err = pgxpool.New(context.Background(), "postgres://test@127.0.0.1:1/test")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer pool.Close()
 			}
-
-			_, err := leaderelection.New(cfg, nil)
+			_, err := leaderelection.New(cfg, pool)
 
 			if tc.wantError && err == nil {
 				t.Errorf("expected an error, got nil")

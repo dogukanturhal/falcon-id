@@ -61,8 +61,8 @@ func newCatalogTestRouter(h *CatalogHandler) *gin.Engine {
 // sampleProduct returns a deterministic active Product for use in tests.
 func sampleProduct(name, slug string) models.Product {
 	desc := fmt.Sprintf("%s description", name)
-	iconURL := fmt.Sprintf("https://cdn.hexxlock.com/%s.png", slug)
-	homepageURL := fmt.Sprintf("https://hexxlock.com/products/%s", slug)
+	iconURL := fmt.Sprintf("https://cdn.example.com/%s.png", slug)
+	homepageURL := fmt.Sprintf("https://example.com/products/%s", slug)
 	return models.Product{
 		ID:          uuid.MustParse("00000000-0000-0000-0000-000000000001"),
 		Name:        name,
@@ -98,7 +98,7 @@ func TestListProducts_ReturnsActiveOnly(t *testing.T) {
 	router := newCatalogTestRouter(h)
 
 	product1 := sampleProduct("Example Suite", "examplesuite")
-	product2 := sampleProduct("HexxLock Hotel PMS", "hexxlock-hotel-pms")
+	product2 := sampleProduct("HexxLock Example PMS", "example-pms")
 	product2.ID = uuid.MustParse("00000000-0000-0000-0000-000000000002")
 
 	repo.On("ListActive", mock.Anything, 1, 20).

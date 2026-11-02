@@ -23,14 +23,36 @@ const (
 // account, tracks verification state, and is finalised into a real User and
 // (optionally) Tenant once the email has been verified and the password set.
 type SignupRequest struct {
-	ID                uuid.UUID  `json:"id" db:"id"`
-	Email             string     `json:"email" db:"email"`
-	FirstName         *string    `json:"first_name,omitempty" db:"first_name"`
-	LastName          *string    `json:"last_name,omitempty" db:"last_name"`
-	AccountType       string     `json:"account_type" db:"account_type"` // "personal" or "business"
-	CompanyName       *string    `json:"company_name,omitempty" db:"company_name"`
-	CompanySlug       *string    `json:"company_slug,omitempty" db:"company_slug"`
+	ID          uuid.UUID `json:"id" db:"id"`
+	Email       string    `json:"email" db:"email"`
+	FirstName   *string   `json:"first_name,omitempty" db:"first_name"`
+	LastName    *string   `json:"last_name,omitempty" db:"last_name"`
+	AccountType string    `json:"account_type" db:"account_type"` // "personal" or "business"
+	CompanyName *string   `json:"company_name,omitempty" db:"company_name"`
+	CompanySlug *string   `json:"company_slug,omitempty" db:"company_slug"`
+	// Continuation is the validated /oauth/authorize URL the signup started
+	// from, kept server-side so verify/complete (possibly on another tab or
+	// device) can send the person back into the OIDC flow. Never serialised.
+	Continuation      *string    `json:"-" db:"continuation"`
+	// CompletionSecretHash is the SHA-256 (hex) of the single-use secret that
+	// VerifyEmail hands ONLY to the caller who presented the emailed
+	// verification token. CompleteSignup requires it, so knowing a signup id
+	// (returned to anyone who starts a signup for an address) is not enough to
+	// claim the mailbox's account. Cleared on completion.
+	CompletionSecretHash *string `json:"-" db:"completion_secret_hash"`
+	// CompletionSecret is the plaintext secret, set in memory by VerifyEmail
+	// for the response only. Never persisted, never serialised.
+	CompletionSecret string `json:"-" db:"-"`
 	VerificationToken string     `json:"-" db:"verification_token"` // Never expose
+	// VerificationCodeHash is the hex hash of the current 6-digit email code;
+	// nil marks a legacy row still verified by VerificationToken. The expiry
+	// and attempt counter belong to that code. Never serialised.
+	VerificationCodeHash      *string    `json:"-" db:"verification_code_hash"`
+	VerificationCodeExpiresAt *time.Time `json:"-" db:"verification_code_expires_at"`
+	VerificationAttempts      int        `json:"-" db:"verification_attempts"`
+	// VerificationFailedTotal counts wrong guesses over the row's lifetime
+	// (resends do not reset it); see signupCodeRowMaxFailures.
+	VerificationFailedTotal int `json:"-" db:"verification_failed_total"`
 	Verified          bool       `json:"verified" db:"verified"`
 	VerifiedAt        *time.Time `json:"verified_at,omitempty" db:"verified_at"`
 	Completed         bool       `json:"completed" db:"completed"`
@@ -71,10 +93,10 @@ type CreateSignupRequestInput struct {
 	LastName    string `json:"last_name" binding:"omitempty,max=100"`
 	AccountType string `json:"account_type" binding:"required,oneof=personal business"`
 	// CompanyName was previously required_if=AccountType business. Relaxed
-	// to omitempty: the Mearax signup page collects only email+password up
+	// to omitempty: the AcmeWeb signup page collects only email+password up
 	// front (mirroring Brevo's structure) and defers company name to
 	// onboarding wizard step 1. provisionTenant falls back to the display
-	// name "My Company" when this is empty — that placeholder name is
+	// name PlaceholderTenantName ("My Company") when this is empty — that placeholder name is
 	// deliberate and fine to reuse across tenants. The SLUG is different:
 	// it must be unique per tenant, so provisionTenant does NOT fall back
 	// to a fixed literal for it. When no CompanySlug is supplied either
@@ -101,11 +123,27 @@ type CreateSignupRequestInput struct {
 	// SignupService.InitiateSignup so a rejection can return a specific,
 	// slug-tenant-enumeration-safe reason (see models.ReservedTenantSlugs).
 	Slug string `json:"slug" binding:"omitempty,max=100"`
+
+	// Continuation is OPTIONAL: the relative /oauth/authorize URL of the
+	// OIDC request that sent the person to sign up. It is validated
+	// server-side (exact path, active client, registered redirect_uri) and
+	// returned as CompleteSignup's redirect_url so the flow resumes after
+	// verification, even when the verification link opens in another
+	// browser or device. Anything that fails validation is rejected, never
+	// silently dropped.
+	Continuation string `json:"continuation" binding:"omitempty,max=4096"`
 }
 
 // VerifySignupEmailInput carries the one-time token sent to the user's email address.
+//
+// New flow: Code (6 digits; spaces and dashes tolerated) plus SignupID or Email
+// (the code is never looked up on its own). Legacy flow: Token only, accepted
+// for rows created before the code rollout.
 type VerifySignupEmailInput struct {
-	Token string `json:"token" binding:"required"`
+	SignupID string `json:"signup_id" binding:"omitempty,max=64"`
+	Email    string `json:"email" binding:"omitempty,max=320"`
+	Code     string `json:"code" binding:"omitempty,max=32"`
+	Token    string `json:"token" binding:"omitempty,max=256"`
 }
 
 // CompleteSignupInput finalises account creation after email verification.
@@ -128,29 +166,44 @@ type VerifySignupEmailInput struct {
 // and never reach this validation.
 type CompleteSignupInput struct {
 	SignupRequestID uuid.UUID `json:"signup_request_id" binding:"required"`
+	// CompletionSecret is the one-time secret returned by the verify-email
+	// call. A missing or wrong value is answered exactly like an unknown
+	// signup_request_id.
+	CompletionSecret string `json:"completion_secret"`
 	// Policy validation belongs to the service, including missing passwords.
 	// No independent binding minimum that can drift from the public contract.
 	Password string `json:"password"`
-	// PlanCode is the subscription_packages.code the user picked during
-	// the signup wizard's plan-selection step (e.g. "starter"/
-	// "professional"/"scale"). Deliberately carried on THIS request, not
-	// persisted on SignupRequest at InitiateSignup time: the plan choice
-	// is UI-only state the client already holds across the wizard's
-	// steps (same as Password, which is likewise never captured at
-	// Initiate), so completing the flow needs no new signup_requests
-	// column / Keystone migration. REQUIRED as of 2026-09-17 (t-<planreq>):
-	// SignupService.CompleteSignup rejects an empty PlanCode with
-	// SignupStateError{Code: "plan_required"} before doing any
-	// provisioning work. Previously optional/empty meant the user could
-	// skip plan choice entirely — but that left no trial subscription
-	// row for the tenant at all, so nothing could expire, convert, or be
-	// dunned; closing that commercial gap is the entire point of this
-	// field being mandatory now. binding stays "omitempty" (validated in
-	// code, not via gin, mirroring how Password has no binding tag
-	// either) — see the plan_required check in CompleteSignup. Still
-	// never independently trusted for billing: subscription-management
-	// resolves and validates the actual package server-side (see
-	// TrialService.StartTrial's PackageCode handling in
-	// platform-commerce) — this is a selection hint, not billing state.
+	// PlanCode is the subscription_packages.code the user picked, IF the
+	// client collected one — the signup wizard no longer has a
+	// plan-selection step (removed 2026-09-18, t-signup-no-plan-step): every
+	// self-serve signup starts on the reverse trial and plan choice is
+	// surfaced later, at the upgrade/limit-hit moment. Deliberately carried
+	// on THIS request rather than persisted on SignupRequest at
+	// InitiateSignup time, same as Password. OPTIONAL — briefly REQUIRED
+	// 2026-09-17..2026-09-18 (e75eeb7, reverted here) when
+	// SignupService.CompleteSignup rejected an empty PlanCode with
+	// SignupStateError{Code: "plan_required"}. That was fixing a real gap
+	// (empty plan meant no trial subscription row at all — nothing to
+	// expire, convert, or dun), but the gap is now closed a layer down
+	// instead: subscription-management's TrialService.StartTrial always
+	// grants the reverse trial on the operator-configured top self-serve
+	// tier (subscription_packages.is_default=true, resolved via
+	// packageRepo.FindDefault) regardless of whether PackageCode is empty —
+	// see that function's 2026-09-18 reverse-trial-redesign doc comment.
+	// PlanCode, when present, only picks the DESTINATION package the trial
+	// converts to at day 14; it was never what gated whether a trial
+	// started. binding stays "omitempty" (validated in code, not via gin,
+	// mirroring Password). Still never independently trusted for billing:
+	// subscription-management resolves and validates the actual package
+	// server-side — this is a selection hint, not billing state.
 	PlanCode string `json:"plan_code" binding:"omitempty,max=64"`
+	// CompanyName, Slug and MarketingConsent are collected on the company
+	// step, after email verification. They are applied only while the
+	// request has not yet provisioned a tenant: on a resumed completion the
+	// slug already registered wins and these are ignored. Slug is an
+	// optional explicit subdomain; without it one is derived from
+	// CompanyName.
+	CompanyName      string `json:"company_name" binding:"omitempty,max=255"`
+	Slug             string `json:"slug" binding:"omitempty,max=100"`
+	MarketingConsent *bool  `json:"marketing_consent"`
 }

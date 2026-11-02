@@ -74,6 +74,52 @@ type PermissionService struct {
 	auditService       *AuditService
 	spicedbSyncer      SpiceDBPermSyncer
 	entitlementChecker ModuleEntitlementChecker
+
+	// Role templates (the product roadmap §4.1) — all optional/nil-safe. A
+	// deployment that never calls SetRoleTemplateRepo behaves exactly as
+	// before RegisterModuleRequest.RoleTemplates existed: a manifest that
+	// tries to use it gets a clear error instead of a nil-pointer panic
+	// (see RegisterModule).
+	roleTemplateRepo      roleTemplateFullRepo
+	roleTemplateValidator *RoleTemplateValidator
+	templateProvisioner   *TemplateRoleProvisioner
+	moduleAccessReconcile permissionModuleReconciler
+}
+
+// permissionModuleReconciler re-runs module-access provisioning for tenants
+// already entitled to a permission module whose permissions or role templates
+// were just registered.
+type permissionModuleReconciler interface {
+	ReconcilePermissionModule(ctx context.Context, permissionModule string) (*ModuleAccessReconcileSummary, error)
+}
+
+// SetModuleAccessReconciler wires the first-registration reconcile.
+// Optional: nil skips it.
+func (s *PermissionService) SetModuleAccessReconciler(r permissionModuleReconciler) {
+	s.moduleAccessReconcile = r
+}
+
+// templateModuleReconcileTimeout bounds the detached reconcile fired after a
+// module registers new permissions or templates.
+const templateModuleReconcileTimeout = 5 * time.Minute
+
+// roleTemplateFullRepo is the subset of RoleTemplateRepository
+// PermissionService.RegisterModule needs to persist and idempotency-check
+// role templates.
+type roleTemplateFullRepo interface {
+	roleTemplateLatestLookup
+	Create(ctx context.Context, t *models.RoleTemplate) error
+}
+
+// SetRoleTemplateSupport wires the role-template repository, validator and
+// provisioner into RegisterModule. All three are constructed together
+// because ReconcileVersionBump (via provisioner) depends on the same
+// repository the validator/create path uses — see cmd/services.go for the
+// concrete wiring.
+func (s *PermissionService) SetRoleTemplateSupport(repo roleTemplateFullRepo, validator *RoleTemplateValidator, provisioner *TemplateRoleProvisioner) {
+	s.roleTemplateRepo = repo
+	s.roleTemplateValidator = validator
+	s.templateProvisioner = provisioner
 }
 
 // SetSpiceDBSyncer wires an optional SpiceDB sync callback. When set, Create() and
@@ -85,7 +131,10 @@ func (s *PermissionService) SetSpiceDBSyncer(syncer SpiceDBPermSyncer) {
 
 // SetModuleEntitlementChecker wires an optional module entitlement checker.
 // When set, tenant-aware listing methods filter permissions to the modules the
-// tenant is subscribed to. Errors from the checker are fail-open.
+// tenant is subscribed to. Errors from the checker are fail-closed (spec 23
+// §1.4): a module whose entitlement check errors is excluded from the
+// result, and a repo-level failure propagates as an error instead of
+// silently returning every module.
 func (s *PermissionService) SetModuleEntitlementChecker(checker ModuleEntitlementChecker) {
 	s.entitlementChecker = checker
 }
@@ -203,13 +252,138 @@ func (s *PermissionService) RegisterModule(ctx context.Context, req *models.Regi
 		permResponses[i] = *perm.ToResponse()
 	}
 
+	templateResponses, _, err := s.registerRoleTemplates(ctx, req, permissions)
+	if err != nil {
+		return nil, err
+	}
+
+	// Registration is also the durable repair point for already-entitled
+	// tenants. Re-run even when every catalog row already exists: a previous
+	// role or SpiceDB write may have partially failed, while an idempotent
+	// catalog upsert reports registered == 0. Detached and best-effort: it must
+	// neither delay nor fail registration.
+	if s.moduleAccessReconcile != nil {
+		go func(module string, r permissionModuleReconciler) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					logger.Log.Error("module access: reconcile after registration panicked",
+						zap.String("module", module), zap.Any("panic", rec))
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), templateModuleReconcileTimeout)
+			defer cancel()
+			if _, err := r.ReconcilePermissionModule(ctx, module); err != nil {
+				logger.Log.Warn("module access: reconcile after registration failed",
+					zap.String("module", module), zap.Error(err))
+			}
+		}(req.Module, s.moduleAccessReconcile)
+	}
+
 	return &models.RegisterModuleResponse{
-		Module:      req.Module,
-		Registered:  registered,
-		Updated:     updated,
-		Deprecated:  deprecated,
-		Permissions: permResponses,
+		Module:        req.Module,
+		Registered:    registered,
+		Updated:       updated,
+		Deprecated:    deprecated,
+		Permissions:   permResponses,
+		RoleTemplates: templateResponses,
 	}, nil
+}
+
+// registerRoleTemplates validates and persists req.RoleTemplates (a no-op,
+// returning nil, when the request has none — every RegisterModule caller
+// that doesn't use this feature is unaffected). See RoleTemplateValidator
+// for the ownership/monotonic-version rules enforced here.
+func (s *PermissionService) registerRoleTemplates(ctx context.Context, req *models.RegisterModuleRequest, registeredPermissions []*models.Permission) (responses []models.RoleTemplateResponse, firstRegistration bool, err error) {
+	if len(req.RoleTemplates) == 0 {
+		return nil, false, nil
+	}
+	if s.roleTemplateRepo == nil {
+		return nil, false, fmt.Errorf("role_templates: role template registration is not enabled on this deployment")
+	}
+
+	permissionNamesInRequest := make(map[string]bool, len(registeredPermissions))
+	for _, p := range registeredPermissions {
+		permissionNamesInRequest[p.Name] = true
+	}
+
+	existingModulePermissions := make(map[string]bool)
+	catalogModules := append([]string{req.Module}, req.Dependencies...)
+	existing, err := s.permissionRepo.ListByModules(ctx, catalogModules)
+	if err != nil {
+		return nil, false, fmt.Errorf("role_templates: load existing catalog for validation: %w", err)
+	}
+	for _, p := range existing {
+		existingModulePermissions[p.Name] = true
+	}
+
+	validator := s.roleTemplateValidator
+	if validator == nil {
+		validator = NewRoleTemplateValidator(s.roleTemplateRepo)
+	}
+	if err := validator.ValidateManifest(ctx, req.Module, req.Dependencies, permissionNamesInRequest, existingModulePermissions, req.RoleTemplates); err != nil {
+		return nil, false, err
+	}
+
+	responses = make([]models.RoleTemplateResponse, 0, len(req.RoleTemplates))
+	for _, def := range req.RoleTemplates {
+		latest, err := s.roleTemplateRepo.GetLatestByKey(ctx, def.Key)
+		if err != nil {
+			return nil, false, fmt.Errorf("role_templates: key %q: look up latest version: %w", def.Key, err)
+		}
+		if latest != nil && latest.Version == def.Version {
+			// Validator already confirmed identical content. Retry the idempotent
+			// reconcile in case a previous per-tenant template update failed.
+			responses = append(responses, *latest.ToResponse())
+			if s.templateProvisioner != nil {
+				if _, reconcileErr := s.templateProvisioner.ReconcileVersionBump(ctx, def.Key, def.Version); reconcileErr != nil {
+					logger.Log.Warn("role_templates: reconcile-on-registration retry failed",
+						zap.String("key", def.Key),
+						zap.Int("version", def.Version),
+						zap.Error(reconcileErr),
+					)
+				}
+			}
+			continue
+		}
+
+		rt := &models.RoleTemplate{
+			Key:              def.Key,
+			Version:          def.Version,
+			Module:           req.Module,
+			Name:             def.Name,
+			NameI18n:         def.NameI18n,
+			DescriptionI18n:  def.DescriptionI18n,
+			Permissions:      def.Permissions,
+			SpiceDBRelations: def.SpiceDBRelations,
+		}
+		if def.Description != "" {
+			rt.Description = &def.Description
+		}
+		if err := s.roleTemplateRepo.Create(ctx, rt); err != nil {
+			return nil, false, fmt.Errorf("role_templates: key %q: create version %d: %w", def.Key, def.Version, err)
+		}
+		responses = append(responses, *rt.ToResponse())
+		if latest == nil {
+			firstRegistration = true
+		}
+
+		// A version bump on an already-registered key must reconcile every
+		// tenant's existing role derived from it (add/remove permissions to
+		// match the new version). Best-effort: this runs inside the
+		// service-startup RegisterModule call path, so a reconcile failure
+		// must never fail registration itself — ReconcileVersionBump already
+		// logs and skips individual role failures internally.
+		if latest != nil && s.templateProvisioner != nil {
+			if _, reconcileErr := s.templateProvisioner.ReconcileVersionBump(ctx, def.Key, def.Version); reconcileErr != nil {
+				logger.Log.Warn("role_templates: reconcile-on-version-bump failed",
+					zap.String("key", def.Key),
+					zap.Int("version", def.Version),
+					zap.Error(reconcileErr),
+				)
+			}
+		}
+	}
+	return responses, firstRegistration, nil
 }
 
 // defaultDeprecationSunsetWindow is the time between soft-deprecation and the
@@ -307,16 +481,27 @@ func (s *PermissionService) ListGroupedByModule(ctx context.Context) ([]models.P
 }
 
 // getEntitledModules returns the modules a tenant is subscribed to.
-// Always includes "core" and "iam". Returns nil (no filtering) when the
-// entitlement checker is not configured or on any error (fail-open).
-func (s *PermissionService) getEntitledModules(ctx context.Context, tenantID uuid.UUID) []string {
+// Always includes "core" and "iam". Returns (nil, nil) when no entitlement
+// checker is wired at all, which is a deliberate "filtering disabled"
+// configuration, not a runtime failure — callers fall back to the
+// unfiltered list in that case.
+//
+// Per spec 23 §1.4, this is fail-CLOSED, not fail-open: a repo/entitlement
+// check outage must never make the permission catalog show everything.
+//   - If the module list itself can't be loaded, the whole check is
+//     unavailable: return an empty set plus the error, so callers can
+//     surface "temporarily unavailable" instead of showing all modules.
+//   - If a single module's entitlement check errors, that module is
+//     excluded from the result (narrower, not wider, than a correct answer).
+func (s *PermissionService) getEntitledModules(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
 	if s.entitlementChecker == nil {
-		return nil
+		return nil, nil
 	}
 
 	allModules, err := s.permissionRepo.GetModules(ctx)
 	if err != nil {
-		return nil // fail-open
+		// Fail-closed: entitlement is unavailable, not "everything".
+		return []string{}, fmt.Errorf("getEntitledModules: %w", err)
 	}
 
 	// Universal modules always included
@@ -333,9 +518,13 @@ func (s *PermissionService) getEntitledModules(ctx context.Context, tenantID uui
 		}
 		ok, err := s.entitlementChecker.IsTenantEntitled(ctx, tenantID, module)
 		if err != nil {
-			// Fail-open: include module if check errors
-			entitled = append(entitled, module)
-			seen[module] = true
+			// Fail-closed: exclude the module if its check errors, rather
+			// than assuming entitlement.
+			logger.Warn("module entitlement check failed, excluding module (fail-closed)",
+				zap.Error(err),
+				zap.String("tenant_id", tenantID.String()),
+				zap.String("module", module),
+			)
 			continue
 		}
 		if ok {
@@ -344,13 +533,17 @@ func (s *PermissionService) getEntitledModules(ctx context.Context, tenantID uui
 		}
 	}
 
-	return entitled
+	return entitled, nil
 }
 
 // ListForTenant returns permissions filtered to the modules the tenant is subscribed to.
-// Falls back to returning all permissions on error or when no entitlement checker is wired.
+// Falls back to returning all permissions only when no entitlement checker is wired;
+// an entitlement-check error is propagated (fail-closed) rather than falling back.
 func (s *PermissionService) ListForTenant(ctx context.Context, tenantID uuid.UUID) (*models.PermissionListResponse, error) {
-	modules := s.getEntitledModules(ctx, tenantID)
+	modules, err := s.getEntitledModules(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("ListForTenant: %w", err)
+	}
 	if modules == nil {
 		return s.List(ctx)
 	}
@@ -360,7 +553,10 @@ func (s *PermissionService) ListForTenant(ctx context.Context, tenantID uuid.UUI
 // ListGroupedByModuleForTenant returns permissions grouped by module, filtered by
 // the tenant's subscribed modules.
 func (s *PermissionService) ListGroupedByModuleForTenant(ctx context.Context, tenantID uuid.UUID) ([]models.PermissionsByModule, error) {
-	modules := s.getEntitledModules(ctx, tenantID)
+	modules, err := s.getEntitledModules(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("ListGroupedByModuleForTenant: %w", err)
+	}
 	if modules == nil {
 		return s.ListGroupedByModule(ctx)
 	}
@@ -387,9 +583,13 @@ func (s *PermissionService) ListGroupedByModuleForTenant(ctx context.Context, te
 }
 
 // ListModulesForTenant returns only the module names the tenant is entitled to.
-// Falls back to all modules when no entitlement checker is wired.
+// Falls back to all modules only when no entitlement checker is wired; an
+// entitlement-check error is propagated (fail-closed) rather than falling back.
 func (s *PermissionService) ListModulesForTenant(ctx context.Context, tenantID uuid.UUID) ([]string, error) {
-	modules := s.getEntitledModules(ctx, tenantID)
+	modules, err := s.getEntitledModules(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("ListModulesForTenant: %w", err)
+	}
 	if modules == nil {
 		return s.ListModules(ctx)
 	}

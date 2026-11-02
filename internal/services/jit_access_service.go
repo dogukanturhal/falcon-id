@@ -4,6 +4,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,12 +13,50 @@ import (
 	"go.uber.org/zap"
 )
 
-// jitSpiceDBClient defines the SpiceDB operations required by JITAccessService.
-// It is a subset of the broader SpiceDBClient interface to keep the dependency
-// surface minimal and make testing straightforward.
+// Errors returned by JITAccessService's eligibility/step-up gate. Handlers
+// map these to specific HTTP statuses (403/428) rather than a generic 400.
+var (
+	// ErrNotEligible is returned when the requesting user has no standing
+	// iam_jit_eligible row for the requested role at all.
+	ErrNotEligible = errors.New("user is not eligible for just-in-time access to this role")
+	// ErrEligibilityWindow is returned when an eligibility row exists but its
+	// valid_from/valid_until window does not currently cover "now".
+	ErrEligibilityWindow = errors.New("eligibility for this role is not currently within its valid window")
+	// ErrDurationExceedsEligibility is returned when the requested duration
+	// exceeds the max_duration_seconds ceiling set on the eligibility row.
+	ErrDurationExceedsEligibility = errors.New("requested duration exceeds the maximum allowed for this eligibility")
+	// ErrStepUpRequired is returned when the eligibility row requires a
+	// recent step-up MFA verification and the caller's session does not have
+	// one on file.
+	ErrStepUpRequired = errors.New("a recent step-up MFA verification is required to request this role")
+)
+
+// jitStepUpMaxAge bounds how recent a step-up MFA verification must be to
+// satisfy an eligibility row with RequiresMFA=true. Matches the default used
+// elsewhere in the codebase for sensitive-action step-up (see
+// internal/middleware/step_up.go callers).
+const jitStepUpMaxAge = 5 * time.Minute
+
+// JITStepUpAction is the step-up action string associated with requesting
+// JIT access. Recorded/queried against iam_step_up_verifications.
+const JITStepUpAction = "jit_access_request"
+
+// jitSpiceDBClient defines the SpiceDB operations required by
+// JITAccessService. Its shape matches pkg/spicedb.Client's WriteUserRoleUntil/
+// DeleteUserRole directly (uuid-based, tenant-scoped role#member writes) so
+// *spicedb.Client can be passed in as-is with no adapter type — Go's
+// structural interfaces make that satisfaction automatic. SpiceDB is the
+// sole runtime authority AuthorizationEngine.CheckPermission consults, so
+// these calls are the actual enforcement boundary for a JIT grant, not a
+// side effect of it.
 type jitSpiceDBClient interface {
-	WriteRelationship(ctx context.Context, tenantID uuid.UUID, relationship interface{}) error
-	DeleteRelationship(ctx context.Context, tenantID uuid.UUID, relationship interface{}) error
+	// WriteUserRoleUntil grants tenantID-scoped role membership to userID for
+	// roleID, caveated with active_elevation(expires_at) so it stops passing
+	// checks at expiresAt even if the expiry sweeper is late. Returns the
+	// SpiceDB zedtoken for the write.
+	WriteUserRoleUntil(ctx context.Context, tenantID, userID, roleID uuid.UUID, expiresAt time.Time) (string, error)
+	// DeleteUserRole revokes the tenantID-scoped role membership.
+	DeleteUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) (string, error)
 }
 
 // jitAccessServiceRepo defines the persistence contract for JIT access grants.
@@ -30,6 +69,12 @@ type jitAccessServiceRepo interface {
 
 	// UpdateStatus atomically transitions a grant to a new status.
 	UpdateStatus(ctx context.Context, id uuid.UUID, status models.JITAccessStatus) error
+	// FinalizeGrant persists status, projection removal and the delete outbox
+	// atomically.
+	FinalizeGrant(ctx context.Context, grant *models.JITAccessGrant, status models.JITAccessStatus) error
+	// QueueActivationRollback durably compensates a failed activation without
+	// overwriting a concurrent grant-state transition.
+	QueueActivationRollback(ctx context.Context, grant *models.JITAccessGrant) error
 
 	// Approve records approval metadata and transitions the grant to "approved".
 	Approve(ctx context.Context, id, approverID uuid.UUID, startsAt time.Time) error
@@ -45,39 +90,140 @@ type jitAccessServiceRepo interface {
 	ListExpiredActive(ctx context.Context, limit int) ([]*models.JITAccessGrant, error)
 }
 
+// jitEligibleRepo defines the eligibility lookup required by JITAccessService
+// to gate elevation. Matches *repositories.JITEligibleRepository.
+type jitEligibleRepo interface {
+	// GetForUserRole returns the eligibility row for (user, role), or
+	// (nil, nil) when no such row exists.
+	GetForUserRole(ctx context.Context, userID, roleID uuid.UUID) (*models.JITEligible, error)
+}
+
+// jitStepUpRepo defines the step-up MFA verification lookup required to
+// satisfy eligibility rows with RequiresMFA=true. Matches
+// *repositories.StepUpVerificationRepository (also used directly by
+// middleware.StepUpMiddleware).
+type jitStepUpRepo interface {
+	HasRecentVerification(ctx context.Context, sessionID uuid.UUID, action string, maxAge time.Duration) (bool, error)
+}
+
+// jitUserRoleWriter writes the secondary, best-effort iam_user_roles
+// time-boxed projection of an active JIT grant. This projection is NOT the
+// authorization boundary — SpiceDB is — but keeps the grant visible to the
+// team/role picker, audit queries, and admin priority checks that already
+// filter on iam_user_roles.expires_at. Matches *repositories.UserRepository.
+type jitUserRoleWriter interface {
+	AddTimeBoundRole(ctx context.Context, userID, roleID, assignedBy uuid.UUID, expiresAt time.Time) (uuid.UUID, error)
+	RemoveTimeBoundRole(ctx context.Context, userID, roleID uuid.UUID) error
+}
+
 // JITAccessService manages just-in-time access grants: request, approval,
-// activation, expiry, and revocation.
+// activation, expiry, and revocation. Elevation is gated by a standing
+// iam_jit_eligible record (who MAY request the role, and under what
+// constraints — max duration, MFA, approval); enforcement of an active grant
+// happens exclusively through the SpiceDB role#member relationship written
+// in ActivateGrant, because AuthorizationEngine.CheckPermission consults
+// SpiceDB only. The iam_user_roles time-boxed row written alongside it is a
+// secondary, best-effort projection for UI/audit visibility.
 type JITAccessService struct {
 	repo         jitAccessServiceRepo
+	eligible     jitEligibleRepo
+	stepUp       jitStepUpRepo
+	userRoles    jitUserRoleWriter
 	spicedb      jitSpiceDBClient
+	roleRevokes  roleRevokeDrain
 	auditService *AuditService
 	logger       *zap.Logger
 }
 
-// NewJITAccessService creates a new JITAccessService.
+// NewJITAccessService creates a new JITAccessService. spicedb must be
+// non-nil in any environment that serves traffic: ActivateGrant fails closed
+// if a SpiceDB write fails. Revokes/expiry commit to PostgreSQL with a durable
+// delete outbox, so a SpiceDB outage cannot prevent a revoke. See
+// AuthorizationEngine.CheckPermission, which denies when its own SpiceDB
+// client is nil.
 func NewJITAccessService(
 	repo jitAccessServiceRepo,
+	eligible jitEligibleRepo,
+	stepUp jitStepUpRepo,
+	userRoles jitUserRoleWriter,
 	spicedb jitSpiceDBClient,
 	auditService *AuditService,
 	logger *zap.Logger,
 ) *JITAccessService {
 	return &JITAccessService{
 		repo:         repo,
+		eligible:     eligible,
+		stepUp:       stepUp,
+		userRoles:    userRoles,
 		spicedb:      spicedb,
 		auditService: auditService,
 		logger:       logger,
 	}
 }
 
-// RequestAccess creates a new just-in-time access grant in the "pending" state.
-// The requester provides the target user, role, justification, and desired
-// duration. An approver must subsequently call ApproveAccess before the grant
-// can become active.
+func (s *JITAccessService) SetRoleRevokeDrainer(d roleRevokeDrain) { s.roleRevokes = d }
+
+func (s *JITAccessService) drainRevokes(ctx context.Context, userID uuid.UUID) {
+	if s.roleRevokes != nil {
+		if err := s.roleRevokes.Drain(ctx, userID); err != nil {
+			s.logger.Warn("JIT role revokes remain durably queued", zap.Error(err))
+		}
+	}
+}
+
+// checkEligibility loads and validates the (user, role) eligibility row for a
+// RequestAccess call: it must exist, be within its validity window, and the
+// requested duration must not exceed its cap. When it requires MFA, sessionID
+// must have a recent step-up verification for JITStepUpAction on file. On
+// success it returns the eligibility row so the caller can also read
+// RequiresApproval.
+func (s *JITAccessService) checkEligibility(
+	ctx context.Context,
+	userID, roleID, sessionID uuid.UUID,
+	requestedDuration int,
+) (*models.JITEligible, error) {
+	elig, err := s.eligible.GetForUserRole(ctx, userID, roleID)
+	if err != nil {
+		return nil, fmt.Errorf("JITAccessService.checkEligibility: %w", err)
+	}
+	if elig == nil {
+		return nil, ErrNotEligible
+	}
+	if !elig.IsCurrentlyValid() {
+		return nil, ErrEligibilityWindow
+	}
+	if elig.MaxDurationSeconds > 0 && requestedDuration > elig.MaxDurationSeconds {
+		return nil, ErrDurationExceedsEligibility
+	}
+	if elig.RequiresMFA {
+		verified, err := s.stepUp.HasRecentVerification(ctx, sessionID, JITStepUpAction, jitStepUpMaxAge)
+		if err != nil {
+			return nil, fmt.Errorf("JITAccessService.checkEligibility: step-up lookup: %w", err)
+		}
+		if !verified {
+			return nil, ErrStepUpRequired
+		}
+	}
+	return elig, nil
+}
+
+// RequestAccess creates a new just-in-time access grant in the "pending"
+// state, after verifying the requester is eligible for the target role: a
+// standing iam_jit_eligible row must exist, be within its validity window,
+// permit the requested duration, and — if it requires MFA — the caller's
+// session must carry a recent step-up verification. sessionID identifies the
+// caller's current session for the step-up check and is ignored when the
+// eligibility row does not require MFA.
 func (s *JITAccessService) RequestAccess(
 	ctx context.Context,
-	tenantID uuid.UUID,
+	tenantID, sessionID uuid.UUID,
 	req *models.CreateJITAccessRequest,
 ) (*models.JITAccessGrant, error) {
+	elig, err := s.checkEligibility(ctx, req.UserID, req.RoleID, sessionID, req.Duration)
+	if err != nil {
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 	grant := &models.JITAccessGrant{
 		UserID:        req.UserID,
@@ -101,6 +247,7 @@ func (s *JITAccessService) RequestAccess(
 		zap.String("user_id", req.UserID.String()),
 		zap.String("role_id", req.RoleID.String()),
 		zap.String("tenant_id", tenantID.String()),
+		zap.Bool("requires_approval", elig.RequiresApproval),
 	)
 
 	if s.auditService != nil {
@@ -138,6 +285,12 @@ func (s *JITAccessService) getGrantInTenant(ctx context.Context, grantID, tenant
 // records the approver's identity. If req.StartsAt is set, the grant will
 // become active at that future time; otherwise it starts immediately and
 // ActivateGrant should be called right away.
+//
+// Self-approval is rejected UNLESS the eligibility row backing this grant
+// has RequiresApproval=false, in which case the requester is allowed to
+// approve (in practice: activate) their own pre-approved elevation. Absence
+// of an eligibility row (it was revoked between request and approval) is
+// treated as requiring approval, i.e. self-approval stays blocked.
 func (s *JITAccessService) ApproveAccess(
 	ctx context.Context,
 	grantID, approverID, approverTenantID uuid.UUID,
@@ -151,9 +304,14 @@ func (s *JITAccessService) ApproveAccess(
 		return nil, fmt.Errorf("grant is not in pending state (current: %s)", grant.Status)
 	}
 
-	// Prevent self-approval (separation of duties)
 	if approverID == grant.UserID {
-		return nil, fmt.Errorf("cannot approve your own JIT access request")
+		elig, err := s.eligible.GetForUserRole(ctx, grant.UserID, grant.RoleID)
+		if err != nil {
+			return nil, fmt.Errorf("JITAccessService.ApproveAccess: eligibility lookup: %w", err)
+		}
+		if elig == nil || elig.RequiresApproval {
+			return nil, fmt.Errorf("cannot approve your own JIT access request")
+		}
 	}
 
 	if err := s.repo.Approve(ctx, grantID, approverID, grant.StartsAt); err != nil {
@@ -175,18 +333,20 @@ func (s *JITAccessService) ApproveAccess(
 	return s.repo.GetByID(ctx, grantID)
 }
 
-// jitRelationship is the minimal struct written to SpiceDB to represent the
-// temporary role membership created by an active JIT grant.
-type jitRelationship struct {
-	TenantID uuid.UUID
-	UserID   uuid.UUID
-	RoleID   uuid.UUID
-	GrantID  uuid.UUID
-}
-
 // ActivateGrant transitions an approved grant to the "active" state and
 // writes the corresponding role membership to SpiceDB so that the user
-// immediately acquires the role for the duration of the grant.
+// immediately acquires the role for the duration of the grant. The SpiceDB
+// write is the actual enforcement boundary: AuthorizationEngine.CheckPermission
+// is SpiceDB-only and never consults iam_user_roles or grant status, so this
+// call must succeed for the grant to confer any permission at all. If it
+// fails, activation fails and the grant remains "approved" — it is never
+// marked "active" without the corresponding SpiceDB relationship existing.
+//
+// A secondary, best-effort iam_user_roles time-boxed row is written after the
+// SpiceDB write succeeds, purely for UI/audit visibility (team picker, role
+// priority, admin-count checks already filter on its expires_at). Its
+// failure is logged but does not fail activation or roll back the SpiceDB
+// write, since SpiceDB is already authoritative at that point.
 func (s *JITAccessService) ActivateGrant(ctx context.Context, grantID, tenantID uuid.UUID) error {
 	grant, err := s.getGrantInTenant(ctx, grantID, tenantID)
 	if err != nil {
@@ -207,26 +367,41 @@ func (s *JITAccessService) ActivateGrant(ctx context.Context, grantID, tenantID 
 		return fmt.Errorf("grant %s has already expired", grantID)
 	}
 
-	// Write the temporary role assignment to SpiceDB.
-	rel := jitRelationship{
-		TenantID: grant.TenantID,
-		UserID:   grant.UserID,
-		RoleID:   grant.RoleID,
-		GrantID:  grant.ID,
+	if s.spicedb == nil {
+		return fmt.Errorf("JITAccessService.ActivateGrant: SpiceDB client unavailable")
 	}
-	if err := s.spicedb.WriteRelationship(ctx, grant.TenantID, rel); err != nil {
+	if _, err := s.spicedb.WriteUserRoleUntil(ctx, grant.TenantID, grant.UserID, grant.RoleID, grant.ExpiresAt); err != nil {
 		return fmt.Errorf("JITAccessService.ActivateGrant write SpiceDB relationship: %w", err)
 	}
 
 	if err := s.repo.Activate(ctx, grantID); err != nil {
-		// Best-effort rollback of the SpiceDB write.
-		if delErr := s.spicedb.DeleteRelationship(ctx, grant.TenantID, rel); delErr != nil {
-			s.logger.Error("Failed to rollback SpiceDB relationship after activation failure",
+		// Roll back the SpiceDB write: an active-looking grant with no
+		// SpiceDB relationship is harmless (denies by default), but a
+		// SpiceDB relationship for a grant that failed to persist as
+		// "active" would silently outlive its own bookkeeping.
+		if delErr := s.repo.QueueActivationRollback(ctx, grant); delErr != nil {
+			s.logger.Error("Failed to queue SpiceDB relationship rollback after activation failure",
 				zap.String("grant_id", grantID.String()),
 				zap.Error(delErr),
 			)
+			return fmt.Errorf("JITAccessService.ActivateGrant persist: %w; compensation: %v", err, delErr)
 		}
+		s.drainRevokes(ctx, grant.UserID)
 		return fmt.Errorf("JITAccessService.ActivateGrant persist: %w", err)
+	}
+
+	assignedBy := grant.UserID
+	if grant.ApprovedBy != nil {
+		assignedBy = *grant.ApprovedBy
+	}
+	if _, err := s.userRoles.AddTimeBoundRole(ctx, grant.UserID, grant.RoleID, assignedBy, grant.ExpiresAt); err != nil {
+		// Best-effort: SpiceDB is already authoritative and already written.
+		// Losing this projection only affects UI/audit visibility, not
+		// enforcement, so we log and continue rather than fail activation.
+		s.logger.Warn("Failed to write secondary iam_user_roles projection for JIT grant (SpiceDB write already succeeded; enforcement unaffected)",
+			zap.String("grant_id", grantID.String()),
+			zap.Error(err),
+		)
 	}
 
 	s.logger.Info("JIT access grant activated",
@@ -249,8 +424,9 @@ func (s *JITAccessService) ActivateGrant(ctx context.Context, grantID, tenantID 
 
 // ExpireGrants is intended to be called by a background worker on a regular
 // schedule (e.g. every minute). It finds all grants that are in the "active"
-// state but whose expires_at is in the past, removes their SpiceDB
-// relationships, and marks them as "expired".
+// state but whose expires_at is in the past. Status, projection removal and
+// the durable SpiceDB delete commit together; the post-commit fast path and
+// the short-interval outbox worker enforce the delete even during outages.
 func (s *JITAccessService) ExpireGrants(ctx context.Context) error {
 	const batchLimit = 100
 
@@ -261,24 +437,7 @@ func (s *JITAccessService) ExpireGrants(ctx context.Context) error {
 
 	var lastErr error
 	for _, grant := range expired {
-		rel := jitRelationship{
-			TenantID: grant.TenantID,
-			UserID:   grant.UserID,
-			RoleID:   grant.RoleID,
-			GrantID:  grant.ID,
-		}
-
-		if err := s.spicedb.DeleteRelationship(ctx, grant.TenantID, rel); err != nil {
-			s.logger.Error("Failed to delete SpiceDB relationship for expired grant",
-				zap.String("grant_id", grant.ID.String()),
-				zap.Error(err),
-			)
-			lastErr = err
-			// Continue processing remaining grants even if one fails.
-			continue
-		}
-
-		if err := s.repo.UpdateStatus(ctx, grant.ID, models.JITAccessStatusExpired); err != nil {
+		if err := s.repo.FinalizeGrant(ctx, grant, models.JITAccessStatusExpired); err != nil {
 			s.logger.Error("Failed to mark grant as expired",
 				zap.String("grant_id", grant.ID.String()),
 				zap.Error(err),
@@ -286,6 +445,8 @@ func (s *JITAccessService) ExpireGrants(ctx context.Context) error {
 			lastErr = err
 			continue
 		}
+
+		s.drainRevokes(ctx, grant.UserID)
 
 		s.logger.Info("JIT access grant expired",
 			zap.String("grant_id", grant.ID.String()),
@@ -305,8 +466,8 @@ func (s *JITAccessService) ExpireGrants(ctx context.Context) error {
 	return lastErr
 }
 
-// RevokeGrant immediately revokes an active or approved grant, removing the
-// SpiceDB relationship if the grant was active.
+// RevokeGrant commits revocation and the durable delete before attempting
+// SpiceDB. An outage leaves a retryable row, not an active PostgreSQL grant.
 func (s *JITAccessService) RevokeGrant(ctx context.Context, grantID, revokerID, revokerTenantID uuid.UUID) error {
 	grant, err := s.getGrantInTenant(ctx, grantID, revokerTenantID)
 	if err != nil {
@@ -317,22 +478,11 @@ func (s *JITAccessService) RevokeGrant(ctx context.Context, grantID, revokerID, 
 		return fmt.Errorf("grant is already %s", grant.Status)
 	}
 
-	// If the grant is active, remove the SpiceDB relationship first.
-	if grant.Status == models.JITAccessStatusActive {
-		rel := jitRelationship{
-			TenantID: grant.TenantID,
-			UserID:   grant.UserID,
-			RoleID:   grant.RoleID,
-			GrantID:  grant.ID,
-		}
-		if err := s.spicedb.DeleteRelationship(ctx, grant.TenantID, rel); err != nil {
-			return fmt.Errorf("JITAccessService.RevokeGrant delete SpiceDB relationship: %w", err)
-		}
-	}
-
-	if err := s.repo.UpdateStatus(ctx, grantID, models.JITAccessStatusRevoked); err != nil {
+	if err := s.repo.FinalizeGrant(ctx, grant, models.JITAccessStatusRevoked); err != nil {
 		return fmt.Errorf("JITAccessService.RevokeGrant persist: %w", err)
 	}
+
+	s.drainRevokes(ctx, grant.UserID)
 
 	s.logger.Info("JIT access grant revoked",
 		zap.String("grant_id", grantID.String()),

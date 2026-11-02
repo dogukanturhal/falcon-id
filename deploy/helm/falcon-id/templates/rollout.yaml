@@ -52,7 +52,7 @@ spec:
       # Stable+canary services share the chart's existing Service —
       # Argo Rollouts manages selector mutation between revisions.
       # The chart does not declare a separate canary Service so the
-      # public id.hexxlock.com host transparently fronts both cohorts.
+      # public id.example.com host transparently fronts both cohorts.
       #
       # Analysis is referenced via `analysis:` blocks inside the
       # `steps:` list (see values.yaml — each step that gates on

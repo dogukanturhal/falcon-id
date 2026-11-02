@@ -587,7 +587,7 @@ func (s *RiskService) GetUserSignals(ctx context.Context, userID uuid.UUID, days
 
 // GetUserRecentLoginEvents returns the most recent login risk events for a
 // user. Powers the user-facing "Sign-in security events" feed on
-// accounts.hexxlock.com — surfaces MFA-challenged + blocked logins so users
+// accounts.example.com — surfaces MFA-challenged + blocked logins so users
 // can spot suspicious activity from the audit-trail layer.
 //
 // `days` defaults to 90 when <= 0; `limit` defaults / caps to 50.
@@ -666,7 +666,7 @@ func (s *RiskService) RecordLoginEvent(
 		event.BlockReason = &reason
 	}
 	// Edge-stamped geo enrichment (platform migration v0.232.247).
-	// Sourced from id-hexxlock-geo-stamp Cloudflare Worker via
+	// Sourced from geo-stamp Cloudflare Worker via
 	// X-Geo-* headers, stamped onto ctx by auth_handler.go::Login at
 	// the trust boundary. Per-field empty-string guard so an absent
 	// X-Geo-City doesn't land as "" in the column. IsVPNHint is only

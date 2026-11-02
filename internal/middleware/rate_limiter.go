@@ -107,6 +107,13 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 			BlockDuration: 1 * time.Minute,
 		},
 		EndpointOverrides: map[string]EndpointTierOverride{
+			// Hosted /oauth/login form: keeps the strict per-IP limit but a
+			// loose per-account one, because the form posts a username and
+			// the default 10/h + 30m block would let anyone lock a victim
+			// out of the hosted login.
+			"oauth_login": {
+				PerAccount: TierConfig{MaxRequests: 100, Window: 1 * time.Hour, BlockDuration: 5 * time.Minute},
+			},
 			// MFA MANAGEMENT — relaxed for already-authenticated user
 			// actions. RequireFreshAuth(5min) is the proper auth-time
 			// gate per RFC 9470; the rate limit just bounds rapid abuse.
@@ -175,6 +182,17 @@ func DefaultAuthRateLimiterConfig() AuthRateLimiterConfig {
 					BlockDuration: 30 * time.Minute,
 				},
 			},
+			// SIGNUP CODE VERIFY — the 6-digit emailed code is only
+			// 10^6 wide, so guessing is capped per IP here (and per code
+			// and per row in the repository). Routed separately from
+			// auth_signup in normalizeEndpoint.
+			"auth_signup_verify": {
+				PerIP: TierConfig{
+					MaxRequests:   10,
+					Window:        1 * time.Minute,
+					BlockDuration: 15 * time.Minute,
+				},
+			},
 			// MFA CREDENTIAL surfaces keep the strict default (5/min/IP,
 			// 10/hour/account, 5-30 min blocks). No override needed —
 			// absence in this map = use the global tier values.
@@ -218,6 +236,7 @@ type AuthRateLimiter struct {
 	redisLimiter   *pkgredis.RateLimiter
 	fallbackStore  *inMemoryTieredStore
 	trustedProxies map[string]bool
+	trustedNets    []*net.IPNet
 	mu             sync.RWMutex
 }
 
@@ -241,13 +260,19 @@ func (rl *AuthRateLimiter) Stop() {
 }
 
 // SetTrustedProxies configures the list of trusted proxy IPs for secure
-// client IP extraction. Only IPs in this list are trusted for X-Forwarded-For.
+// client IP extraction. Only IPs (or CIDR ranges, e.g. "10.42.0.0/16") in this
+// list are trusted for X-Forwarded-For.
 func (rl *AuthRateLimiter) SetTrustedProxies(proxies []string) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	newProxies := make(map[string]bool, len(proxies))
+	var nets []*net.IPNet
 	for _, proxy := range proxies {
+		if _, ipNet, err := net.ParseCIDR(strings.TrimSpace(proxy)); err == nil {
+			nets = append(nets, ipNet)
+			continue
+		}
 		ip := proxy
 		if host, _, err := net.SplitHostPort(proxy); err == nil {
 			ip = host
@@ -255,6 +280,25 @@ func (rl *AuthRateLimiter) SetTrustedProxies(proxies []string) {
 		newProxies[ip] = true
 	}
 	rl.trustedProxies = newProxies
+	rl.trustedNets = nets
+}
+
+// isTrustedProxy reports whether ip is an exact trusted proxy or inside a
+// trusted CIDR range.
+func isTrustedProxy(exact map[string]bool, nets []*net.IPNet, ip string) bool {
+	if exact[ip] {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // Middleware returns a Gin middleware handler that enforces tiered rate limiting.
@@ -441,6 +485,7 @@ func (rl *AuthRateLimiter) checkTierInMemory(key string, tierCfg TierConfig, tie
 func (rl *AuthRateLimiter) extractClientIP(c *gin.Context) string {
 	rl.mu.RLock()
 	proxies := rl.trustedProxies
+	nets := rl.trustedNets
 	rl.mu.RUnlock()
 
 	remoteAddr := c.Request.RemoteAddr
@@ -448,11 +493,11 @@ func (rl *AuthRateLimiter) extractClientIP(c *gin.Context) string {
 		remoteAddr = host
 	}
 
-	if len(proxies) == 0 {
+	if len(proxies) == 0 && len(nets) == 0 {
 		return remoteAddr
 	}
 
-	if !proxies[remoteAddr] {
+	if !isTrustedProxy(proxies, nets, remoteAddr) {
 		return remoteAddr
 	}
 
@@ -470,7 +515,7 @@ func (rl *AuthRateLimiter) extractClientIP(c *gin.Context) string {
 		if host, _, err := net.SplitHostPort(ip); err == nil {
 			ip = host
 		}
-		if !proxies[ip] {
+		if !isTrustedProxy(proxies, nets, ip) {
 			return ip
 		}
 	}
@@ -523,7 +568,7 @@ func rateLimitMessage(tier RateLimitTier) string {
 // motivation for the auth_mfa lump).
 //
 // 2026-05-19 update: split the MFA bucket into two by abuse profile, so already-
-// authenticated users managing their MFA factors via accounts.hexxlock.com don't
+// authenticated users managing their MFA factors via accounts.example.com don't
 // trip the brute-force budget designed for /mfa/verify. Industry pattern (Auth0
 // "Management API" vs "Authentication API" tiers; Okta "User Lifecycle" vs
 // "Authentication" buckets): credential-checking surfaces get strict limits,
@@ -566,6 +611,10 @@ func normalizeEndpoint(path string) string {
 	// state between calls; bucketing them under one endpoint key keeps
 	// the abuse budget shared across the flow so 5/min/IP means 5
 	// signup ATTEMPTS, not 15 sub-calls.
+	// The code-guessing surface (verify-email) gets its own tighter bucket.
+	if strings.HasPrefix(normalized, "/auth/signup/verify-email") {
+		return "auth_signup_verify"
+	}
 	if strings.HasPrefix(normalized, "/auth/signup") {
 		return "auth_signup"
 	}

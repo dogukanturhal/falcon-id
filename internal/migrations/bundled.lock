@@ -34,7 +34,6 @@
 # live. 0002 is re-vehicled to its own bundle, v0.232.264, which Keystone
 # will dispatch as a genuinely new (non-AlreadyApplied) execution.
 # -----------------------------------------------------------------------------
-
 0001_tenant_settings_phase2.sql        v0.232.255   519ed98f3ab5245676c21612e7ba4dc9caf9526f8a220d3dd71be930d0872766
 0002_team_invitations_phase2.sql       v0.232.264   be990b68e8083a1c0d9b150465cdd990f4163b6b118f07ced6a1ed3e3c50b1a2
 0003_caep_event_outbox.sql             v0.232.256   cc5c9813da110eea5eda236f7a37713cf89b8528579c606eb29e6e76c0d60094
@@ -46,3 +45,32 @@
 0009_oauth_token_family.sql            v0.232.262   cc2e3bf2fc7a31e907809045bd6e2211bc64647807844d36bfcd457c95e561bc
 0010_user_admin_review_flag.sql        baseline     e5e49cf3ab27518bf006e7f54e92c58f9f34de8260e5b839242aaaa5ad9e74e3
 0011_team_invitation_pending_email_uniqueness.sql baseline d326143880640f508e4d7598fe560966e57518b64b49649323bc1b1f5a60341c
+0012_iam_role_templates.sql            v0.232.265   feb5ca3f0e0f2fa3f6d2438ddcf2663f37ec3d51097637f21756e54a1479ce8f
+0013_iam_invitations_seats.sql         v0.232.266   3f55ab1a50da15d138369836ffcb87a3945df57a2ee23f72e0d8a15cb0823b0c
+0014_iam_tenant_module_entitlements.sql v0.232.267   26d10d7b3c51f1b95966b59c8c0edf10bf43edbbaa5bbb664e1f7e260eb36ea3
+0015_iam_sod.sql                       v0.232.268   ccea87ed0c50a76b00529599c1ee40c41c31b28b3f7f045cf2276269a10bb872
+0016_iam_platform_roles_jit_elevations.sql v0.232.269 a748c395450e8ca0f4d2f3356c2a07d56e4f5390170ce805df150357472729e2
+0017_tenant_seat_limit_version.sql      v0.232.270   be6714001859d0cc17caa657d5240483a6386d373bf707f6ba62815b0b280a80
+0018_iam_tenant_status.sql              v0.232.271   1e903c6ff179b12baf3a7cc4386b72d493c4daf9c099ac73bef5b4789b16a997
+0019_iam_user_memberships_self_select.sql v0.232.272   987d582cf3aad9365f6a2c1d731c3b517375b6ad94fa1c8ce8980b2f99fc018f
+0020_tenant_entitlement_limits.sql      v0.232.273   b28a2f1250e42dd83f1979145efdd90c1587258ece8efb558429f96446d9faec
+0021_iam_employee_seat_class.sql        v0.232.274   6a662ae9a14cffc8c3e3e612951219e29e02ef6e5ba202d4e1bc2e15dbb37bd9
+0022_iam_kiosk_seat_class.sql           v0.232.275   1248452d7ccdfc2efa4a6ae3c3d0729a96dd6313ac239bffe33637117d411a69
+0023_iam_sod_seed_fix.sql              v0.232.276   6c5ac2204e2c0f3d7b82ccd0cc38ba990faf13d0f6a4634b6a7d3bfe31dbecff
+0024_module_entitlement_source_tier.sql v0.232.277 a960cdfe7a950990b6cbca28d602c7b4ba2c2cc04c4de36c20ce680984e38d89
+0025_iam_membership_multi_company.sql v0.232.279 e81d914e5ab6cee11b072f34ebf5add468496fc72d4acab67d037de8c9306da7
+0026_iam_signup_continuation.sql      v0.232.280   f2cc85344583a430f7c3bbd644f337ec9052e6a486021218f2c1aec203870620
+0027_iam_module_entitlement_read_only.sql v0.232.281 ca9c4e35085568f81d79fa80753e487ee1a8059d41d35993466d595b25fd86c4
+0028_oauth_token_session_binding.sql v0.232.282 f2b578ec3f4d6d779f430cd811b3306e660fc4e4b6447b1dcbcd3eba3fa7f155
+0029_iam_tenant_api_keys.sql          v0.232.283   d207f8613b3a58c9fee6a0315b747e4a0d7fffe2e86503f89f311e15f57661b6
+0030_iam_api_keys_checks.sql v0.232.284 0d8afef6fa6917025c6e5f65ee500aebcfcd202baa444ed93fe6d882def230e9
+0031_oauth_token_replaced_by.sql v0.232.285 2cc72044e5903819d1f1e753909e6d9bcdcbb4159e81fc7793b25fd16ac9386f
+0032_iam_signup_otp.sql v0.232.286 d3ffbbd10365baad8eeb4f17325af5fabd268154d027561778b0690ac5ad3b4c
+0033_signing_key_pending_status.sql v0.232.287 0297fbe6bb68eb473209a93f464eee87240e30a2763e16155d3c129c9d37dbee
+0034_iam_hr_employment_sync.sql v0.232.288 80b90dda51c2cb9e975f21aec95976563bbca4ea928e8d63bb61e7e72f5f63da
+0035_ops_console_p0.sql v0.232.289 610e88f70da7192351315a2d177d6a88fe933bf5aa5ee719ca97f7e80ea7568d
+0036_ops_console_people.sql v0.232.291 2fd6e811b841fe8b7608a5cc1a14e85518845bae93d2b7248e7dacf674d3775d
+0037_ops_audit_chain_seq.sql v0.232.292 fc83bac446240269fd88ee869943d690d43d81e43c6b47bb386df06be0dc68d4
+0038_iam_users_username_prefix_index.sql v0.232.293 196fa16728c9bce01a75143e137091f30e6c75ac39fa5e7eb854fa464b8a11ef
+0039_totp_witness_fallback.sql v0.232.294 79e5bca0220e01082fa1ff9dd285a3b501e0c85143693fa16ca074264cb3f965
+0040_realm_session_absolute_ttl.sql v0.232.295 79049a2aa91333f920486dc7d101f9f30d1aea052865ade24244218dc3c15d99

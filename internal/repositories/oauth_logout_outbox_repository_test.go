@@ -43,7 +43,7 @@ func sampleOutboxRow(t *testing.T) *OAuthLogoutOutboxRow {
 		LogoutTokenJTI: "jti-test-12345",
 		Sub:            &sub,
 		Sid:            &sid,
-		TargetURI:      "https://internal.example.com/auth/backchannel-logout",
+		TargetURI:      "https://auth.internal.example.com/auth/backchannel-logout",
 		Payload:        "eyJhbGciOiJSUzI1NiJ9.fake-jwt",
 		Status:         OAuthLogoutOutboxPending,
 		AttemptCount:   0,
@@ -85,7 +85,7 @@ func TestOAuthLogoutOutboxRepository_Insert_DefaultsApplied(t *testing.T) {
 		ID:             uuid.New(),
 		RPClientID:     "svc-accounts",
 		LogoutTokenJTI: "jti-defaults",
-		TargetURI:      "https://accounts.hexxlock.com/api/auth/backchannel-logout",
+		TargetURI:      "https://accounts.example.com/api/auth/backchannel-logout",
 		Payload:        "eyJ.fake",
 	}
 	// status, next_retry_at, created_at all start zero — assert
@@ -225,10 +225,10 @@ func TestOAuthLogoutOutboxRepository_SelectPendingForDelivery(t *testing.T) {
 		"last_error", "created_at", "delivered_at",
 	}).
 		AddRow(id1, "svc-talon", "jti-1", &sub, &sid,
-			"https://internal.example.com/auth/backchannel-logout",
+			"https://auth.internal.example.com/auth/backchannel-logout",
 			"eyJ.fake1", "pending", 0, now, (*string)(nil), now, (*time.Time)(nil)).
 		AddRow(id2, "svc-accounts", "jti-2", &sub, &sid,
-			"https://accounts.hexxlock.com/api/auth/backchannel-logout",
+			"https://accounts.example.com/api/auth/backchannel-logout",
 			"eyJ.fake2", "pending", 1, now.Add(5*time.Second),
 			strPtr("transient timeout"), now, (*time.Time)(nil))
 

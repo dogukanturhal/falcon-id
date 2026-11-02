@@ -204,3 +204,27 @@ func IsValidOrgRole(role string) bool {
 	}
 	return false
 }
+
+// TeamScopeTeam is one team (or department) a user belongs to or manages.
+type TeamScopeTeam struct {
+	ID            uuid.UUID   `json:"id"`
+	Name          string      `json:"name"`
+	OrgType       string      `json:"org_type"`
+	Role          string      `json:"role"`
+	Manages       bool        `json:"manages"`
+	MemberUserIDs []uuid.UUID `json:"member_user_ids"`
+}
+
+// TeamScope is the set of users a tenant user can see through team membership.
+type TeamScope struct {
+	TenantID      uuid.UUID       `json:"tenant_id"`
+	UserID        uuid.UUID       `json:"user_id"`
+	HasTeam       bool            `json:"has_team"`
+	MemberUserIDs []uuid.UUID     `json:"member_user_ids"`
+	Teams         []TeamScopeTeam `json:"teams"`
+}
+
+// IsOrgManagerRole reports whether the role manages the organization subtree.
+func IsOrgManagerRole(role string) bool {
+	return role == OrgRoleManager || role == OrgRoleLead || role == OrgRoleOwner
+}

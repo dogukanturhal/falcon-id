@@ -685,3 +685,99 @@ func (r *RealmRepository) UserHasRealmAccess(ctx context.Context, userID, realmI
 
 	return exists, nil
 }
+
+// DeviceWitnessTOTPAllowed reports the realm flag device_witness_totp_allowed
+// for the realm the tenant belongs to. A tenant without a realm assignment
+// uses the default realm; a missing row defaults to true (the column default).
+func (r *RealmRepository) DeviceWitnessTOTPAllowed(ctx context.Context, tenantID uuid.UUID) (bool, error) {
+	const q = `
+		SELECT r.device_witness_totp_allowed
+		FROM realms r
+		JOIN realm_tenants rt ON r.id = rt.realm_id
+		WHERE rt.tenant_id = $1`
+	var allowed bool
+	err := r.db.QueryRow(ctx, q, tenantID).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = r.db.QueryRow(ctx, `SELECT device_witness_totp_allowed FROM realms WHERE id = $1`, models.DefaultRealmID).Scan(&allowed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return true, nil
+		}
+	}
+	if err != nil {
+		return false, fmt.Errorf("DeviceWitnessTOTPAllowed: %w", err)
+	}
+	return allowed, nil
+}
+
+// GetDeviceWitnessTOTPAllowedByRealm returns the flag for one realm.
+func (r *RealmRepository) GetDeviceWitnessTOTPAllowedByRealm(ctx context.Context, realmID uuid.UUID) (bool, error) {
+	var allowed bool
+	err := r.db.QueryRow(ctx, `SELECT device_witness_totp_allowed FROM realms WHERE id = $1`, realmID).Scan(&allowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("realm not found")
+	}
+	if err != nil {
+		return false, fmt.Errorf("GetDeviceWitnessTOTPAllowedByRealm: %w", err)
+	}
+	return allowed, nil
+}
+
+// SetDeviceWitnessTOTPAllowed updates the flag for one realm.
+func (r *RealmRepository) SetDeviceWitnessTOTPAllowed(ctx context.Context, realmID uuid.UUID, allowed bool) error {
+	res, err := r.db.Exec(ctx, `UPDATE realms SET device_witness_totp_allowed = $2, updated_at = NOW() WHERE id = $1`, realmID, allowed)
+	if err != nil {
+		return fmt.Errorf("SetDeviceWitnessTOTPAllowed: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("realm not found")
+	}
+	return nil
+}
+
+// SessionAbsoluteTTLSecondsByTenant returns the SSO session absolute lifetime
+// (seconds) of the realm the tenant belongs to. ok=false when the realm has no
+// policy (NULL) or the tenant has no realm assignment.
+func (r *RealmRepository) SessionAbsoluteTTLSecondsByTenant(ctx context.Context, tenantID uuid.UUID) (int, bool, error) {
+	const q = `
+		SELECT r.session_absolute_ttl_seconds
+		FROM realms r
+		JOIN realm_tenants rt ON r.id = rt.realm_id
+		WHERE rt.tenant_id = $1`
+	var secs *int
+	err := r.db.QueryRow(ctx, q, tenantID).Scan(&secs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("SessionAbsoluteTTLSecondsByTenant: %w", err)
+	}
+	if secs == nil {
+		return 0, false, nil
+	}
+	return *secs, true, nil
+}
+
+// GetSessionAbsoluteTTLSeconds returns the realm's SSO session cap (nil = global default).
+func (r *RealmRepository) GetSessionAbsoluteTTLSeconds(ctx context.Context, realmID uuid.UUID) (*int, error) {
+	var secs *int
+	err := r.db.QueryRow(ctx, `SELECT session_absolute_ttl_seconds FROM realms WHERE id = $1`, realmID).Scan(&secs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("realm not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetSessionAbsoluteTTLSeconds: %w", err)
+	}
+	return secs, nil
+}
+
+// SetSessionAbsoluteTTLSeconds updates the realm's SSO session cap (nil clears it).
+func (r *RealmRepository) SetSessionAbsoluteTTLSeconds(ctx context.Context, realmID uuid.UUID, secs *int) error {
+	res, err := r.db.Exec(ctx, `UPDATE realms SET session_absolute_ttl_seconds = $2, updated_at = NOW() WHERE id = $1`, realmID, secs)
+	if err != nil {
+		return fmt.Errorf("SetSessionAbsoluteTTLSeconds: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("realm not found")
+	}
+	return nil
+}

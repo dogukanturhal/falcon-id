@@ -28,7 +28,7 @@ func TestRenderFCLIFrames_NoIFrames_ReturnsEmptyAndMinDelay(t *testing.T) {
 
 func TestRenderFCLIFrames_OneIFrame_RendersHiddenWithSecureAttrs(t *testing.T) {
 	html, delay := renderFCLIFrames([]services.FrontchannelLogoutIFrame{
-		{ClientID: "svc-talon", Src: "https://internal.example.com/auth/frontchannel-logout?iss=https%3A%2F%2Fid.hexxlock.com&sid=abc"},
+		{ClientID: "svc-talon", Src: "https://auth.internal.example.com/auth/frontchannel-logout?iss=https%3A%2F%2Fid.example.com&sid=abc"},
 	})
 
 	// HTML structure
@@ -36,7 +36,7 @@ func TestRenderFCLIFrames_OneIFrame_RendersHiddenWithSecureAttrs(t *testing.T) {
 	assert.Contains(t, html, `loading="eager"`, "FCL iframes must load eagerly — lazy-load defeats the cascade for hidden iframes")
 	assert.Contains(t, html, `referrerpolicy="no-referrer"`, "MUST NOT leak the iframe URL via Referer")
 	assert.Contains(t, html, `<!-- fcl: svc-talon -->`, "comment must identify the RP for log inspection")
-	assert.Contains(t, html, `src="https://internal.example.com/auth/frontchannel-logout?iss=https%3A%2F%2Fid.hexxlock.com&amp;sid=abc"`,
+	assert.Contains(t, html, `src="https://auth.internal.example.com/auth/frontchannel-logout?iss=https%3A%2F%2Fid.example.com&amp;sid=abc"`,
 		"src must be HTML-escaped (& → &amp;)")
 
 	// Delay budget
@@ -96,7 +96,7 @@ func TestBuildLoggedOutPage_NoIFrames_RendersBaseCard(t *testing.T) {
 
 func TestBuildLoggedOutPage_WithIFrames_EmbedsHiddenIFrame(t *testing.T) {
 	page := buildLoggedOutPage([]services.FrontchannelLogoutIFrame{
-		{ClientID: "svc-talon", Src: "https://internal.example.com/auth/frontchannel-logout?iss=x&sid=y"},
+		{ClientID: "svc-talon", Src: "https://auth.internal.example.com/auth/frontchannel-logout?iss=x&sid=y"},
 	})
 	require.Contains(t, page, "<iframe ")
 	assert.Contains(t, page, `class="fcl"`)

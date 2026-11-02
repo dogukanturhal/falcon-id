@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDecodeBasicAuthClientID locks down the parsing contract: the
@@ -78,7 +81,7 @@ func TestOAuthTokenRateLimit_BurstBlock(t *testing.T) {
 	authRateLimitStore.mu.Unlock()
 
 	r := gin.New()
-	r.POST("/oauth/token", OAuthTokenRateLimit(), func(c *gin.Context) {
+	r.POST("/oauth/token", OAuthTokenRateLimit([]string{"acmeapp-bff"}), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
 
@@ -126,4 +129,110 @@ func newPostFormCtx(form map[string]string) (*gin.Context, *httptest.ResponseRec
 	c, _ := gin.CreateTestContext(w)
 	c.Request = req
 	return c, w
+}
+
+// LD-R3-TX-3: acmeapp-bff calls /oauth/token for every signed-in user, so its
+// burst window is per end user: one user's 61st exchange is refused while
+// another user of the same client still gets through.
+func TestOAuthTokenRateLimit_PerUserForBFF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authRateLimitStore.mu.Lock()
+	authRateLimitStore.store = make(map[string]*lruEntry)
+	authRateLimitStore.lruList.Init()
+	authRateLimitStore.mu.Unlock()
+
+	r := gin.New()
+	r.POST("/oauth/token", OAuthTokenRateLimit([]string{"acmeapp-bff"}), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	subjectFor := func(sub string) string {
+		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": sub}).SignedString([]byte("k"))
+		require.NoError(t, err)
+		return tok
+	}
+	post := func(subject string) int {
+		form := url.Values{}
+		form.Set("client_id", "acmeapp-bff")
+		form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+		form.Set("subject_token", subject)
+		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	alice := subjectFor("alice")
+	for i := 0; i < 60; i++ {
+		require.Equal(t, http.StatusOK, post(alice), "req %d", i+1)
+	}
+	assert.Equal(t, http.StatusTooManyRequests, post(alice), "alice's 61st request trips her own bucket")
+	assert.Equal(t, http.StatusOK, post(subjectFor("bob")), "bob shares the client but not the bucket")
+}
+
+func TestResolveOAuthTokenUserKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := newPostFormCtx(map[string]string{"refresh_token": "rt-secret"})
+	key := resolveOAuthTokenUserKey(c)
+	assert.True(t, strings.HasPrefix(key, "rt:"))
+	assert.NotContains(t, key, "rt-secret", "raw credentials never become a key")
+
+	c, _ = newPostFormCtx(map[string]string{"subject_token": "not-a-jwt"})
+	assert.True(t, strings.HasPrefix(resolveOAuthTokenUserKey(c), "st:"))
+
+	// Public client: a forged sub must not pick the bucket.
+	forged, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "victim"}).SignedString([]byte("k"))
+	require.NoError(t, err)
+	c, _ = newPostFormCtx(map[string]string{"subject_token": forged})
+	key = resolveOAuthTokenUserKey(c)
+	assert.True(t, strings.HasPrefix(key, "st:"))
+	assert.NotContains(t, key, "victim")
+	assert.NotContains(t, key, forged)
+
+	// Confidential client keeps the stable sub bucket.
+	c, _ = newPostFormCtx(map[string]string{"subject_token": forged, "client_secret": "s"})
+	assert.Equal(t, "sub:victim", resolveOAuthTokenUserKey(c))
+
+	c, _ = newPostFormCtx(map[string]string{})
+	c.Request.RemoteAddr = "10.0.0.9:1234"
+	assert.Equal(t, "ip:10.0.0.9", resolveOAuthTokenUserKey(c))
+}
+
+// Public native clients listed in the per-user set get one bucket per
+// install/credential, not one shared client bucket.
+func TestOAuthTokenRateLimit_PerUserForPublicClient(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	authRateLimitStore.mu.Lock()
+	authRateLimitStore.store = make(map[string]*lruEntry)
+	authRateLimitStore.lruList.Init()
+	authRateLimitStore.mu.Unlock()
+
+	r := gin.New()
+	r.POST("/oauth/token", OAuthTokenRateLimit([]string{"mobile-app"}), func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+	post := func(clientID, refresh string) int {
+		form := url.Values{}
+		form.Set("client_id", clientID)
+		form.Set("grant_type", "refresh_token")
+		form.Set("refresh_token", refresh)
+		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	for i := 0; i < 60; i++ {
+		require.Equal(t, http.StatusOK, post("mobile-app", "rt-a"))
+	}
+	assert.Equal(t, http.StatusTooManyRequests, post("mobile-app", "rt-a"))
+	assert.Equal(t, http.StatusOK, post("mobile-app", "rt-b"), "other install not locked out")
+
+	// A client not in the list still shares one per-client bucket.
+	for i := 0; i < 60; i++ {
+		require.Equal(t, http.StatusOK, post("other", "rt-"+strconv.Itoa(i)))
+	}
+	assert.Equal(t, http.StatusTooManyRequests, post("other", "rt-new"))
 }

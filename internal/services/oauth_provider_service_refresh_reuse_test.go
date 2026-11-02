@@ -66,6 +66,7 @@ func TestRefreshTokens_Reuse_CleanRotationConsumesOnceNoFamilyRevoke(t *testing.
 	id := uuid.New()
 	fam := id
 	uid := uuid.New()
+	svc.userRepo = &bindingUserRepo{user: &models.User{ID: uid, TenantID: client.TenantID, IsActive: true}}
 	repo.addToken(hash, &models.OAuthToken{
 		ID:            id,
 		TenantID:      client.TenantID,
@@ -98,6 +99,7 @@ func TestRefreshTokens_Reuse_RevokesFamilyAndEmitsCAEPTheftSignal(t *testing.T) 
 
 	client := activeConfidentialBFFClient("rotate")
 	userID := uuid.New()
+	svc.userRepo = &bindingUserRepo{user: &models.User{ID: userID, TenantID: client.TenantID, IsActive: true}}
 	familyID := uuid.New()
 	sessionID := uuid.New()
 
@@ -106,6 +108,7 @@ func TestRefreshTokens_Reuse_RevokesFamilyAndEmitsCAEPTheftSignal(t *testing.T) 
 	stolenPlaintext := "stolen-older-generation-refresh-plaintext"
 	stolenHash := svc.hashSecret(stolenPlaintext)
 	revokedLongAgo := time.Now().Add(-1 * time.Hour)
+	rotatedReason := "rotated"
 	repo.addToken(stolenHash, &models.OAuthToken{
 		ID:            uuid.New(),
 		TenantID:      client.TenantID,
@@ -117,6 +120,7 @@ func TestRefreshTokens_Reuse_RevokesFamilyAndEmitsCAEPTheftSignal(t *testing.T) 
 		RefreshToken:  &stolenHash,
 		IsRevoked:     true,
 		RevokedAt:     &revokedLongAgo,
+		RevokeReason:  &rotatedReason,
 		TokenFamilyID: &familyID,
 		IdpSessionID:  &sessionID,
 		ExpiresAt:     time.Now().Add(time.Hour),
@@ -176,6 +180,7 @@ func TestRefreshTokens_Reuse_ConcurrentRedemptionIsRaceSafe(t *testing.T) {
 	id := uuid.New()
 	fam := id
 	uid := uuid.New()
+	svc.userRepo = &bindingUserRepo{user: &models.User{ID: uid, TenantID: client.TenantID, IsActive: true}}
 	repo.addToken(hash, &models.OAuthToken{
 		ID:            id,
 		TenantID:      client.TenantID,

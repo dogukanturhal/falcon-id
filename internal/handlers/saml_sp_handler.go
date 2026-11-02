@@ -190,6 +190,9 @@ func (h *SAMLSPHandler) HandleACSPost(c *gin.Context) {
 		userAgent,
 	)
 	if err != nil {
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		h.logger.Error("SAML ACS POST processing failed",
 			zap.String("tenant_id", tenantID.String()),
 			zap.String("client_ip", clientIP),

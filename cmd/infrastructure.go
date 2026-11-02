@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -166,7 +168,7 @@ func initTracing(cfg *config.Config) *trace.TracerProvider {
 
 // connectDataPlaneDB connects to the primary (data plane) PostgreSQL database.
 func connectDataPlaneDB(cfg *config.Config) *database.PostgresDB {
-	db, err := database.NewPostgresDB(cfg.DatabaseURL)
+	db, err := database.NewPostgresDBWithPool(cfg.DatabaseURL, shareddb.LoadPoolConfigPrefixed("DB_"))
 	if err != nil {
 		logger.Fatal("Failed to connect to data plane database", zap.Error(err))
 	}
@@ -175,13 +177,14 @@ func connectDataPlaneDB(cfg *config.Config) *database.PostgresDB {
 }
 
 // connectControlPlaneDB connects to the control plane PostgreSQL database.
-// Returns nil and logs a warning when the URL is not configured or the connection fails.
+// Returns nil and logs a warning when the URL is not configured or the connection
+// still fails after transient errors (53300, network, ...) were retried.
 func connectControlPlaneDB(cfg *config.Config) *database.PostgresDB {
 	if cfg.ControlPlaneDatabaseURL == "" {
 		logger.Warn("Control plane database URL not configured, platform admin features will be unavailable")
 		return nil
 	}
-	db, err := database.NewPostgresDB(cfg.ControlPlaneDatabaseURL)
+	db, err := database.NewPostgresDBWithPool(cfg.ControlPlaneDatabaseURL, shareddb.LoadPoolConfigPrefixed("CONTROL_PLANE_DB_"))
 	if err != nil {
 		logger.Warn("Failed to connect to control plane database, platform admin features will be unavailable",
 			zap.Error(err),
@@ -193,9 +196,13 @@ func connectControlPlaneDB(cfg *config.Config) *database.PostgresDB {
 }
 
 // initRedisComponents connects to Redis and initializes all Redis-backed sub-components.
-// Returns nils for all components when REDIS_URL is not configured or the connection fails.
+// Returns nils for all components when REDIS_URL is not configured or the connection fails,
+// unless REDIS_REQUIRED is set: then either case stops startup.
 func initRedisComponents(cfg *config.Config) (*redis.Client, *redis.RateLimiter, *redis.SessionCache, *redis.TokenBlacklist) {
 	if cfg.RedisURL == "" {
+		if err := redisRequiredError(cfg, nil); err != nil {
+			logger.Fatal(err.Error())
+		}
 		return nil, nil, nil, nil
 	}
 
@@ -213,9 +220,12 @@ func initRedisComponents(cfg *config.Config) (*redis.Client, *redis.RateLimiter,
 
 	redisClient, err := redis.NewClient(redisCfg, logger.Log)
 	if err != nil {
+		if fatal := redisRequiredError(cfg, err); fatal != nil {
+			logger.Fatal(fatal.Error(), zap.Error(err), zap.String("redis_url", redactedRedisURL(cfg.RedisURL)))
+		}
 		logger.Warn("Failed to connect to Redis, continuing without Redis features",
 			zap.Error(err),
-			zap.String("redis_url", cfg.RedisURL),
+			zap.String("redis_url", redactedRedisURL(cfg.RedisURL)),
 		)
 		return nil, nil, nil, nil
 	}
@@ -223,6 +233,7 @@ func initRedisComponents(cfg *config.Config) (*redis.Client, *redis.RateLimiter,
 	logger.Info("Connected to Redis")
 	rateLimiter := redis.NewRateLimiter(redisClient, "iam:ratelimit:")
 	sessionCache := redis.NewSessionCache(redisClient, "iam:session:", cfg.RedisSessionCacheTTL)
+	sessionCache.SetIdpAbsoluteCap(cfg.SessionTTLRememberMe)
 	tokenBlacklist := redis.NewTokenBlacklist(redisClient, "iam:blacklist:")
 	logger.Info("Redis components initialized",
 		zap.Bool("rate_limiter", rateLimiter != nil),
@@ -301,4 +312,26 @@ func (infra *Infrastructure) Close() {
 	if infra.VaultClient != nil {
 		_ = infra.VaultClient.Close()
 	}
+}
+
+// redactedRedisURL strips credentials from a Redis URL before it is logged:
+// with per-client ACL users the URL carries the username and password.
+func redactedRedisURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable redis url>"
+	}
+	return u.Redacted()
+}
+
+// redisRequiredError says whether a missing Redis must stop startup: only when
+// REDIS_REQUIRED is set, for an empty REDIS_URL (connectErr nil) or a failed connect.
+func redisRequiredError(cfg *config.Config, connectErr error) error {
+	if !cfg.RedisRequired {
+		return nil
+	}
+	if connectErr == nil {
+		return errors.New("REDIS_REQUIRED is set but REDIS_URL is empty; refusing to start without revocation and rate limits")
+	}
+	return errors.New("failed to connect to Redis and REDIS_REQUIRED is set; refusing to start without revocation and rate limits")
 }

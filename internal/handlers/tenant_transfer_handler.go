@@ -15,7 +15,7 @@ import (
 // tenant-transfer requests. STUB ONLY — every endpoint returns 501
 // Not Implemented + a descriptive body pointing at the ENT-6 spec.
 //
-// Why register the routes now: frontend (accounts.hexxlock.com) needs
+// Why register the routes now: frontend (accounts.example.com) needs
 // a stable URL surface to mock against for the UX iteration that
 // shows consumer-tenant users a "Move to a business account" banner.
 // Without registered routes, the BFF proxy would 404 every probe

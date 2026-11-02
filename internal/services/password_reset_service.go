@@ -51,6 +51,7 @@ type PasswordResetService struct {
 	sessionRepo  passwordResetServiceSessionRepo
 	emailService *EmailService
 	auditService *AuditService
+	oauthRevoker passwordResetOAuthRevoker
 
 	// caeService is optional. When set, ResetPassword publishes a
 	// CAEPasswordChanged event so receivers (Talon IAP, SSE
@@ -67,6 +68,8 @@ type PasswordResetService struct {
 	// they revoke independently. nil-safe; when nil, behavior is
 	// unchanged from pre-tier-1.
 	caepEmitter *CAEPEmitter
+
+	accessTerminator accessTerminator
 
 	// breachChecker is optional. When set, ResetPassword rejects a new
 	// password found in the HIBP breach corpus (ASVS V6 / NIST 800-63B).
@@ -115,6 +118,24 @@ func NewPasswordResetService(
 // SetSessionRepo sets the session repository for session invalidation on password reset.
 func (s *PasswordResetService) SetSessionRepo(sessionRepo passwordResetServiceSessionRepo) {
 	s.sessionRepo = sessionRepo
+}
+
+// passwordResetOAuthRevoker revokes a user's OAuth/refresh tokens; satisfied by *TokenService.
+type passwordResetOAuthRevoker interface {
+	RevokeAllUserOAuthTokens(ctx context.Context, userID uuid.UUID, reason string) error
+}
+
+// SetAccessTerminator wires the single access-termination path run after a
+// successful reset (supersedes the session/OAuth sweeps when set).
+func (s *PasswordResetService) SetAccessTerminator(t accessTerminator) {
+	s.accessTerminator = t
+}
+
+// SetOAuthRevoker wires the OAuth token sweep run after a successful reset, so
+// refresh tokens (including legacy ones with no session binding) die with the
+// old credentials.
+func (s *PasswordResetService) SetOAuthRevoker(r passwordResetOAuthRevoker) {
+	s.oauthRevoker = r
 }
 
 // RequestPasswordReset initiates a password reset flow
@@ -337,10 +358,26 @@ func (s *PasswordResetService) ResetPassword(ctx context.Context, token, newPass
 		logger.Error("Failed to invalidate other password resets", zap.Error(err))
 	}
 
-	// SECURITY: Invalidate all active sessions after password reset
-	if s.sessionRepo != nil {
-		if err := s.sessionRepo.EndAllUserSessions(ctx, user.ID, "password_reset"); err != nil {
-			logger.Error("Failed to invalidate sessions after password reset", zap.Error(err))
+	// SECURITY: Invalidate everything the old credentials could present.
+	if s.accessTerminator != nil {
+		// Sessions, OAuth tokens, IdP SSO cookies, per-session JWT blacklist,
+		// BCL. The flat user-level blacklist is off: the user is about to
+		// log back in with the new password.
+		termCtx, cancel := detachedTerminationCtx()
+		defer cancel()
+		if err := s.accessTerminator.TerminateUserAccessWith(termCtx, user.ID, user.TenantID, "password_reset", TerminateOptions{}); err != nil {
+			logger.Error("Access termination incomplete after password reset", zap.Error(err))
+		}
+	} else {
+		if s.sessionRepo != nil {
+			if err := s.sessionRepo.EndAllUserSessions(ctx, user.ID, "password_reset"); err != nil {
+				logger.Error("Failed to invalidate sessions after password reset", zap.Error(err))
+			}
+		}
+		if s.oauthRevoker != nil {
+			if err := s.oauthRevoker.RevokeAllUserOAuthTokens(ctx, user.ID, "password_reset"); err != nil {
+				logger.Error("Failed to revoke OAuth tokens after password reset", zap.Error(err))
+			}
 		}
 	}
 

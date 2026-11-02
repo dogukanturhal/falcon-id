@@ -4,6 +4,9 @@ package services
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +15,18 @@ import (
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
 	"github.com/dogukanturhal/falcon-id/pkg/metrics"
 )
+
+const SignupTrialPackageCode = "erp_growth_v1"
+
+var ErrSignupTrialAlreadyConsumed = errors.New("signup trial already consumed")
+
+func signupPlanSelection(code string) (string, error) {
+	code = strings.TrimSpace(code)
+	if strings.EqualFold(code, "free") {
+		return "", &SignupStateError{Code: "free_plan_not_offered"}
+	}
+	return code, nil
+}
 
 // productEntitlementSyncTimeout bounds how long OnSignupComplete will
 // synchronously wait (via SyncProductEntitlementProvisioner, below) for
@@ -77,6 +92,25 @@ type FounderRoleAssigner interface {
 	AssignFounderRole(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
+// AcmeAppRoleProvisionerHook provisions the real AcmeApp marketing
+// role model (Owner/Admin/Marketing Manager/Editor/Analyst/Billing — see
+// AcmeAppRoleCatalog) for a freshly created business tenant, and assigns the
+// founding user the Owner role.
+//
+// This is ADDITIVE to, not a replacement for, FounderRoleAssigner above:
+// FounderRoleAssigner's "org_admin" role name is a well-known constant that
+// internal/handlers/onboarding_slug_handler.go and
+// internal/middleware/auth_admin.go already key admin-detection off of, so
+// it must keep being created for onboarding to work at all. The AcmeApp
+// Owner role is a superset of org_admin's permissions plus the marketing-
+// specific ones, granted to the same founding user for use by
+// Settings > Team once onboarding is complete.
+//
+// Implemented by *AcmeAppRoleProvisioner (see acmeapp_role_provisioner.go).
+type AcmeAppRoleProvisionerHook interface {
+	ProvisionTenantAndAssignOwner(ctx context.Context, tenantID, ownerUserID uuid.UUID) error
+}
+
 // downstreamMailboxProvisioner provisions the downstream side of a new signup —
 // the personal mailbox <username>@downstream.com (consumer tenant) for personal
 // accounts, or the business work-email domain as a custom tenant domain for
@@ -87,7 +121,7 @@ type downstreamMailboxProvisioner interface {
 }
 
 // ProductEntitlementProvisioner enqueues a tenant's entitlement for a
-// specific first-party product (e.g. Mearax) through the SAME
+// specific first-party product (e.g. AcmeWeb) through the SAME
 // subscription-activation pipeline a billing webhook would use — see
 // ProvisioningConsumer.HandleSubscriptionActivated. It creates (or reuses,
 // idempotently) a pending iam_product_instances row and kicks the async
@@ -147,7 +181,7 @@ type SyncProductEntitlementProvisioner interface {
 //
 // This is NOT the same thing as ProductEntitlementProvisioner above:
 // entitlement provisioning gives the tenant access to a first-party product
-// (e.g. Mearax) via iam_product_instances; StartTrial writes billing state
+// (e.g. AcmeWeb) via iam_product_instances; StartTrial writes billing state
 // (TenantSubscription.Status/TrialEnd) that tenant-management's 15-minute
 // reconciler reads to decide whether to suspend a tenant. The two pipelines
 // are unrelated and both run, independently, out of OnSignupComplete.
@@ -174,7 +208,7 @@ type PlanAwarePostSignupHook interface {
 //  2. Subdomain creation (GAP 5) — business accounts only
 //  3. Consumer role assignment (ENT-2) — personal accounts only
 //  4. SSF account-created event emission (ENT-7 Phase 1 — NoOp by default)
-//  6. Product entitlement provisioning (e.g. Mearax) — see
+//  6. Product entitlement provisioning (e.g. AcmeWeb) — see
 //     ProductEntitlementProvisioner above.
 //  7. Cardless trial start (business accounts only) — see TrialStarter above.
 //
@@ -193,6 +227,7 @@ type PostSignupProvisioner struct {
 	slugResolver         TenantSlugResolver
 	consumerRoleAsgn     ConsumerRoleAssigner
 	founderRoleAsgn      FounderRoleAssigner
+	acmeappRoleProv      AcmeAppRoleProvisionerHook
 	ssfEmitter           SSFEventEmitter
 	downstreamProv         downstreamMailboxProvisioner
 	productEntitlement   ProductEntitlementProvisioner
@@ -240,6 +275,15 @@ func (p *PostSignupProvisioner) SetFounderRoleAssigner(a FounderRoleAssigner) {
 	p.founderRoleAsgn = a
 }
 
+// SetAcmeAppRoleProvisioner wires the AcmeApp marketing role model
+// provisioner — creates Owner/Admin/Marketing Manager/Editor/Analyst/Billing
+// for a new business tenant and assigns the founding user Owner. Nil-safe:
+// when unset (e.g. most unit tests), onSignupComplete simply skips this
+// step, matching every other optional post-signup step in this file.
+func (p *PostSignupProvisioner) SetAcmeAppRoleProvisioner(h AcmeAppRoleProvisionerHook) {
+	p.acmeappRoleProv = h
+}
+
 // SetdownstreamProvisioner wires the downstream provisioner that runs after signup:
 // personal -> mailbox <username>@downstream.com, business -> custom tenant domain.
 func (p *PostSignupProvisioner) SetdownstreamProvisioner(h downstreamMailboxProvisioner) {
@@ -249,7 +293,7 @@ func (p *PostSignupProvisioner) SetdownstreamProvisioner(h downstreamMailboxProv
 // SetProductEntitlementProvisioner wires the product-entitlement step: every
 // tenant produced by self-service signup gets a pending, then reconciled,
 // ACTIVE iam_product_instances row for productID (e.g.
-// models.WellKnownProductMearax). Nil-safe: when unset, OnSignupComplete
+// models.WellKnownProductAcmeWeb). Nil-safe: when unset, OnSignupComplete
 // simply skips this step (e.g. in unit tests or deployments where signup
 // intentionally doesn't grant a first-party product).
 func (p *PostSignupProvisioner) SetProductEntitlementProvisioner(provisioner ProductEntitlementProvisioner, productID uuid.UUID) {
@@ -326,7 +370,52 @@ func (p *PostSignupProvisioner) OnSignupCompleteWithPlan(ctx context.Context, te
 	return p.onSignupComplete(ctx, tenantID, userID, accountType, planCode)
 }
 
+// EnsureTrialProduct is the durable retry edge for an initially unavailable
+// trial source. Core's confirmed trial-start event invokes it after projection.
+// Re-checking the source prevents stale Kafka events from re-granting Growth
+// after payment, expiry or an independently active complimentary replacement.
+func (p *PostSignupProvisioner) EnsureTrialProduct(ctx context.Context, tenantID uuid.UUID) error {
+	if p.trialStarter == nil || p.productEntitlement == nil || p.entitlementProductID == uuid.Nil {
+		return fmt.Errorf("signup trial/product dependencies are not configured")
+	}
+	if err := p.trialStarter.StartTrial(ctx, tenantID, ""); err != nil {
+		if errors.Is(err, ErrSignupTrialAlreadyConsumed) {
+			return nil
+		}
+		return err
+	}
+	plan := SignupTrialPackageCode
+	event := SubscriptionActivatedEvent{TenantID: tenantID, ProductID: &p.entitlementProductID, PlanID: &plan}
+	if syncProvisioner, ok := p.productEntitlement.(SyncProductEntitlementProvisioner); ok {
+		bounded, cancel := context.WithTimeout(ctx, p.entitlementTimeout())
+		defer cancel()
+		return syncProvisioner.HandleSubscriptionActivatedSync(bounded, event)
+	}
+	return p.productEntitlement.HandleSubscriptionActivated(ctx, event)
+}
+
 func (p *PostSignupProvisioner) onSignupComplete(ctx context.Context, tenantID, userID uuid.UUID, accountType, planCode string) error {
+	var selectionErr error
+	planCode, selectionErr = signupPlanSelection(planCode)
+	if selectionErr != nil {
+		return selectionErr
+	}
+	// Confirm trial eligibility before granting a business product tier.
+	// Basic app/owner access below is the recovery shell, not a paid benefit.
+	trialReady := accountType != discoverAccountTypeBusiness
+	trialConsumed := false
+	if accountType == discoverAccountTypeBusiness && p.trialStarter != nil {
+		if err := p.trialStarter.StartTrial(ctx, tenantID, planCode); err != nil {
+			if errors.Is(err, ErrSignupTrialAlreadyConsumed) {
+				trialConsumed = true
+			} else {
+				metrics.TrialStartFailures.WithLabelValues(accountType).Inc()
+				logger.Error("Post-signup: trial start failed; product-tier grant withheld until source is repaired", zap.String("tenant_id", tenantID.String()), zap.Error(err))
+			}
+		} else {
+			trialReady = true
+		}
+	}
 	// 1. Grant default app access
 	if p.appAccessGranter != nil {
 		if err := p.appAccessGranter.GrantDefaultAccess(ctx, tenantID, userID); err != nil {
@@ -368,6 +457,23 @@ func (p *PostSignupProvisioner) onSignupComplete(ctx context.Context, tenantID, 
 	if p.founderRoleAsgn != nil && accountType == discoverAccountTypeBusiness {
 		if err := p.founderRoleAsgn.AssignFounderRole(ctx, tenantID, userID); err != nil {
 			logger.Warn("Post-signup: failed to assign founder org_admin role (non-fatal)",
+				zap.String("tenant_id", tenantID.String()),
+				zap.String("user_id", userID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
+	// 3c. Provision the real AcmeApp marketing role model
+	// (Owner/Admin/Marketing Manager/Editor/Analyst/Billing) for the tenant
+	// and assign the founding user Owner. Business signups only — additive
+	// to step 3b's org_admin grant above, not a replacement (see
+	// AcmeAppRoleProvisionerHook's doc comment). Non-fatal like every other
+	// step here: a failure leaves the founder with only org_admin (still
+	// enough to pass onboarding) and is visible via this Warn log.
+	if p.acmeappRoleProv != nil && accountType == discoverAccountTypeBusiness {
+		if err := p.acmeappRoleProv.ProvisionTenantAndAssignOwner(ctx, tenantID, userID); err != nil {
+			logger.Warn("Post-signup: failed to provision AcmeApp role model (non-fatal)",
 				zap.String("tenant_id", tenantID.String()),
 				zap.String("user_id", userID.String()),
 				zap.Error(err),
@@ -434,7 +540,7 @@ func (p *PostSignupProvisioner) onSignupComplete(ctx context.Context, tenantID, 
 		}
 	}
 
-	// 6. Grant the tenant's product entitlement (e.g. Mearax) so the user
+	// 6. Grant the tenant's product entitlement (e.g. AcmeWeb) so the user
 	//    isn't bounced to /unauthorized?reason=product_not_entitled on
 	//    first login. Routed through the same subscription-activation
 	//    pipeline a billing webhook would use (ProvisioningConsumer →
@@ -457,8 +563,11 @@ func (p *PostSignupProvisioner) onSignupComplete(ctx context.Context, tenantID, 
 	//    iam_product_instances.provisioning_state / failure_reason /
 	//    next_retry_at for the affected tenant+product to diagnose; the
 	//    orchestrator retries automatically with exponential backoff.
-	if p.productEntitlement != nil && p.entitlementProductID != uuid.Nil {
+	if p.productEntitlement != nil && p.entitlementProductID != uuid.Nil && trialReady {
 		plan := p.defaultPlan()
+		if accountType == discoverAccountTypeBusiness {
+			plan = SignupTrialPackageCode
+		}
 		event := SubscriptionActivatedEvent{
 			TenantID:  tenantID,
 			ProductID: &p.entitlementProductID,
@@ -525,16 +634,11 @@ func (p *PostSignupProvisioner) onSignupComplete(ctx context.Context, tenantID, 
 	//    above, which are also business-only: cardless trials are a
 	//    business-account billing concept, and subscription-management's
 	//    TenantSubscription table has no meaning for a personal tenant.
-	if p.trialStarter != nil && accountType == discoverAccountTypeBusiness {
-		if err := p.trialStarter.StartTrial(ctx, tenantID, planCode); err != nil {
-			metrics.TrialStartFailures.WithLabelValues(accountType).Inc()
-			logger.Error("Post-signup: trial start failed — tenant will show subscription_status=trial with no trial_ends_at until tenant-management's trial-gap reconciler repairs it; alert on falcon_id_trial_start_failed_total",
-				zap.String("tenant_id", tenantID.String()),
-				zap.String("user_id", userID.String()),
-				zap.Error(err),
-			)
-		}
-	}
+	// Trial start has already run before step 6; never retry a consumed trial
+	// or grant a second default tier here.
 
+	if trialConsumed {
+		return ErrSignupTrialAlreadyConsumed
+	}
 	return nil
 }

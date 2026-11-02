@@ -15,7 +15,7 @@ global:
 #   argocd-image-updater's `helm.image-name` write-back would corrupt a
 #   multi-field split by writing the FULL Harbor path into `repository`,
 #   producing doubled URLs like registry.example.com/falcon-id/harbor.
-#   hexxlock.com/falcon-id/falcon-id. Collapsing to a single field makes
+#   example.com/falcon-id/falcon-id. Collapsing to a single field makes
 #   image-updater's writes correct by construction. See the commit
 #   message for the full bug history.
 #
@@ -45,7 +45,7 @@ replicaCount: 3
 # topologySpreadConstraints distribute the falcon-id pods across nodes
 # so a single node failure cannot take all replicas down. `whenUnsatisfiable:
 # ScheduleAnyway` is deliberate — the cluster runs single-node today
-# (memory: internal engineering notes) so a strict
+# (operational notes) so a strict
 # DoNotSchedule would block all but one replica from scheduling. As
 # additional nodes land the soft preference pulls pods apart without
 # requiring a chart change.
@@ -291,6 +291,12 @@ serviceMonitor:
 # additions that don't displace it.
 podAnnotations: {}
 
+# Graceful rollout drain. Both empty by default (kubelet defaults apply).
+# Env overlays set a preStop sleep and a grace period larger than
+# preStop + SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT.
+terminationGracePeriodSeconds: null
+lifecycle: {}
+
 deploymentAnnotations: {}
 
 podSecurityContext:
@@ -320,10 +326,18 @@ env:
   ENVIRONMENT: production
   SERVICE_NAME: falcon-id
   SERVICE_PORT: "8010"
+  # DB connection budget (Postgres max_connections=100 today, 200 planned).
+  # Worst case 6 processes (HPA max 4 + 1 surge + 1 terminating) x 19 = 114,
+  # others ~46, total 160 of 197 usable once max_connections=200. Until then,
+  # steady state 3 pods ~ 9 pinned connections.
+  DB_MAX_OPEN_CONNS: "16"
+  DB_MIN_CONNS: "2"
+  CONTROL_PLANE_DB_MAX_OPEN_CONNS: "3"
+  CONTROL_PLANE_DB_MIN_CONNS: "1"
   LOG_LEVEL: info
-  JWT_ISSUER: https://id.hexxlock.com
-  OAUTH_ISSUER: https://id.hexxlock.com
-  FRONTEND_URL: https://app.hexxlock.com
+  JWT_ISSUER: https://id.example.com
+  OAUTH_ISSUER: https://id.example.com
+  FRONTEND_URL: https://example.com
   # IAM_SERVICE_URL — in-cluster base URL of falcon-id for the
   # tenantprojection bootstrap's OAuth2 client_credentials token mint.
   # Falcon-id calls its own /oauth/token; the cluster-internal DNS
@@ -331,13 +345,11 @@ env:
   # follow-up handoff (G).
   IAM_SERVICE_URL: http://falcon-id-falcon-id.falcon-id.svc.cluster.local
   MFA_ISSUER: "Falcon ID"
-  SMTP_HOST: mail.hexxlock.com
+  SMTP_HOST: mail.example.com
   SMTP_PORT: "587"
-  SMTP_FROM: noreply@falcon.hexxlock.com
+  SMTP_FROM: noreply@falcon.example.com
   SMTP_USE_TLS: "true"
   TRUSTED_PROXIES: "10.0.0.0/8"
-  OPA_DECISION_PATH: falcon/authz/allow
-  OPA_URL: http://opa.opa.svc.cluster.local:8181
   SPICEDB_ENDPOINT: spicedb.spicedb.svc.cluster.local:50051
   # Falcon-id's viper config sets SPICEDB_INSECURE default to TRUE
   # (dev-friendly). In production/staging this MUST be explicitly
@@ -528,7 +540,7 @@ externalSecrets:
 # Mount the trust-manager-distributed internal CA bundle and set
 # SSL_CERT_FILE so Go's crypto/x509 trusts both public roots AND
 # HexxLock internal CA (spicedb TLS, etc.). Requires the namespace to
-# be labeled hexxlock.com/internal-tls-trust=enabled so trust-manager
+# be labeled example.com/internal-tls-trust=enabled so trust-manager
 # auto-creates the ConfigMap.
 internalTlsTrust:
   enabled: false            # opt-in per release values
@@ -571,11 +583,11 @@ apisix:
   routes:
     internal:
       enabled: true
-      host: auth.hexxlock.com
+      host: auth.example.com
       tenantId: "00000000-0000-0000-0000-000000000003"
     customer:
       enabled: true
-      host: id.hexxlock.com
+      host: id.example.com
 
 # podDisruptionBudget block is defined earlier in this file (HA section
 # at line 67). Removed the trailing override `enabled: false` because
@@ -598,7 +610,7 @@ networkPolicy:
   # linkerd.policy.allowedNamespaces at L3/L4). Matched by the
   # kubernetes.io/metadata.name label auto-applied to every namespace.
   allowedNamespaces:
-    - apisix            # id.hexxlock.com ingress gateway
+    - apisix            # id.example.com ingress gateway
     - example-frontend  # ExampleSuite SPA BFFs
     - example-platform  # platform namespace (when populated)
     - example-business  # business namespace (when populated)
@@ -659,7 +671,7 @@ linkerd:
     # Namespace-wide allow-list (preferred). Every ServiceAccount in each
     # listed namespace is authorized to call falcon-id over mTLS.
     allowedNamespaces:
-      # APISIX gateway — forwards id.hexxlock.com external traffic
+      # APISIX gateway — forwards id.example.com external traffic
       - apisix
       # ExampleSuite frontend BFFs (11 SPAs sharing the namespace)
       - example-frontend

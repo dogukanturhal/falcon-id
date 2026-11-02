@@ -129,6 +129,18 @@ func (e *SignupStateError) Error() string {
 		return "signup request has expired"
 	case "plan_required":
 		return "a subscription plan must be selected to complete signup"
+	case "invalid_continuation":
+		return "the sign-in continuation is not a valid authorization request"
+	case "domain_trial_exists":
+		return "an account for this organization's email domain has already used its trial"
+	case "verification_code_invalid":
+		return "invalid verification code"
+	case "verification_code_expired":
+		return "verification code has expired"
+	case "verification_attempts_exceeded":
+		return "too many incorrect attempts; request a new code"
+	case "resend_throttled":
+		return "a code was sent recently; please wait before requesting another"
 	default:
 		return e.Code
 	}

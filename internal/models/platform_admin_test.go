@@ -227,7 +227,7 @@ func TestPlatformAdmin_ToResponse(t *testing.T) {
 	t.Run("should handle nil optional pointer fields", func(t *testing.T) {
 		admin := &PlatformAdmin{
 			ID:          uuid.New(),
-			Email:       "minimal@hexxlock.com",
+			Email:       "minimal@example.com",
 			Role:        PlatformAdminRoleDeveloper,
 			Permissions: []string{"tenants.read"},
 			IsActive:    true,
@@ -636,7 +636,7 @@ func TestPlatformAdminResponse_StructFields(t *testing.T) {
 func TestPlatformAdminRefreshRequest_StructFields(t *testing.T) {
 	t.Run("should carry RefreshToken", func(t *testing.T) {
 		req := PlatformAdminRefreshRequest{ //nolint:gosec // test fixture value, not a real credential
-			RefreshToken: "eyJhbGciOiJIUzI1NiJ9.refresh", // gitleaks:allow — JWT-shaped test fixture
+			RefreshToken: "eyJhbGciOiJIUzI1NiJ9.refresh",
 		}
 
 		assert.Equal(t, "eyJhbGciOiJIUzI1NiJ9.refresh", req.RefreshToken)

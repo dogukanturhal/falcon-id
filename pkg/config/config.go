@@ -45,6 +45,10 @@ type Config struct {
 	RedisConnMaxLifetime  time.Duration `mapstructure:"REDIS_CONN_MAX_LIFETIME"`
 	RedisRateLimitEnabled bool          `mapstructure:"REDIS_RATE_LIMIT_ENABLED"`
 	RedisSessionCacheTTL  time.Duration `mapstructure:"REDIS_SESSION_CACHE_TTL"`
+	// RedisRequired makes a Redis connect failure fatal at startup. Without it
+	// the service degrades to no rate limits, no session cache and no token
+	// blacklist, which in production silently turns off revocation.
+	RedisRequired bool `mapstructure:"REDIS_REQUIRED"`
 
 	// Permission Cache Configuration
 	PermissionCacheLocalSize      int           `mapstructure:"PERMISSION_CACHE_LOCAL_SIZE"`       // Local LRU cache size
@@ -69,6 +73,12 @@ type Config struct {
 	JWTIssuer         string        `mapstructure:"JWT_ISSUER"`
 	AccessTokenExpiry time.Duration `mapstructure:"ACCESS_TOKEN_EXPIRY"`
 	SessionExpiry     time.Duration `mapstructure:"SESSION_EXPIRY"`
+
+	// Signing-key rotation (publish before activate). See pkg/keys.
+	SigningKeyPublishDelay   time.Duration `mapstructure:"SIGNING_KEY_PUBLISH_DELAY"`
+	SigningKeyReloadInterval time.Duration `mapstructure:"SIGNING_KEY_RELOAD_INTERVAL"`
+	SigningKeyRetireAfter    time.Duration `mapstructure:"SIGNING_KEY_RETIRE_AFTER"`
+	JWKSMaxAge               time.Duration `mapstructure:"JWKS_MAX_AGE"`
 
 	// CAEPOutboxEnabled flips the CAEP transmitter from best-effort
 	// sync push (Phase 1, wave 2 default) to PG-backed transactional
@@ -103,6 +113,27 @@ type Config struct {
 	//     additive, so gradual SDK rollout is safe.
 	// Default OFF until the SDKs are shipped with DPoP proof generation.
 	DPoPEnabled bool `mapstructure:"DPOP_ENABLED"`
+
+	// PlatformAdminRequirePhishingResistantMFA makes the platform admin plane
+	// (RequirePlatformAdmin + its step-up) demand a session authenticated with
+	// a passkey (amr "hwk"). TOTP / email OTP / SMS do not qualify. Scoped to
+	// platform admins only; tenant owners/admins are unaffected. The configured
+	// break-glass account is exempt by design. Default OFF.
+	PlatformAdminRequirePhishingResistantMFA bool `mapstructure:"PLATFORM_ADMIN_REQUIRE_PHISHING_RESISTANT_MFA"`
+
+	// NativeAppSchemeDomains enables RFC 8252 §7.1 private-use URI scheme
+	// redirects for native clients (public + PKCE + first-party): a scheme
+	// is accepted when its reversed labels equal or sit under an entry
+	// (com.example.app under example.com). Empty = feature off.
+	NativeAppSchemeDomains []string `mapstructure:"NATIVE_APP_SCHEME_DOMAINS"`
+	// TenantExchangePublicClientIDs lists client_ids of public, PKCE,
+	// first-party clients allowed to use the tenant token exchange.
+	// Empty = confidential clients only.
+	TenantExchangePublicClientIDs []string `mapstructure:"TENANT_EXCHANGE_PUBLIC_CLIENT_IDS"`
+	// OAuthTokenPerUserClientIDs lists client_ids whose /oauth/token rate
+	// limit is bucketed per end user instead of per client (multi-user BFFs
+	// and public native clients). Default: acmeapp-bff.
+	OAuthTokenPerUserClientIDs []string `mapstructure:"OAUTH_TOKEN_PER_USER_CLIENT_IDS"`
 
 	// Session Security Configuration
 	SessionIdleTimeout time.Duration `mapstructure:"SESSION_IDLE_TIMEOUT"` // Max inactivity before session is invalidated on refresh
@@ -156,6 +187,12 @@ type Config struct {
 	// "failing open" log line on every password set.
 	PasswordBreachCheckEnabled bool `mapstructure:"PASSWORD_BREACH_CHECK_ENABLED"`
 
+	// WitnessTOTPEnabled is the global kill switch for the authenticator-app
+	// (TOTP) fallback of the ZTNA device-enrollment witness. Default false:
+	// first deploy ships dark. Even when true, the realm flag
+	// device_witness_totp_allowed must also allow it.
+	WitnessTOTPEnabled bool `mapstructure:"FALCON_WITNESS_TOTP_ENABLED"`
+
 	// Rate Limiting
 	RateLimitRequests int           `mapstructure:"RATE_LIMIT_REQUESTS"`
 	RateLimitWindow   time.Duration `mapstructure:"RATE_LIMIT_WINDOW"`
@@ -196,10 +233,10 @@ type Config struct {
 	ConsumerEmailDomain string `mapstructure:"CONSUMER_EMAIL_DOMAIN"`
 
 	// TenantApexDomain is the eTLD+1 that business-tenant subdomains hang
-	// off (e.g. tenant slug "hexxlock" resolves at "hexxlock.ligarbo.com").
+	// off (e.g. tenant slug "hexxlock" resolves at "hexxlock.example.com").
 	// Used to build the Host/CanonicalURL passed to HostDiscoveryService.
 	// RegisterVerifiedHost when the onboarding wizard confirms/changes a
-	// tenant's slug. Env TENANT_APEX_DOMAIN; defaults to ligarbo.com.
+	// tenant's slug. Env TENANT_APEX_DOMAIN; defaults to example.com.
 	TenantApexDomain string `mapstructure:"TENANT_APEX_DOMAIN"`
 
 	// SignupDefaultPlanCode is the subscription_plans.name assigned to a
@@ -212,6 +249,12 @@ type Config struct {
 	// active plan) — "free" was retired 2026-09-10 and must never be
 	// assigned to new tenants again.
 	SignupDefaultPlanCode string `mapstructure:"SIGNUP_DEFAULT_PLAN_CODE"`
+
+	// SignupDefaultAppURL is where a completed self-service signup is sent when
+	// it carries no (valid) OIDC continuation, e.g. the AcmeApp app's
+	// oidc-start URL. Absolute http(s) URL; empty leaves the client on its own
+	// fallback. Env SIGNUP_DEFAULT_APP_URL.
+	SignupDefaultAppURL string `mapstructure:"SIGNUP_DEFAULT_APP_URL"`
 
 	// ABAC/OPA Configuration
 	UseABAC          bool          `mapstructure:"USE_ABAC"`           // Global ABAC enable/disable (default: false)
@@ -252,14 +295,14 @@ type Config struct {
 	SpiceDBReconcilerInterval time.Duration `mapstructure:"SPICEDB_RECONCILER_INTERVAL"` // Reconciliation interval
 
 	// SAML SP (Inbound Federation) Configuration
-	SAMLSPBaseURL               string        `mapstructure:"SAML_SP_BASE_URL"`               // Base URL for SP endpoints (e.g., "https://iam.hexxlock.com")
+	SAMLSPBaseURL               string        `mapstructure:"SAML_SP_BASE_URL"`               // Base URL for SP endpoints (e.g., "https://iam.example.com")
 	SAMLSPClockSkew             time.Duration `mapstructure:"SAML_SP_CLOCK_SKEW"`             // Clock skew tolerance for assertion validation
 	SAMLMetadataRefreshEnabled  bool          `mapstructure:"SAML_METADATA_REFRESH_ENABLED"`  // Enable background metadata auto-refresh
 	SAMLMetadataRefreshInterval time.Duration `mapstructure:"SAML_METADATA_REFRESH_INTERVAL"` // Interval between metadata refresh checks
 
 	// WebAuthn / Passkey Configuration (FIDO2)
 	// RPID is the Relying Party identifier used to scope passkey credentials.
-	// MUST be the eTLD+1 root (e.g. "hexxlock.com") so a credential is reusable
+	// MUST be the eTLD+1 root (e.g. "example.com") so a credential is reusable
 	// across every product subdomain. RPID is immutable per credential —
 	// changing it after credentials exist invalidates them.
 	WebAuthnRPID string `mapstructure:"WEBAUTHN_RP_ID"`
@@ -267,8 +310,8 @@ type Config struct {
 	WebAuthnRPDisplayName string `mapstructure:"WEBAUTHN_RP_DISPLAY_NAME"`
 	// RPOrigins is the comma-separated list of origins (scheme + host[:port])
 	// from which passkey ceremonies are permitted. MUST cover every host that
-	// runs the login or accounts UI (e.g. "https://accounts.hexxlock.com,
-	// https://id.hexxlock.com"). Subdomains of RPID are not auto-trusted.
+	// runs the login or accounts UI (e.g. "https://accounts.example.com,
+	// https://id.example.com"). Subdomains of RPID are not auto-trusted.
 	WebAuthnRPOrigins []string `mapstructure:"WEBAUTHN_RP_ORIGINS"`
 
 	// Apple Sign In Configuration
@@ -280,7 +323,7 @@ type Config struct {
 	// Asymmetric JWT Signing Configuration
 	JWTSigningAlgorithm    string        `mapstructure:"JWT_SIGNING_ALGORITHM"`     // RS256 (default) or ES256
 	JWTKeyRotationInterval time.Duration `mapstructure:"JWT_KEY_ROTATION_INTERVAL"` // How often to rotate signing keys (default: 90 days)
-	JWTHMACFallbackEnabled bool          `mapstructure:"JWT_HMAC_FALLBACK_ENABLED"` // Accept HS256 tokens during migration (default: true)
+	JWTHMACFallbackEnabled bool          `mapstructure:"JWT_HMAC_FALLBACK_ENABLED"` // Accept HS256 tokens during migration (default: false)
 	// JWTClockSkewLeeway is the symmetric clock-skew tolerance applied to
 	// access-token time-based claim validation (exp / nbf). A disconnected or
 	// drifting DDIL node whose clock runs ahead of the issuer would otherwise
@@ -413,9 +456,88 @@ type Config struct {
 	// disable at runtime without a code change (ops kill-switch).
 	// Default: "true" — must be enabled before Phase 1b flips authoritative writes.
 	TenantProjectionEnabled bool `mapstructure:"TENANT_PROJECTION_ENABLED"`
+
+	// EntitlementSyncEnabled gates the example.tenant.modules.sync
+	// consumer (the product roadmap §4.1, internal/entitlementsync). Set to
+	// "false" to disable at runtime without a code change (ops
+	// kill-switch) -- e.g. before <gitops-bootstrap-repo>'s
+	// topic/KafkaUser and the GitOps repository' v0.232.267 MigrationBundle
+	// have both rolled out (see falcon-id r1/entitlements rollout-order
+	// note). Default: "true".
+	EntitlementSyncEnabled bool `mapstructure:"ENTITLEMENT_SYNC_ENABLED"`
+	// ModuleAccessReconcileOnStartup runs the module-access reconcile (role
+	// templates + owner grants for every granting entitlement) once, shortly
+	// after startup. Kill switch: MODULE_ACCESS_RECONCILE_ON_STARTUP=false.
+	// Default: "true".
+	ModuleAccessReconcileOnStartup bool `mapstructure:"MODULE_ACCESS_RECONCILE_ON_STARTUP"`
+	// AcmeAppGrantSyncOnStartup tops up catalog permission grants on every
+	// tenant's existing AcmeApp system roles shortly after startup (additive,
+	// idempotent). Kill switch: ACMEAPP_GRANT_SYNC_ON_STARTUP=false.
+	AcmeAppGrantSyncOnStartup bool `mapstructure:"ACMEAPP_GRANT_SYNC_ON_STARTUP"`
+
+	// WO#20 tenant API keys (developer access). Everything is off by default:
+	// DeveloperKeysEnabled gates the /api/v1/developer/api-keys routes and the
+	// /oauth/token/api-key exchange; DeveloperKeysTenantAllowlist (comma-
+	// separated tenant UUIDs) narrows it to a canary set, and an empty list
+	// means every tenant once the flag is on (GA).
+	DeveloperKeysEnabled         bool     `mapstructure:"DEVELOPER_KEYS_ENABLED"`
+	DeveloperKeysTenantAllowlist []string `mapstructure:"DEVELOPER_KEYS_TENANT_ALLOWLIST"`
+	// DeveloperKeysPepper is the HMAC-SHA256 pepper for tenant API key secrets.
+	// Sourced from Vault via env; never logged, never in the DB. Empty disables
+	// key creation and exchange (fail closed).
+	DeveloperKeysPepper string `mapstructure:"DEVELOPER_KEYS_PEPPER"`
+	// DeveloperKeysPeppers holds additional pepper versions ("v2=secret,
+	// v3=secret" in DEVELOPER_KEYS_PEPPERS) so stored hashes made with an
+	// older pepper keep verifying across a rotation. DEVELOPER_KEYS_PEPPER is
+	// always version v1. DeveloperKeysPepperCurrent names the version used for
+	// new hashes (default v1); stored as hash_alg "hmac-sha256:<version>".
+	DeveloperKeysPeppers       map[string]string `mapstructure:"DEVELOPER_KEYS_PEPPERS"`
+	DeveloperKeysPepperCurrent string            `mapstructure:"DEVELOPER_KEYS_PEPPER_CURRENT"`
+	// DeveloperKeysAudience is the `aud` of API key access tokens. The public
+	// API host is not final, so it is configuration, not code.
+	DeveloperKeysAudience string `mapstructure:"DEVELOPER_KEYS_AUDIENCE"`
+	// DeveloperKeysTokenTTL is the lifetime of an exchanged API key token.
+	DeveloperKeysTokenTTL time.Duration `mapstructure:"DEVELOPER_KEYS_TOKEN_TTL"`
+	// BusinessInternalURL is the in-cluster base URL of the business service,
+	// used to sync API key company edges (scope iam:api-keys:sync).
+	BusinessInternalURL string `mapstructure:"BUSINESS_INTERNAL_URL"`
+	// TenantStatusEnabled gates the example.tenant.status consumer (tenant
+	// suspension enforcement, R1-GAPS row 27, internal/tenantstatus). Kill
+	// switch: TENANT_STATUS_ENABLED=false. Like the other Kafka consumers it
+	// is a no-op when KAFKA_BROKERS is empty.
+	TenantStatusEnabled bool `mapstructure:"TENANT_STATUS_ENABLED"`
+	// OpsStrictPlatformRoles (OPS_STRICT_PLATFORM_ROLES, default false) turns
+	// on the platform-admin console's strict platform-plane model. When true,
+	// platform-admin authority comes ONLY from iam_platform_roles (an active
+	// JIT elevation or break-glass grant): the is_platform_admin claim, the
+	// checkPermissions / RequirePlatformAdmin bypass and the implicit
+	// internal-tenant admin no longer follow tenant membership or the legacy
+	// tenant-role platform_admin / iam_admin. The one exception is the
+	// break-glass account (OpsBreakGlassEmail). When false (default) every
+	// path behaves exactly as before.
+	OpsStrictPlatformRoles bool `mapstructure:"OPS_STRICT_PLATFORM_ROLES"`
+	// OpsBreakGlassEmail (OPS_BREAK_GLASS_EMAIL) is the single account that
+	// keeps a standing platform_admin / iam_admin tenant role under
+	// OPS_STRICT_PLATFORM_ROLES. Empty = the account created by
+	// FALCON_ADMIN_EMAIL is the break-glass account.
+	OpsBreakGlassEmail string `mapstructure:"OPS_BREAK_GLASS_EMAIL"`
+	// OpsAuditConsumerEnabled (OPS_AUDIT_CONSUMER_ENABLED, default false)
+	// starts the platform.ops-audit.v1 consumer that appends operator audit
+	// events to platform_admin_audit_log (needs migration 0035 applied).
+	OpsAuditConsumerEnabled bool `mapstructure:"OPS_AUDIT_CONSUMER_ENABLED"`
+	// OpsOperatorExchangeClientIDs (OPS_OPERATOR_EXCHANGE_CLIENT_IDS, comma
+	// separated) lists the confidential OAuth clients allowed to run the
+	// operator token exchange (audience hexxlock-ops). Empty = exchange off.
+	OpsOperatorExchangeClientIDs []string `mapstructure:"OPS_OPERATOR_EXCHANGE_CLIENT_IDS"`
+	// OpsStandingAdminDirect (OPS_STANDING_ADMIN_DIRECT, default false) makes
+	// the operator exchange mint standing_platform_admin for the standing
+	// break-glass platform_admin, so the operator console skips reason /
+	// confirmation / four-eyes friction for it (audit stays complete). false =
+	// kill switch: full friction for everyone.
+	OpsStandingAdminDirect bool `mapstructure:"OPS_STANDING_ADMIN_DIRECT"`
 	// TenantManagementInternalURL is the in-cluster base URL of tenant-management
 	// used by the cold-start bootstrap REST poll.
-	// Default: http://hexxlock-platform-tenant-management.example-platform.svc.cluster.local:80
+	// Default: http://platform-tenant-management.example-platform.svc.cluster.local:80
 	TenantManagementInternalURL string `mapstructure:"TENANT_MANAGEMENT_INTERNAL_URL"`
 	// SubscriptionManagementInternalURL is the in-cluster base URL of
 	// subscription-management, used by the onboarding-completion trial-start
@@ -479,14 +601,15 @@ type Config struct {
 	// only authoritative source of tenant users on the platform) and
 	// writes the absolute value to quota-service via
 	// POST /api/v1/quota/admin/reconcile, self-correcting any drift
-	// between runs — mirrors hexxlock/business's
+	// between runs — mirrors the business service repository's
 	// ContactsQuotaReconcilerService for the "contacts" resource.
 	// Default: enabled, hourly (same cadence as the contacts precedent —
 	// seat counts do not need real-time reconciliation given the
 	// synchronous check/increment/decrement path above already covers
 	// the common create/delete case).
-	SeatQuotaReconcilerEnabled  bool          `mapstructure:"SEAT_QUOTA_RECONCILER_ENABLED"`
-	SeatQuotaReconcilerInterval time.Duration `mapstructure:"SEAT_QUOTA_RECONCILER_INTERVAL"`
+	SeatQuotaReconcilerEnabled   bool          `mapstructure:"SEAT_QUOTA_RECONCILER_ENABLED"`
+	SeatQuotaReconcilerInterval  time.Duration `mapstructure:"SEAT_QUOTA_RECONCILER_INTERVAL"`
+	EmployeeAccessExpiryInterval time.Duration `mapstructure:"EMPLOYEE_ACCESS_EXPIRY_INTERVAL"`
 
 	BotDetectionEnabled            bool    `mapstructure:"BOT_DETECTION_ENABLED"`
 	BotDetectionThreshold          float64 `mapstructure:"BOT_DETECTION_THRESHOLD"`
@@ -533,6 +656,42 @@ func envStringSlice(key string) []string {
 	return out
 }
 
+// parseVersionedSecrets parses "v2=secret,v3=secret" into a version->secret map.
+// Entries without a version, secret or "=" are ignored.
+func parseVersionedSecrets(raw string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.Split(raw, ",") {
+		version, secret, ok := strings.Cut(strings.TrimSpace(part), "=")
+		version, secret = strings.TrimSpace(version), strings.TrimSpace(secret)
+		if ok && version != "" && secret != "" {
+			out[version] = secret
+		}
+	}
+	return out
+}
+
+// DeveloperKeyPeppers returns every configured API key pepper by version
+// (DEVELOPER_KEYS_PEPPER is v1; DEVELOPER_KEYS_PEPPERS adds more) and the
+// version new hashes use. The current version is v1 unless
+// DEVELOPER_KEYS_PEPPER_CURRENT says otherwise; if it has no pepper, the
+// returned current pepper is missing and callers must fail closed.
+func (c *Config) DeveloperKeyPeppers() (peppers map[string]string, current string) {
+	peppers = map[string]string{}
+	for v, s := range c.DeveloperKeysPeppers {
+		peppers[v] = s
+	}
+	if c.DeveloperKeysPepper != "" {
+		if _, taken := peppers["v1"]; !taken {
+			peppers["v1"] = c.DeveloperKeysPepper
+		}
+	}
+	current = c.DeveloperKeysPepperCurrent
+	if current == "" {
+		current = "v1"
+	}
+	return peppers, current
+}
+
 // LoadConfig is an exported function.
 func LoadConfig() (*Config, error) {
 	// SECURITY: Environment must be explicitly set - no default
@@ -556,6 +715,7 @@ func LoadConfig() (*Config, error) {
 
 	viper.SetDefault("REDIS_URL", "")
 	viper.SetDefault("REDIS_MAX_RETRIES", 3)
+	viper.SetDefault("REDIS_REQUIRED", false)
 	viper.SetDefault("REDIS_MIN_IDLE_CONNS", 5)
 	viper.SetDefault("REDIS_CONN_MAX_LIFETIME", 30*time.Minute)
 	viper.SetDefault("REDIS_RATE_LIMIT_ENABLED", true)
@@ -596,7 +756,13 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("JWT_ISSUER", "falcon-id")
 	viper.SetDefault("ACCESS_TOKEN_EXPIRY", 15*time.Minute) // SECURITY: Short-lived access tokens reduce exposure window
 	viper.SetDefault("SESSION_EXPIRY", 24*time.Hour)
+	// Must exceed JWKS_MAX_AGE + SIGNING_KEY_RELOAD_INTERVAL so every cache and replica knows a key before it signs.
+	viper.SetDefault("SIGNING_KEY_PUBLISH_DELAY", 75*time.Minute)
+	viper.SetDefault("SIGNING_KEY_RELOAD_INTERVAL", 60*time.Second)
+	viper.SetDefault("SIGNING_KEY_RETIRE_AFTER", 24*time.Hour) // rotated key stays in JWKS this long (>= longest JWT lifetime + margin)
+	viper.SetDefault("JWKS_MAX_AGE", 300*time.Second)
 	viper.SetDefault("SESSION_IDLE_TIMEOUT", 8*time.Hour) // 8 hours of inactivity before session is invalidated
+	viper.SetDefault("PLATFORM_ADMIN_REQUIRE_PHISHING_RESISTANT_MFA", false)
 	viper.SetDefault("DPOP_ENABLED", false)               // RFC 9449 — enable after SDK client proof generation ships
 	// SECURITY: Enable session rotation by default to prevent session fixation attacks
 	viper.SetDefault("SESSION_ROTATION_ON_REFRESH", true)
@@ -628,6 +794,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("PASSWORD_REQUIRE_DIGIT", true)
 	viper.SetDefault("PASSWORD_REQUIRE_SPECIAL", true)
 	viper.SetDefault("PASSWORD_BREACH_CHECK_ENABLED", true)
+	viper.SetDefault("FALCON_WITNESS_TOTP_ENABLED", false)
 
 	viper.SetDefault("RATE_LIMIT_REQUESTS", 100)
 	viper.SetDefault("RATE_LIMIT_WINDOW", time.Minute)
@@ -702,7 +869,7 @@ func LoadConfig() (*Config, error) {
 	// Asymmetric JWT Signing Defaults
 	viper.SetDefault("JWT_SIGNING_ALGORITHM", "RS256")             // RS256 for broad compatibility
 	viper.SetDefault("JWT_KEY_ROTATION_INTERVAL", 90*24*time.Hour) // 90-day rotation cycle
-	viper.SetDefault("JWT_HMAC_FALLBACK_ENABLED", true)            // Accept HS256 during migration
+	viper.SetDefault("JWT_HMAC_FALLBACK_ENABLED", false)           // Accept HS256 during migration
 	viper.SetDefault("JWT_CLOCK_SKEW_LEEWAY", 60*time.Second)      // DDIL P3.3: clock-skew tolerance on exp/nbf
 
 	// DDIL degraded-mode (Phase 3) defaults — budgets from the operating spec.
@@ -759,7 +926,7 @@ func LoadConfig() (*Config, error) {
 	// avatar bucket creation across every deploy until this change
 	// (discovered 2026-05-01).
 	viper.SetDefault("PROMETHEUS_URL", "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090")
-	viper.SetDefault("MINIO_CONSOLE_URL", "http://hexxlock-prod-console.minio-tenant.svc.cluster.local:9090")
+	viper.SetDefault("MINIO_CONSOLE_URL", "http://example-prod-console.minio-tenant.svc.cluster.local:9090")
 	// MINIO_ACCESS_KEY / MINIO_SECRET_KEY have no default by design.
 	// The previous defaults (`hexxlock` / `hexxlock_minio_dev_2024`) were
 	// dev-only credentials that silently shipped to every environment;
@@ -785,7 +952,17 @@ func LoadConfig() (*Config, error) {
 	// Default true — must be enabled before Phase 1b flips authoritative writes.
 	// Ops kill-switch: set TENANT_PROJECTION_ENABLED=false without redeploying.
 	viper.SetDefault("TENANT_PROJECTION_ENABLED", true)
-	viper.SetDefault("TENANT_MANAGEMENT_INTERNAL_URL", "http://hexxlock-platform-tenant-management.example-platform.svc.cluster.local:80")
+	viper.SetDefault("ENTITLEMENT_SYNC_ENABLED", true)
+	viper.SetDefault("MODULE_ACCESS_RECONCILE_ON_STARTUP", true)
+	viper.SetDefault("ACMEAPP_GRANT_SYNC_ON_STARTUP", true)
+	viper.SetDefault("DEVELOPER_KEYS_ENABLED", false)
+	viper.SetDefault("DEVELOPER_KEYS_AUDIENCE", "https://api.example.com")
+	viper.SetDefault("DEVELOPER_KEYS_TOKEN_TTL", 600*time.Second)
+	viper.SetDefault("TENANT_STATUS_ENABLED", true)
+	viper.SetDefault("OPS_STRICT_PLATFORM_ROLES", false)
+	viper.SetDefault("OPS_AUDIT_CONSUMER_ENABLED", false)
+	viper.SetDefault("OPS_STANDING_ADMIN_DIRECT", false)
+	viper.SetDefault("TENANT_MANAGEMENT_INTERNAL_URL", "http://platform-tenant-management.example-platform.svc.cluster.local:80")
 	viper.SetDefault("SUBSCRIPTION_MANAGEMENT_INTERNAL_URL", "http://subscription-management.example-platform.svc.cluster.local:8040")
 	// Outbound OAuth (ADR 0029 follow-up G) — empty by default; production
 	// overlay sets these via the falcon-id-oauth ServiceClientClaim →
@@ -800,6 +977,7 @@ func LoadConfig() (*Config, error) {
 	viper.SetDefault("QUOTA_CHECK_FAIL_OPEN", false)
 	viper.SetDefault("SEAT_QUOTA_RECONCILER_ENABLED", true)
 	viper.SetDefault("SEAT_QUOTA_RECONCILER_INTERVAL", time.Hour)
+	viper.SetDefault("EMPLOYEE_ACCESS_EXPIRY_INTERVAL", 15*time.Minute)
 
 	viper.AutomaticEnv()
 
@@ -818,6 +996,7 @@ func LoadConfig() (*Config, error) {
 	config.ControlPlaneDatabaseURL = viper.GetString("CONTROL_PLANE_DATABASE_URL")
 	config.RedisURL = viper.GetString("REDIS_URL")
 	config.RedisMaxRetries = viper.GetInt("REDIS_MAX_RETRIES")
+	config.RedisRequired = viper.GetBool("REDIS_REQUIRED")
 	config.RedisMinIdleConns = viper.GetInt("REDIS_MIN_IDLE_CONNS")
 	config.RedisConnMaxLifetime = viper.GetDuration("REDIS_CONN_MAX_LIFETIME")
 	config.RedisRateLimitEnabled = viper.GetBool("REDIS_RATE_LIMIT_ENABLED")
@@ -845,6 +1024,10 @@ func LoadConfig() (*Config, error) {
 	config.JWTIssuer = viper.GetString("JWT_ISSUER")
 	config.AccessTokenExpiry = viper.GetDuration("ACCESS_TOKEN_EXPIRY")
 	config.SessionExpiry = viper.GetDuration("SESSION_EXPIRY")
+	config.SigningKeyPublishDelay = viper.GetDuration("SIGNING_KEY_PUBLISH_DELAY")
+	config.SigningKeyReloadInterval = viper.GetDuration("SIGNING_KEY_RELOAD_INTERVAL")
+	config.SigningKeyRetireAfter = viper.GetDuration("SIGNING_KEY_RETIRE_AFTER")
+	config.JWKSMaxAge = viper.GetDuration("JWKS_MAX_AGE")
 	config.SessionIdleTimeout = viper.GetDuration("SESSION_IDLE_TIMEOUT")
 	// Remember-me TTL bifurcation. SessionTTLDefault falls back to
 	// SessionExpiry when SESSION_TTL_DEFAULT is unset — this preserves
@@ -857,6 +1040,13 @@ func LoadConfig() (*Config, error) {
 	}
 	config.SessionTTLRememberMe = viper.GetDuration("SESSION_TTL_REMEMBER_ME")
 	config.DPoPEnabled = viper.GetBool("DPOP_ENABLED")
+	config.PlatformAdminRequirePhishingResistantMFA = viper.GetBool("PLATFORM_ADMIN_REQUIRE_PHISHING_RESISTANT_MFA")
+	config.NativeAppSchemeDomains = envStringSlice("NATIVE_APP_SCHEME_DOMAINS")
+	config.TenantExchangePublicClientIDs = envStringSlice("TENANT_EXCHANGE_PUBLIC_CLIENT_IDS")
+	config.OAuthTokenPerUserClientIDs = envStringSlice("OAUTH_TOKEN_PER_USER_CLIENT_IDS")
+	if len(config.OAuthTokenPerUserClientIDs) == 0 {
+		config.OAuthTokenPerUserClientIDs = []string{"acmeapp-bff"}
+	}
 	config.CAEPOutboxEnabled = viper.GetBool("CAEP_OUTBOX_ENABLED")
 	config.EmailOutboxEnabled = viper.GetBool("EMAIL_OUTBOX_ENABLED")
 
@@ -876,6 +1066,7 @@ func LoadConfig() (*Config, error) {
 	config.PasswordRequireDigit = viper.GetBool("PASSWORD_REQUIRE_DIGIT")
 	config.PasswordRequireSpecial = viper.GetBool("PASSWORD_REQUIRE_SPECIAL")
 	config.PasswordBreachCheckEnabled = viper.GetBool("PASSWORD_BREACH_CHECK_ENABLED")
+	config.WitnessTOTPEnabled = viper.GetBool("FALCON_WITNESS_TOTP_ENABLED")
 
 	config.RateLimitRequests = viper.GetInt("RATE_LIMIT_REQUESTS")
 	config.RateLimitWindow = viper.GetDuration("RATE_LIMIT_WINDOW")
@@ -908,12 +1099,13 @@ func LoadConfig() (*Config, error) {
 	}
 	config.TenantApexDomain = viper.GetString("TENANT_APEX_DOMAIN")
 	if config.TenantApexDomain == "" {
-		config.TenantApexDomain = "ligarbo.com"
+		config.TenantApexDomain = "example.com"
 	}
 	config.SignupDefaultPlanCode = viper.GetString("SIGNUP_DEFAULT_PLAN_CODE")
 	if config.SignupDefaultPlanCode == "" {
 		config.SignupDefaultPlanCode = "starter"
 	}
+	config.SignupDefaultAppURL = strings.TrimSpace(viper.GetString("SIGNUP_DEFAULT_APP_URL"))
 
 	// ABAC/OPA
 	config.UseABAC = viper.GetBool("USE_ABAC")
@@ -994,7 +1186,7 @@ func LoadConfig() (*Config, error) {
 			origins := []string{
 				"http://localhost:3002",  // accounts portal (passkey management)
 				"http://localhost:3015",  // login app
-				"http://localhost:3010",  // mearax
+				"http://localhost:3010",  // acmeweb
 				"http://localhost:18090", // local gateway / OAuth issuer
 			}
 			if u := strings.TrimRight(strings.TrimSpace(config.FrontendURL), "/"); u != "" {
@@ -1104,6 +1296,23 @@ func LoadConfig() (*Config, error) {
 
 	// Tenant reverse projection (ADR 0029 Phase 1a).
 	config.TenantProjectionEnabled = viper.GetBool("TENANT_PROJECTION_ENABLED")
+	config.EntitlementSyncEnabled = viper.GetBool("ENTITLEMENT_SYNC_ENABLED")
+	config.ModuleAccessReconcileOnStartup = viper.GetBool("MODULE_ACCESS_RECONCILE_ON_STARTUP")
+	config.AcmeAppGrantSyncOnStartup = viper.GetBool("ACMEAPP_GRANT_SYNC_ON_STARTUP")
+	config.DeveloperKeysEnabled = viper.GetBool("DEVELOPER_KEYS_ENABLED")
+	config.DeveloperKeysTenantAllowlist = envStringSlice("DEVELOPER_KEYS_TENANT_ALLOWLIST")
+	config.DeveloperKeysPepper = viper.GetString("DEVELOPER_KEYS_PEPPER")
+	config.DeveloperKeysPeppers = parseVersionedSecrets(viper.GetString("DEVELOPER_KEYS_PEPPERS"))
+	config.DeveloperKeysPepperCurrent = viper.GetString("DEVELOPER_KEYS_PEPPER_CURRENT")
+	config.DeveloperKeysAudience = viper.GetString("DEVELOPER_KEYS_AUDIENCE")
+	config.DeveloperKeysTokenTTL = viper.GetDuration("DEVELOPER_KEYS_TOKEN_TTL")
+	config.BusinessInternalURL = viper.GetString("BUSINESS_INTERNAL_URL")
+	config.TenantStatusEnabled = viper.GetBool("TENANT_STATUS_ENABLED")
+	config.OpsStrictPlatformRoles = viper.GetBool("OPS_STRICT_PLATFORM_ROLES")
+	config.OpsBreakGlassEmail = strings.TrimSpace(viper.GetString("OPS_BREAK_GLASS_EMAIL"))
+	config.OpsAuditConsumerEnabled = viper.GetBool("OPS_AUDIT_CONSUMER_ENABLED")
+	config.OpsStandingAdminDirect = viper.GetBool("OPS_STANDING_ADMIN_DIRECT")
+	config.OpsOperatorExchangeClientIDs = envStringSlice("OPS_OPERATOR_EXCHANGE_CLIENT_IDS")
 	config.TenantManagementInternalURL = viper.GetString("TENANT_MANAGEMENT_INTERNAL_URL")
 	config.SubscriptionManagementInternalURL = viper.GetString("SUBSCRIPTION_MANAGEMENT_INTERNAL_URL")
 
@@ -1117,6 +1326,7 @@ func LoadConfig() (*Config, error) {
 	config.QuotaCheckFailOpen = viper.GetBool("QUOTA_CHECK_FAIL_OPEN")
 	config.SeatQuotaReconcilerEnabled = viper.GetBool("SEAT_QUOTA_RECONCILER_ENABLED")
 	config.SeatQuotaReconcilerInterval = viper.GetDuration("SEAT_QUOTA_RECONCILER_INTERVAL")
+	config.EmployeeAccessExpiryInterval = viper.GetDuration("EMPLOYEE_ACCESS_EXPIRY_INTERVAL")
 
 	// SECURITY: Validate configuration before returning
 	if err := validateSecurityConfig(config); err != nil {

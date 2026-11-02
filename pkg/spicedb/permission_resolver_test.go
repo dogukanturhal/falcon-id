@@ -202,6 +202,13 @@ func TestParsePermission_ModuleResourceAction(t *testing.T) {
 			wantObjectID:   "iam__users__manage",
 			wantAction:     "check",
 		},
+		{
+			// RPM WP-22: the PM permission module key is "projects" (pm stays known for old grants).
+			permission:     "projects:budget:approve",
+			wantObjectType: "access_grant",
+			wantObjectID:   "projects__budget__approve",
+			wantAction:     "check",
+		},
 	}
 
 	for _, tt := range tests {
@@ -218,7 +225,7 @@ func TestParsePermission_ModuleResourceAction(t *testing.T) {
 
 func TestIsModuleName_KnownModules(t *testing.T) {
 	known := []string{
-		"crm", "hr", "accounting", "inventory", "invoicing", "pm", "marketing",
+		"crm", "hr", "accounting", "inventory", "invoicing", "pm", "projects", "marketing",
 		"ppscm", "sd", "fico", "mm", "qms", "plm", "cmms",
 		"cms", "helpdesk", "documents", "workflow", "custom_objects", "reporting",
 		"ecommerce", "settings", "admin",

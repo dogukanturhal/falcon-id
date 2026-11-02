@@ -143,7 +143,7 @@ func TestDisableEmailMFAOnly_EmptyPasswordSucceeds(t *testing.T) {
 }
 
 // Empty-everything (no password, no code) — relies solely on the
-// freshAuth route gate. This is the canonical accounts.hexxlock.com
+// freshAuth route gate. This is the canonical accounts.example.com
 // flow after the user has just completed step-up via WebAuthn or OTP.
 // The frontend passes `disableEmailMfa('')` / `disableTotp('')` —
 // empty string for both fields. See apps/accounts/src/components/

@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -60,13 +61,27 @@ func (h *JITAccessHandler) RequestAccess(c *gin.Context) {
 		return
 	}
 
-	grant, err := h.jitService.RequestAccess(c.Request.Context(), currentUser.TenantID, &req)
+	grant, err := h.jitService.RequestAccess(c.Request.Context(), currentUser.TenantID, currentUser.SessionID, &req)
 	if err != nil {
-		h.logger.Error("Failed to request JIT access",
-			zap.String("user_id", currentUser.ID.String()),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		switch {
+		case errors.Is(err, services.ErrNotEligible), errors.Is(err, services.ErrEligibilityWindow):
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrDurationExceedsEligibility):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrStepUpRequired):
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":            "step_up_required",
+				"step_up_required": true,
+				"action":           services.JITStepUpAction,
+				"message":          err.Error(),
+			})
+		default:
+			h.logger.Error("Failed to request JIT access",
+				zap.String("user_id", currentUser.ID.String()),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
 

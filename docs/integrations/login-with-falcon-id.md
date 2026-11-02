@@ -15,7 +15,7 @@ bootstrap and token refresh automatically.
 ## 1. Discovery URL
 
 ```
-https://id.hexxlock.com/.well-known/openid-configuration
+https://id.example.com/.well-known/openid-configuration
 ```
 
 Bootstrap your RP SDK (panva/openid-client, oidc-client-ts, AppAuth, or
@@ -93,7 +93,7 @@ work without any additional scope.
 ## 4. PKCE example (confidential client, authorization_code grant)
 
 ```
-GET https://id.hexxlock.com/oauth/authorize
+GET https://id.example.com/oauth/authorize
     ?response_type=code
     &client_id=YOUR_CLIENT_ID
     &redirect_uri=https%3A%2F%2Fyourapp.example.com%2Fcallback
@@ -137,7 +137,7 @@ Response:
 
 | Client type                     | Recommended `access_token_lifetime` |
 | ------------------------------- | ----------------------------------- |
-| First-party (HexxLock products) | 3600 (1 hour)                       |
+| First-party (platform products) | 3600 (1 hour)                       |
 | Confidential third-party        | 300–900 (5–15 minutes)              |
 | Public third-party (browser)    | 300 (5 minutes)                     |
 
@@ -174,7 +174,7 @@ Successful response (active token):
   "sub":        "user-uuid",
   "exp":        1714329600,
   "iat":        1714326000,
-  "iss":        "https://id.hexxlock.com",
+  "iss":        "https://id.example.com",
   "token_type": "Bearer"
 }
 ```
@@ -260,15 +260,15 @@ minutes recommended).
 Verify discovery (anonymous, no auth required):
 
 ```bash
-curl -sS https://id.hexxlock.com/.well-known/openid-configuration | jq .
-curl -sS https://id.hexxlock.com/.well-known/jwks.json | jq .
+curl -sS https://id.example.com/.well-known/openid-configuration | jq .
+curl -sS https://id.example.com/.well-known/jwks.json | jq .
 ```
 
 Verify introspection (replace `CLIENT_ID` / `CLIENT_SECRET` / `TOKEN`):
 
 ```bash
 curl -sS -u "${CLIENT_ID}:${CLIENT_SECRET}" \
-  -X POST https://id.hexxlock.com/oauth/introspect \
+  -X POST https://id.example.com/oauth/introspect \
   -d "token=${TOKEN}" -d 'token_type_hint=access_token' | jq .
 ```
 
@@ -276,7 +276,7 @@ Verify revocation:
 
 ```bash
 curl -sS -u "${CLIENT_ID}:${CLIENT_SECRET}" \
-  -X POST -i https://id.hexxlock.com/oauth/revoke \
+  -X POST -i https://id.example.com/oauth/revoke \
   -d "token=${TOKEN}" -d 'token_type_hint=refresh_token'
 # Expect: HTTP/2 200, empty body
 ```

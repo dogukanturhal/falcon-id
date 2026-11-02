@@ -36,7 +36,7 @@ spec:
               APISIX_URL="{{ .Values.apisix.adminUrl }}"
               SVC="{{ include "falcon-id.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
               {{- if .Values.apisix.routes.enabled }}
-              # Consolidated id.hexxlock.com routes
+              # Consolidated id.example.com routes
               curl -s -X PUT "$APISIX_URL/apisix/admin/routes/{{ include "falcon-id.fullname" . }}-discovery" \
                 -H "X-API-KEY: $ADMIN_KEY" -H "Content-Type: application/json" \
                 -d "{\"uri\":\"/.well-known/*\",\"host\":\"{{ .Values.apisix.routes.host }}\",\"priority\":10,\"upstream\":{\"type\":\"roundrobin\",\"nodes\":{\"$SVC\":1}}}"
@@ -65,5 +65,5 @@ spec:
           secret:
             secretName: {{ .Values.apisix.adminKeySecret }}
       nodeSelector:
-        hexxlock.com/tier: ops
+        example.com/tier: ops
 {{- end }}

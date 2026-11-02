@@ -8,10 +8,12 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/dogukanturhal/falcon-id/internal/metrics"
 	"github.com/dogukanturhal/falcon-id/internal/models"
@@ -309,6 +311,28 @@ func (s *AuthService) SkipMFAEnrollment(
 // was deleted on first read, which made a wrong-then-correct retry
 // fail with "MFA session expired or invalid" on attempt #2.
 func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompleteRequest, ipAddress, userAgent string) (*models.LoginResponse, error) {
+	// Finish the bounded issuance even when the browser disconnects, otherwise
+	// TOTP is consumed but no replayable result ever gets published.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	if resp, err := s.replayMFACompletion(ctx, req, ipAddress, userAgent); resp != nil || err != nil {
+		return resp, err
+	}
+	// Serialize completion per challenge across replicas. A concurrent retry
+	// gets a retryable error, not a second session or a TOTP replay failure.
+	lockKey := "mfa:session:" + req.SessionID + ":completing"
+	lockOwner := uuid.NewString()
+	locked, err := s.sessionCache.Client().Redis().SetNX(ctx, lockKey, lockOwner, time.Minute).Result()
+	if err != nil {
+		return nil, fmt.Errorf("lock MFA completion: %w", err)
+	}
+	if !locked {
+		return nil, &MFAFlowError{Code: "mfa_rate_limited"}
+	}
+	defer s.sessionCache.Client().Redis().Eval(context.WithoutCancel(ctx), `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`, []string{lockKey}, lockOwner)
+	if resp, err := s.replayMFACompletion(ctx, req, ipAddress, userAgent); resp != nil || err != nil {
+		return resp, err
+	}
 	// 1. Retrieve MFA session (read-only — do not consume yet).
 	mfaSession, err := s.retrieveMFASession(ctx, req.SessionID)
 	if err != nil {
@@ -329,7 +353,7 @@ func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompl
 		logger.Warn("MFA attempts exhausted; consuming session",
 			zap.String("session_id", req.SessionID), zap.Int64("attempts", attempts))
 		_ = s.consumeMFASession(ctx, req.SessionID)
-		return nil, fmt.Errorf("MFA session exhausted: too many failed attempts, please sign in again")
+		return nil, &MFAFlowError{Code: "mfa_rate_limited"}
 	}
 
 	// 2. Parse user and tenant IDs
@@ -343,6 +367,9 @@ func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompl
 	}
 
 	// 3. Look up the user
+	if s.userRepo == nil {
+		return nil, fmt.Errorf("user lookup unavailable")
+	}
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil || user == nil {
 		return nil, fmt.Errorf("user not found")
@@ -350,16 +377,30 @@ func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompl
 
 	// 4. Verify the MFA code. On failure: leave the session intact so
 	// the user can retry (up to mfaMaxAttempts total — see step 1b).
-	if err := s.handleMFAChallenge(ctx, tenantID, user, &models.LoginRequest{
-		Username: user.Username,
-		MFACode:  req.MFACode,
-	}, ipAddress, userAgent); err != nil {
-		return nil, err
+	valid := false
+	if s.mfaService == nil {
+		return nil, fmt.Errorf("MFA service unavailable")
+	}
+	valid, err = s.mfaService.VerifyMFACodeForMethod(ctx, user.ID, req.MFACode, mfaSession.MFAMethod)
+	if err != nil {
+		return nil, fmt.Errorf("verify MFA code: %w", err)
+	}
+	if !valid {
+		remaining := mfaMaxAttempts - int(attempts)
+		return nil, &MFAFlowError{Code: "mfa_code_invalid", RemainingAttempts: remaining}
+	}
+	if mfaSession.MFAMethod == authMethodTOTP {
+		fresh, err := s.claimLoginTOTP(ctx, user.ID, req.MFACode)
+		if err != nil {
+			return nil, fmt.Errorf("track TOTP replay: %w", err)
+		}
+		if !fresh {
+			return nil, &MFAFlowError{Code: "mfa_code_invalid", RemainingAttempts: mfaMaxAttempts - int(attempts)}
+		}
 	}
 
 	// 4b. Successful verification — consume the session so the (now
 	// proven) credentials cannot be replayed.
-	_ = s.consumeMFASession(ctx, req.SessionID)
 
 	// 5. Get user roles and permissions (reuse Login helper)
 	roleNames, roles, permNames, permissions, err := s.getUserRolesAndPermissions(ctx, user.ID)
@@ -387,7 +428,7 @@ func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompl
 	// factor — inferred from the user's MFAPreferredMethod. Email-based MFA
 	// stays under the generic `mfa` umbrella per the spec.
 	mfaFactor := "mfa"
-	if user.MFAPreferredMethod != nil && *user.MFAPreferredMethod == authMethodTOTP {
+	if mfaSession.MFAMethod == authMethodTOTP || (mfaSession.MFAMethod == "" && user.MFAPreferredMethod != nil && *user.MFAPreferredMethod == authMethodTOTP) {
 		mfaFactor = "otp"
 	}
 	// req.RememberMe carries the checkbox state from the original
@@ -432,6 +473,9 @@ func (s *AuthService) CompleteMFALogin(ctx context.Context, req *models.MFACompl
 	// (cookie + DB row stay lock-step — see comment in
 	// sessionTTLForLogin).
 	resp.IsRememberMeSession = req.RememberMe
+	if err := s.saveMFACompletion(context.WithoutCancel(ctx), req, resp, ipAddress, userAgent); err != nil {
+		return nil, fmt.Errorf("save MFA completion: %w", err)
+	}
 	return resp, nil
 }
 
@@ -466,7 +510,10 @@ func (s *AuthService) retrieveMFASession(ctx context.Context, sessionID string) 
 	sessionJSON, err := s.sessionCache.Client().Get(ctx, redisKey)
 	if err != nil {
 		logger.Warn("MFA session not found or expired", zap.String("session_id", sessionID), zap.Error(err))
-		return nil, fmt.Errorf("MFA session expired or invalid")
+		if errors.Is(err, redis.Nil) {
+			return nil, &MFAFlowError{Code: "mfa_session_expired"}
+		}
+		return nil, fmt.Errorf("read MFA session: %w", err)
 	}
 
 	var mfaSession models.MFASessionData
@@ -536,16 +583,9 @@ func (s *AuthService) SwitchMFALoginMethod(ctx context.Context, sessionID, metho
 		return nil, fmt.Errorf("invalid MFA session ID")
 	}
 
-	// Retrieve MFA session from Redis (do NOT delete - user may need multiple switches)
-	redisKey := "mfa:session:" + sessionID
-	sessionJSON, err := s.sessionCache.Client().Get(ctx, redisKey)
+	mfaSession, err := s.retrieveMFASession(ctx, sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("MFA session expired or invalid")
-	}
-
-	var mfaSession models.MFASessionData
-	if err := json.Unmarshal([]byte(sessionJSON), &mfaSession); err != nil {
-		return nil, fmt.Errorf("invalid MFA session data")
+		return nil, err
 	}
 
 	userID, err := uuid.Parse(mfaSession.UserID)
@@ -553,7 +593,14 @@ func (s *AuthService) SwitchMFALoginMethod(ctx context.Context, sessionID, metho
 		return nil, fmt.Errorf("invalid MFA session")
 	}
 
-	user, err := s.userRepo.GetByID(ctx, userID)
+	lookup := s.mfaUserLookup
+	if lookup == nil {
+		if s.userRepo == nil {
+			return nil, fmt.Errorf("user lookup unavailable")
+		}
+		lookup = s.userRepo
+	}
+	user, err := lookup.GetByID(ctx, userID)
 	if err != nil || user == nil {
 		return nil, fmt.Errorf("user not found")
 	}
@@ -562,7 +609,7 @@ func (s *AuthService) SwitchMFALoginMethod(ctx context.Context, sessionID, metho
 	// passkey check (matches createMFAChallenge path) so "switch to
 	// webauthn" is rejected for users without an enrolled credential.
 	hasPasskey := false
-	if has, err := s.userRepo.HasActiveWebAuthnCredential(ctx, user.ID); err == nil {
+	if has, err := lookup.HasActiveWebAuthnCredential(ctx, user.ID); err == nil {
 		hasPasskey = has
 	}
 	availableMethods := s.getAvailableMFAMethods(user, hasPasskey)
@@ -578,30 +625,58 @@ func (s *AuthService) SwitchMFALoginMethod(ctx context.Context, sessionID, metho
 		return nil, fmt.Errorf("requested MFA method is not available")
 	}
 
+	// A separate switch/resend cooldown does not consume code attempts. It
+	// also prevents using method switches to spam the user's mailbox.
+	if method == authMethodEmail {
+		allowed, err := s.sessionCache.Client().Redis().SetNX(ctx, "mfa:session:"+sessionID+":resend", "1", 60*time.Second).Result()
+		if err != nil {
+			return nil, fmt.Errorf("MFA resend unavailable: %w", err)
+		}
+		if !allowed {
+			return nil, &MFAFlowError{Code: "mfa_rate_limited"}
+		}
+	}
 	// If switching to email, send the code
-	if method == authMethodEmail && s.mfaService != nil {
+	if method == authMethodEmail {
+		if s.mfaService == nil {
+			return nil, fmt.Errorf("email verification not configured")
+		}
 		if err := s.mfaService.SendEmailMFACode(ctx, user.ID); err != nil {
 			logger.Error("Failed to send MFA email code for method switch", zap.Error(err))
+			return nil, fmt.Errorf("send MFA code: %w", err)
 		}
 	}
 
-	// Generate new session ID for the switched method
-	newSessionID := uuid.New().String()
-	newRedisKey := "mfa:session:" + newSessionID
-
-	// Store updated session with new ID
-	mfaSession.CreatedAt = time.Now().Unix()
-	newSessionJSON, err := json.Marshal(&mfaSession)
-	if err == nil {
-		_ = s.sessionCache.Client().Set(ctx, newRedisKey, string(newSessionJSON), 5*time.Minute)
+	// Keep the original challenge, expiry and attempt budget. Rotating IDs on
+	// switch used to reset rate limits and made a lost response unrecoverable.
+	ttl, err := s.sessionCache.Client().Redis().TTL(ctx, "mfa:session:"+sessionID).Result()
+	if err != nil {
+		return nil, err
 	}
-	// Delete old session
-	_ = s.sessionCache.Client().Del(ctx, redisKey)
+	if ttl <= 0 {
+		return nil, &MFAFlowError{Code: "mfa_session_expired"}
+	}
+	mfaSession.MFAMethod = method
+	payload, err := json.Marshal(mfaSession)
+	if err != nil {
+		return nil, err
+	}
+	// XX + KEEPTTL is atomic: a concurrent completion/expiry cannot be
+	// resurrected by switching, and neither attempts nor expiry are reset.
+	if err := s.sessionCache.Client().Redis().SetArgs(ctx, "mfa:session:"+sessionID, string(payload), redis.SetArgs{Mode: "XX", KeepTTL: true}).Err(); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, &MFAFlowError{Code: "mfa_session_expired"}
+		}
+		return nil, fmt.Errorf("switch MFA method: %w", err)
+	}
 
 	return &models.LoginResponse{
 		RequiresMFA:         true,
 		MFAMethod:           method,
 		AvailableMFAMethods: availableMethods,
-		SessionID:           newSessionID,
+		SessionID:           sessionID,
+		MaskedEmail:         maskMFAEmail(user.Email),
+		MFAExpiresIn:        int64(ttl.Seconds()),
+		ResendAfterSeconds:  60,
 	}, nil
 }

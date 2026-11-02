@@ -4,7 +4,7 @@ package services
 
 // PlatformAPIAudienceURI is the canonical RFC 8707 / OIDC resource
 // indicator for every HexxLock platform API surface served behind the
-// `api.hexxlock.com` virtual host on APISIX. New services validate this
+// `api.example.com` virtual host on APISIX. New services validate this
 // as their `Jwt__Audience` (Auth0 / Microsoft Entra / Okta convention).
 //
 // Every OAuth access token minted by Falcon-ID carries this value as one
@@ -28,7 +28,7 @@ package services
 // updated and verified) we drop `LegacyServiceMeshAudience` from the
 // emitted `aud` array. Until then it rides along so unmigrated
 // receivers continue to pass token validation.
-const PlatformAPIAudienceURI = "https://api.hexxlock.com"
+const PlatformAPIAudienceURI = "https://api.example.com"
 
 // LegacyServiceMeshAudience is the historical hard-coded audience
 // value that every .NET service in `example-business` /

@@ -53,7 +53,7 @@ func CountryFromContext(ctx context.Context) string {
 }
 
 // Geo is the request-scoped geo snapshot stamped by the
-// `id-hexxlock-geo-stamp` Cloudflare Worker (infrastructure-iac MR-114).
+// `geo-stamp` Cloudflare Worker (the edge infrastructure repository).
 // Lives in this leaf package so the middleware (which reads it from
 // request headers) and the services layer (which persists it on
 // iam_sessions) can both reach it without an import cycle.

@@ -60,6 +60,41 @@ type SCIMService struct {
 	userRepo scimServiceUserRepo
 	roleRepo scimServiceRoleRepo
 	cfg      *config.Config
+
+	accessTerminator accessTerminator
+}
+
+// SetAccessTerminator wires the single access-termination path run when SCIM
+// deactivates or deletes a user.
+func (s *SCIMService) SetAccessTerminator(t accessTerminator) {
+	s.accessTerminator = t
+}
+
+// terminateIfDeactivated ends all access when a SCIM write flipped the user
+// from active to inactive. userRepo.Update alone leaves live sessions, OAuth
+// tokens and SSO cookies working.
+func (s *SCIMService) terminateIfDeactivated(ctx context.Context, user *models.User, wasActive bool, reason string) {
+	if !wasActive && user.IsActive && s.accessTerminator != nil {
+		s.accessTerminator.ClearUserBlock(context.Background(), user.ID)
+		return
+	}
+	if !wasActive || user.IsActive {
+		return
+	}
+	s.terminateAccess(user, reason)
+}
+
+func (s *SCIMService) terminateAccess(user *models.User, reason string) {
+	if s.accessTerminator == nil {
+		return
+	}
+	// Detach: the SCIM request ctx may end before the fan-out completes.
+	bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.accessTerminator.TerminateUserAccess(bgCtx, user.ID, user.TenantID, reason, nil); err != nil {
+		logger.Error("SCIM: access termination incomplete",
+			zap.String("user_id", user.ID.String()), zap.Error(err))
+	}
 }
 
 // NewSCIMService creates a new SCIMService
@@ -415,6 +450,7 @@ func (s *SCIMService) UpdateUser(ctx context.Context, userID uuid.UUID, scimUser
 	if err != nil {
 		return nil, fmt.Errorf("UpdateUser: %w", err)
 	}
+	wasActive := user.IsActive
 
 	// Update fields
 	if scimUser.UserName != "" {
@@ -473,6 +509,7 @@ func (s *SCIMService) UpdateUser(ctx context.Context, userID uuid.UUID, scimUser
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
+	s.terminateIfDeactivated(ctx, user, wasActive, "scim_deactivate")
 
 	return user.ToSCIMUser(s.getBaseURL()), nil
 }
@@ -483,6 +520,7 @@ func (s *SCIMService) PatchUser(ctx context.Context, userID uuid.UUID, patchOp *
 	if err != nil {
 		return nil, fmt.Errorf("PatchUser: %w", err)
 	}
+	wasActive := user.IsActive
 
 	for _, op := range patchOp.Operations {
 		switch strings.ToLower(op.Op) {
@@ -500,13 +538,21 @@ func (s *SCIMService) PatchUser(ctx context.Context, userID uuid.UUID, patchOp *
 	if err := s.userRepo.Update(ctx, user); err != nil {
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
+	s.terminateIfDeactivated(ctx, user, wasActive, "scim_deactivate")
 
 	return user.ToSCIMUser(s.getBaseURL()), nil
 }
 
 // DeleteUser deletes a user
 func (s *SCIMService) DeleteUser(ctx context.Context, userID uuid.UUID) error {
-	return s.userRepo.Delete(ctx, userID)
+	user, _ := s.userRepo.GetByID(ctx, userID) // best-effort: only needed for the tenant id
+	if err := s.userRepo.Delete(ctx, userID); err != nil {
+		return err
+	}
+	if user != nil {
+		s.terminateAccess(user, "scim_delete")
+	}
+	return nil
 }
 
 // ==================== SCIM Group Operations ====================

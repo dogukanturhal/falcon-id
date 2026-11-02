@@ -254,9 +254,9 @@ func newServiceForTests(t *testing.T, repo webAuthnRepo, store webAuthnSessionSt
 	pub := &fakeCAEPublisher{}
 	cae := NewCAEService(pub, zap.NewNop())
 	wa, err := webauthn.New(&webauthn.Config{
-		RPID:          "hexxlock.com",
+		RPID:          "example.com",
 		RPDisplayName: "HexxLock",
-		RPOrigins:     []string{"https://accounts.hexxlock.com"},
+		RPOrigins:     []string{"https://accounts.example.com"},
 		AuthenticatorSelection: protocol.AuthenticatorSelection{
 			UserVerification:   protocol.VerificationRequired,
 			ResidentKey:        protocol.ResidentKeyRequirementRequired,
@@ -325,7 +325,7 @@ func TestWebAuthnSessionCache_RoundTrip(t *testing.T) {
 
 	want := &webauthn.SessionData{
 		Challenge:        "abc123",
-		RelyingPartyID:   "hexxlock.com",
+		RelyingPartyID:   "example.com",
 		UserID:           []byte{0x01, 0x02},
 		UserVerification: protocol.VerificationRequired,
 	}

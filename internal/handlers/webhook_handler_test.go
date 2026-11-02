@@ -231,7 +231,7 @@ func TestWebhookHandler_CreateWebhook(t *testing.T) {
 		router := gin.New()
 		router.POST("/webhooks", h.CreateWebhook)
 
-		body := `{"name":"Test","url":"https://example.com","secret":"secret12345678","events":["user.created"]}` // gitleaks:allow — test fixture, not a real credential
+		body := `{"name":"Test","url":"https://example.com","secret":"secret12345678","events":["user.created"]}`
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/webhooks", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -278,7 +278,7 @@ func TestWebhookHandler_CreateWebhook(t *testing.T) {
 		router.Use(injectTenantContext(tenantID))
 		router.POST("/webhooks", h.CreateWebhook)
 
-		body := `{"name":"Test","url":"https://example.com","secret":"validsecret12345","events":["invalid.event.type.here"]}` // gitleaks:allow — test fixture, not a real credential
+		body := `{"name":"Test","url":"https://example.com","secret":"validsecret12345","events":["invalid.event.type.here"]}`
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/webhooks", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()

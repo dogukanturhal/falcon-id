@@ -564,9 +564,12 @@ func TestTenantHandler_GetTenantUserCount_Success(t *testing.T) {
 	defer mockPool.Close()
 
 	tenantID := uuid.New()
-	mockPool.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users\s+WHERE tenant_id = \$1 AND is_active = true AND deletion_scheduled_at IS NULL`).
+	mockPool.ExpectBegin()
+	expectTenantScope(mockPool, tenantID)
+	mockPool.ExpectQuery(`SELECT COUNT\(\*\) FROM iam_users u\s+WHERE u.tenant_id = \$1 AND u.is_active = true AND u.deletion_scheduled_at IS NULL`).
 		WithArgs(tenantID).
 		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(3))
+	mockPool.ExpectCommit()
 
 	h := &TenantHandler{
 		userRepo: repositories.NewUserRepository(mockPool),
@@ -605,4 +608,59 @@ func TestTenantHandler_GetTenantUserCount_InvalidTenantID(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func newTenantMemberRouter(t *testing.T) (*gin.Engine, pgxmock.PgxPoolIface) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	mockPool, err := pgxmock.NewPool(pgxmock.QueryMatcherOption(pgxmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	t.Cleanup(mockPool.Close)
+	h := &TenantHandler{userRepo: repositories.NewUserRepository(mockPool), logger: zap.NewNop()}
+	router := gin.New()
+	router.GET("/internal/v1/tenants/:id/members/:userId", h.GetTenantMember)
+	return router, mockPool
+}
+
+func TestTenantHandler_GetTenantMember(t *testing.T) {
+	const q = `SELECT \(is_active AND deletion_scheduled_at IS NULL\) FROM iam_users WHERE tenant_id = \$1 AND id = \$2`
+	tenantID, userID := uuid.New(), uuid.New()
+	path := "/internal/v1/tenants/" + tenantID.String() + "/members/" + userID.String()
+
+	for _, active := range []bool{true, false} {
+		router, pool := newTenantMemberRouter(t)
+		pool.ExpectQuery(q).WithArgs(tenantID, userID).
+			WillReturnRows(pgxmock.NewRows([]string{"active"}).AddRow(active))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.JSONEq(t, `{"active":`+map[bool]string{true: "true", false: "false"}[active]+`}`, w.Body.String())
+		require.NoError(t, pool.ExpectationsWereMet())
+	}
+
+	// Not a member of the tenant -> 404.
+	router, pool := newTenantMemberRouter(t)
+	pool.ExpectQuery(q).WithArgs(tenantID, userID).WillReturnRows(pgxmock.NewRows([]string{"active"}))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+
+	// DB error -> 500 (caller fails closed).
+	router, pool = newTenantMemberRouter(t)
+	pool.ExpectQuery(q).WithArgs(tenantID, userID).WillReturnError(assert.AnError)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestTenantHandler_GetTenantMember_InvalidIDs(t *testing.T) {
+	router, _ := newTenantMemberRouter(t)
+	for _, p := range []string{
+		"/internal/v1/tenants/not-a-uuid/members/" + uuid.NewString(),
+		"/internal/v1/tenants/" + uuid.NewString() + "/members/not-a-uuid",
+	} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, p, nil))
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	}
 }

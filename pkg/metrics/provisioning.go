@@ -17,7 +17,7 @@ import (
 var (
 	// ProvisioningStepsTotal counts provisioning step transitions.
 	// Labels: step (creating|migrating|seeding|configuring_auth|registering_service),
-	//         product (examplesuite|hotel-pms|...).
+	//         product (examplesuite|example-pms|...).
 	ProvisioningStepsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "falcon_provisioning_steps_total",

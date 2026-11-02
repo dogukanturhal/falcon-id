@@ -36,7 +36,11 @@ func (s *EmailService) SetOutbox(o emailOutboxInserter) {
 // time, so a tenant that corrects its relay settings while messages are
 // queued gets the corrected settings on the next attempt.
 func (s *EmailService) SendRendered(ctx context.Context, tenantID uuid.UUID, template, to, subject, htmlBody string) error {
-	return s.sendEmail(ctx, tenantID, template, to, subject, htmlBody)
+	// Queued templates are never the AcmeApp-branded invitation templates
+	// (TeamInvitationEmailTemplate is credential-bearing and never queued —
+	// see EnqueueOrSend/MayQueue below), so the sender override never
+	// applies on this path.
+	return s.sendEmail(ctx, tenantID, template, to, subject, htmlBody, "")
 }
 
 // EnqueueOrSend writes a rendered message to the outbox when the
@@ -72,7 +76,9 @@ func (s *EmailService) EnqueueOrSend(
 	template, to, subject, htmlBody string,
 ) error {
 	if s.outbox == nil || tx == nil || !MayQueue(template) {
-		return s.sendEmail(ctx, tenantID, template, to, subject, htmlBody)
+		// Same reasoning as SendRendered: nothing routed through the
+		// generic enqueue/send path is a AcmeApp invitation template.
+		return s.sendEmail(ctx, tenantID, template, to, subject, htmlBody, "")
 	}
 	row := &repositories.EmailOutboxRow{
 		TenantID:  tenantID,

@@ -166,9 +166,7 @@ func (h *SettingsHandler) applySettingsUpdates(c *gin.Context, current *models.I
 	if req.HRLDAPGroupFilter != nil {
 		current.HRLDAPGroupFilter = *req.HRLDAPGroupFilter
 	}
-	if req.ABACEnabled != nil {
-		current.ABACEnabled = *req.ABACEnabled
-	}
+	// req.ABACEnabled is deprecated and ignored: tenants cannot toggle ABAC.
 	if req.ABACFallbackRBAC != nil {
 		current.ABACFallbackRBAC = *req.ABACFallbackRBAC
 	}

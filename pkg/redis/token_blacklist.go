@@ -120,6 +120,13 @@ func (t *TokenBlacklist) BlacklistUserTokens(ctx context.Context, userID uuid.UU
 	return t.client.Redis().Set(ctx, key, reason, ttl).Err()
 }
 
+// ClearUser removes the user-level blacklist marker (called when a disabled or
+// deleted account is re-enabled so the user can log in again right away).
+func (t *TokenBlacklist) ClearUser(ctx context.Context, userID uuid.UUID) error {
+	key := fmt.Sprintf("%s:blacklist:user_all:%s", t.prefix, userID.String())
+	return t.client.Redis().Del(ctx, key).Err()
+}
+
 // IsUserBlacklisted checks if all tokens for a user are blacklisted
 // SECURITY: Returns UnavailableError if Redis is down to enforce fail-closed behavior
 func (t *TokenBlacklist) IsUserBlacklisted(ctx context.Context, userID uuid.UUID) (bool, error) {

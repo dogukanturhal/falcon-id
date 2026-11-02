@@ -44,6 +44,14 @@ type mockAuthzSvc struct {
 	authorizeFn          func(ctx context.Context, req *models.AuthorizeRequest) (*models.AuthorizeResponse, error)
 	authorizeBatchFn     func(ctx context.Context, req *models.BatchAuthorizeRequest) (*models.BatchAuthorizeResponse, error)
 	getEffectivePermsFn  func(ctx context.Context, userID, tenantID uuid.UUID) (*models.EffectivePermissionsResponse, error)
+	simulateFn           func(ctx context.Context, actorID, userID, tenantID uuid.UUID, permission string) (*models.SimulateResponse, error)
+}
+
+func (m *mockAuthzSvc) Simulate(ctx context.Context, actorID, userID, tenantID uuid.UUID, permission string) (*models.SimulateResponse, error) {
+	if m.simulateFn != nil {
+		return m.simulateFn(ctx, actorID, userID, tenantID, permission)
+	}
+	return &models.SimulateResponse{UserID: userID, Permission: permission}, nil
 }
 
 func (m *mockAuthzSvc) Authorize(ctx context.Context, req *models.AuthorizeRequest) (*models.AuthorizeResponse, error) {

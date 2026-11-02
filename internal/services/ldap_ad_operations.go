@@ -595,7 +595,7 @@ func encodeADPassword(password string) string {
 }
 
 // extractDomainFromBaseDN extracts a domain name from a BaseDN.
-// e.g., "DC=hexxlock,DC=corp" -> "hexxlock.corp"
+// e.g., "DC=example,DC=corp" -> "example.corp"
 func extractDomainFromBaseDN(baseDN string) string {
 	parts := strings.Split(baseDN, ",")
 	var domainParts []string

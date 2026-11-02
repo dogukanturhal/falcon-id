@@ -1,5 +1,5 @@
 -- Migration: team invitations Phase 2 prereq
--- Creates iam_team_invitations for the Mearax Team settings page.
+-- Creates iam_team_invitations for the AcmeWeb Team settings page.
 --
 -- This table is distinct from the existing iam_user_invitations, which ties an
 -- invitation to a pre-existing user row (user_id FK). This new table supports

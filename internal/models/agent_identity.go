@@ -17,7 +17,7 @@ const (
 	AgentTypeAutonomous AgentType = "autonomous"
 
 	// AgentTypeInteractive is a user-facing assistant that acts on explicit
-	// human triggers — chat agents, copilots, inline assistants.
+	// human triggers — chat agents and inline assistants.
 	AgentTypeInteractive AgentType = "interactive"
 
 	// AgentTypeMCPServer is a Model Context Protocol server that exposes tools

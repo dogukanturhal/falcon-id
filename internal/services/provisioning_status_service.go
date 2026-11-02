@@ -10,6 +10,8 @@ import (
 	"github.com/dogukanturhal/falcon-id/internal/models"
 )
 
+const provisioningStateActive = "active"
+
 // provisioningStatusInstanceRepo abstracts instance queries for the status service.
 type provisioningStatusInstanceRepo interface {
 	ListByTenantAll(ctx context.Context, tenantID uuid.UUID) ([]models.ProductInstance, error)

@@ -1,0 +1,41 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security problems use the private report link in SECURITY.md instead of this form.
+  - type: input
+    id: version
+    attributes:
+      label: Falcon ID version
+      description: Image tag or commit hash
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "Go 1.26, PostgreSQL 16, Redis 7, SpiceDB 1.44"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Requests, client settings and configuration. Remove secrets, tokens and hostnames you do not want public.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant service log lines. Remove tokens and personal data.
+      render: text

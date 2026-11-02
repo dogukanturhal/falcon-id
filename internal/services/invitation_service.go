@@ -5,6 +5,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -523,11 +524,12 @@ func (s *InvitationService) ExpireOldInvitations(ctx context.Context) (int64, er
 }
 
 // Helper function to send invitation email
-func (s *InvitationService) sendInvitationEmail(_ context.Context, invitation *models.UserInvitation, rawToken string, user *models.User) error {
-	baseURL := s.config.FrontendURL
-	if baseURL == "" {
-		baseURL = defaultFrontendURL
-	}
+func (s *InvitationService) sendInvitationEmail(ctx context.Context, invitation *models.UserInvitation, rawToken string, user *models.User) error {
+	// Resolved per tenant (falls back to the static default) via the same
+	// ConfigProvider path SendTeamInvitation uses, so this link and the
+	// sender alignment in EmailService.sendEmail can never diverge from a
+	// tenant's configured frontend_url. See EmailService.ResolveFrontendURL.
+	baseURL := strings.TrimRight(s.emailService.ResolveFrontendURL(ctx, invitation.TenantID), "/")
 	setupURL := fmt.Sprintf("%s/setup-account?token=%s", baseURL, rawToken)
 
 	// Get username for email

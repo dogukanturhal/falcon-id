@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS iam_devices (
 
     -- Canonical UUIDv4 bound to the attestation key (TPM AK, Apple
     -- SE key, Android StrongBox key). Used as the device-cert SAN:
-    -- spiffe://hexxlock.com/device/<device_uuid> (ADR 0040 D-005).
+    -- spiffe://example.com/device/<device_uuid> (ADR 0040 D-005).
     -- Unique cluster-wide; collision = bug (caller-side).
     device_uuid             uuid        NOT NULL UNIQUE,
 

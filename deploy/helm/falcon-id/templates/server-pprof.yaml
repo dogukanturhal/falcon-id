@@ -21,7 +21,7 @@ metadata:
   name: {{ include "falcon-id.fullname" . }}-pprof
   labels:
     {{- include "falcon-id.labels" . | nindent 4 }}
-    falcon-id.hexxlock.com/surface: pprof
+    falcon-id.example.com/surface: pprof
 spec:
   port: pprof
   proxyProtocol: HTTP/1

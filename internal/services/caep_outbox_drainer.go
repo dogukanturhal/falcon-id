@@ -102,7 +102,7 @@ type CAEPOutboxDrainerConfig struct {
 	BatchSize int
 	// HTTPTimeout is the per-row delivery timeout. Default 5s.
 	HTTPTimeout time.Duration
-	// Issuer is the CAEP SET 'iss' claim (typically https://id.hexxlock.com).
+	// Issuer is the CAEP SET 'iss' claim (typically https://id.example.com).
 	Issuer string
 }
 

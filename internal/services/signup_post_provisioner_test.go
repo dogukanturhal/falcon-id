@@ -188,6 +188,7 @@ func TestPostSignupProvisioner_OnSignupComplete_GrantsProductEntitlement(t *test
 	provisioner := NewPostSignupProvisioner(nil, nil, nil)
 	productID := uuid.New()
 	provisioner.SetProductEntitlementProvisioner(entitlement, productID)
+	provisioner.SetTrialStarter(&mockTrialStarter{})
 
 	tenantID := uuid.New()
 	userID := uuid.New()
@@ -201,7 +202,7 @@ func TestPostSignupProvisioner_OnSignupComplete_GrantsProductEntitlement(t *test
 		assert.Equal(t, productID, *entitlement.event.ProductID)
 	}
 	if assert.NotNil(t, entitlement.event.PlanID) {
-		assert.Equal(t, "starter", *entitlement.event.PlanID)
+		assert.Equal(t, SignupTrialPackageCode, *entitlement.event.PlanID)
 	}
 }
 
@@ -215,6 +216,7 @@ func TestPostSignupProvisioner_OnSignupComplete_EntitlementFailure_NonFatal(t *t
 	entitlement := &mockProductEntitlementProvisioner{err: fmt.Errorf("provisioning enqueue failed")}
 	provisioner := NewPostSignupProvisioner(nil, nil, nil)
 	provisioner.SetProductEntitlementProvisioner(entitlement, uuid.New())
+	provisioner.SetTrialStarter(&mockTrialStarter{})
 
 	err := provisioner.OnSignupComplete(context.Background(), uuid.New(), uuid.New(), "business")
 
@@ -268,6 +270,7 @@ func TestPostSignupProvisioner_OnSignupComplete_EntitlementSyncTimeout(t *testin
 	provisioner := NewPostSignupProvisioner(nil, nil, nil)
 	provisioner.SetProductEntitlementProvisioner(entitlement, uuid.New())
 	provisioner.entitlementSyncTimeout = 20 * time.Millisecond
+	provisioner.SetTrialStarter(&mockTrialStarter{})
 
 	start := time.Now()
 	err := provisioner.OnSignupComplete(context.Background(), uuid.New(), uuid.New(), "business")

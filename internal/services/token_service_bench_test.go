@@ -189,7 +189,7 @@ func BenchmarkValidateAccessToken_Parallel(b *testing.B) {
 func BenchmarkValidateAccessToken_Invalid(b *testing.B) {
 	svc := newBenchTokenService()
 
-	invalidToken := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.invalid-signature" //nolint:gosec // test fixture value, not a real credential  // gitleaks:allow — test fixture, not a real credential
+	invalidToken := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.invalid-signature" //nolint:gosec // test fixture value, not a real credential
 
 	b.ResetTimer()
 	b.ReportAllocs()

@@ -22,7 +22,8 @@ type RotationScheduler struct {
 
 // NewRotationScheduler creates a new scheduler that checks for key rotation needs.
 // interval is how often to check; the actual rotation happens when the active key
-// is within 7 days of expiry.
+// is within 7 days of expiry. The new key is published as pending and activated after
+// the publish delay, so interval also bounds activation lateness.
 func NewRotationScheduler(km *KeyManager, interval time.Duration, logger *zap.Logger) *RotationScheduler {
 	return &RotationScheduler{
 		km:       km,
@@ -55,9 +56,20 @@ func (rs *RotationScheduler) Stop() {
 	rs.logger.Info("Key rotation scheduler stopped")
 }
 
+// tickTimeout bounds each maintain/reload tick so a stuck DB call cannot wedge the loop.
+const tickTimeout = 30 * time.Second
+
 func (rs *RotationScheduler) run(ctx context.Context) {
 	ticker := time.NewTicker(rs.interval)
 	defer ticker.Stop()
+
+	// Periodic reload keeps every replica's key set (and active key) converged.
+	var reloadC <-chan time.Time
+	if rs.km.store != nil {
+		reloadTicker := time.NewTicker(rs.km.opts.WithDefaults().ReloadInterval)
+		defer reloadTicker.Stop()
+		reloadC = reloadTicker.C
+	}
 
 	for {
 		select {
@@ -65,34 +77,24 @@ func (rs *RotationScheduler) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			rs.checkAndRotate(ctx)
+		case <-reloadC:
+			rctx, cancel := context.WithTimeout(ctx, tickTimeout)
+			err := rs.km.Reload(rctx)
+			cancel()
+			if err != nil {
+				rs.logger.Warn("Periodic signing key reload failed", zap.Error(err))
+			}
 		}
 	}
 }
 
+// checkAndRotate runs one lifecycle step. Every replica calls it; the advisory lock
+// inside KeyManager.Maintain elects a single rotator and the expiry/pending state is
+// re-checked under that lock, so concurrent replicas never rotate twice.
 func (rs *RotationScheduler) checkAndRotate(ctx context.Context) {
-	rs.km.mu.RLock()
-	activeKey := rs.km.activeKey
-	rs.km.mu.RUnlock()
-
-	if activeKey == nil {
-		rs.logger.Warn("No active signing key found during rotation check")
-		return
-	}
-
-	// Rotate if the active key expires within 7 days
-	rotationThreshold := 7 * 24 * time.Hour
-	if time.Until(activeKey.ExpiresAt) <= rotationThreshold {
-		rs.logger.Info("Active signing key approaching expiry, initiating rotation",
-			zap.String("kid", activeKey.KeyID),
-			zap.Time("expires_at", activeKey.ExpiresAt),
-			zap.Duration("time_until_expiry", time.Until(activeKey.ExpiresAt)),
-		)
-
-		if err := rs.km.Rotate(ctx); err != nil {
-			rs.logger.Error("Failed to rotate signing key", zap.Error(err))
-			return
-		}
-
-		rs.logger.Info("Key rotation completed successfully")
+	tctx, cancel := context.WithTimeout(ctx, tickTimeout)
+	defer cancel()
+	if err := rs.km.Maintain(tctx); err != nil {
+		rs.logger.Error("Signing key lifecycle step failed", zap.Error(err))
 	}
 }

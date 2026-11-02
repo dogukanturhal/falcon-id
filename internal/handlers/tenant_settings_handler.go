@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -16,10 +17,22 @@ import (
 )
 
 // TenantSettingsHandler exposes GET/PATCH /api/v1/tenants/me/settings
-// for the Phase 2 Mearax General settings page.
+// for the Phase 2 AcmeWeb General settings page.
 type TenantSettingsHandler struct {
 	tenantRepo *repositories.TenantRepository
 	logger     *zap.Logger
+	namePusher WorkspaceNamePusher
+}
+
+// WorkspaceNamePusher mirrors a saved workspace name into tenant-management
+// (best effort). Satisfied by *services.TenantWorkspaceNameService.
+type WorkspaceNamePusher interface {
+	PushName(ctx context.Context, tenantID uuid.UUID, name string)
+}
+
+// SetWorkspaceNamePusher wires the tenant-management mirror; nil disables it.
+func (h *TenantSettingsHandler) SetWorkspaceNamePusher(p WorkspaceNamePusher) {
+	h.namePusher = p
 }
 
 // NewTenantSettingsHandler creates a new TenantSettingsHandler.
@@ -181,6 +194,9 @@ func (h *TenantSettingsHandler) PatchSettings(c *gin.Context) {
 		h.logger.Error("PatchSettings: failed to persist settings", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update settings"})
 		return
+	}
+	if req.DisplayName != nil && h.namePusher != nil {
+		h.namePusher.PushName(c.Request.Context(), tenant.ID, tenant.DisplayName)
 	}
 
 	c.JSON(http.StatusOK, TenantSettingsResponse{

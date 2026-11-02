@@ -33,12 +33,12 @@ func withIssuer(t *testing.T, issuer string) {
 }
 
 func TestFrontchannelLogout_BuildIFrames_HappyPath_SessionRequired(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	lister := &stubFCLLister{
 		clients: []FrontchannelLogoutClient{
 			{
 				ClientID:              "svc-talon",
-				FrontchannelLogoutURI: "https://internal.example.com/auth/frontchannel-logout",
+				FrontchannelLogoutURI: "https://auth.internal.example.com/auth/frontchannel-logout",
 				SessionRequired:       true,
 			},
 		},
@@ -52,16 +52,16 @@ func TestFrontchannelLogout_BuildIFrames_HappyPath_SessionRequired(t *testing.T)
 	u, err := url.Parse(frames[0].Src)
 	require.NoError(t, err)
 	assert.Equal(t, "https", u.Scheme)
-	assert.Equal(t, "internal.example.com", u.Host)
+	assert.Equal(t, "auth.internal.example.com", u.Host)
 	assert.Equal(t, "/auth/frontchannel-logout", u.Path)
 	q := u.Query()
-	assert.Equal(t, "https://id.hexxlock.com", q.Get("iss"), "iss MUST match OAUTH_ISSUER")
+	assert.Equal(t, "https://id.example.com", q.Get("iss"), "iss MUST match OAUTH_ISSUER")
 	assert.Equal(t, "39c8c5d2-0c5e-4b35-9a3a-9c1c8f7e5a91", q.Get("sid"), "sid MUST be passed for session-required RPs")
 	assert.Len(t, q, 2, "FCL §3 — query carries iss + sid ONLY (no extra claims)")
 }
 
 func TestFrontchannelLogout_BuildIFrames_OmitsSidWhenSessionNotRequired(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	lister := &stubFCLLister{
 		clients: []FrontchannelLogoutClient{
 			{
@@ -76,13 +76,13 @@ func TestFrontchannelLogout_BuildIFrames_OmitsSidWhenSessionNotRequired(t *testi
 	frames := svc.BuildIFrames(context.Background(), uuid.New(), "any-sid-value")
 	require.Len(t, frames, 1)
 	q := mustParseQuery(t, frames[0].Src)
-	assert.Equal(t, "https://id.hexxlock.com", q.Get("iss"))
+	assert.Equal(t, "https://id.example.com", q.Get("iss"))
 	assert.Empty(t, q.Get("sid"), "RP did not opt in via session_required, no sid in URL")
 	assert.Len(t, q, 1)
 }
 
 func TestFrontchannelLogout_BuildIFrames_SkipsSessionRequiredWithoutSid(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	// One session-required RP and one non-session-required RP. With sid=""
 	// the session-required one MUST be dropped (cannot scope safely);
 	// the other one MUST still render.
@@ -100,14 +100,14 @@ func TestFrontchannelLogout_BuildIFrames_SkipsSessionRequiredWithoutSid(t *testi
 }
 
 func TestFrontchannelLogout_BuildIFrames_RebuildsQueryDroppingExtraParams(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	// A maliciously-stored URI with extra params MUST get the query stripped
 	// down to iss + sid only — defense in depth.
 	lister := &stubFCLLister{
 		clients: []FrontchannelLogoutClient{
 			{
 				ClientID:              "svc-talon",
-				FrontchannelLogoutURI: "https://internal.example.com/auth/frontchannel-logout?token=abc&trick=xyz",
+				FrontchannelLogoutURI: "https://auth.internal.example.com/auth/frontchannel-logout?token=abc&trick=xyz",
 				SessionRequired:       true,
 			},
 		},
@@ -118,14 +118,14 @@ func TestFrontchannelLogout_BuildIFrames_RebuildsQueryDroppingExtraParams(t *tes
 	require.Len(t, frames, 1)
 	q := mustParseQuery(t, frames[0].Src)
 	assert.Equal(t, "sid-val", q.Get("sid"))
-	assert.Equal(t, "https://id.hexxlock.com", q.Get("iss"))
+	assert.Equal(t, "https://id.example.com", q.Get("iss"))
 	assert.Empty(t, q.Get("token"), "extra DB-stored params MUST be stripped")
 	assert.Empty(t, q.Get("trick"))
 	assert.Len(t, q, 2, "rebuilt query MUST be exactly iss + sid")
 }
 
 func TestFrontchannelLogout_BuildIFrames_RejectsNonHTTPS(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	lister := &stubFCLLister{
 		clients: []FrontchannelLogoutClient{
 			{ClientID: "ok", FrontchannelLogoutURI: "https://ok.example.com/fcl", SessionRequired: true},
@@ -151,7 +151,7 @@ func TestFrontchannelLogout_BuildIFrames_NoIssuerReturnsNil(t *testing.T) {
 }
 
 func TestFrontchannelLogout_BuildIFrames_ListerErrorReturnsNil(t *testing.T) {
-	withIssuer(t, "https://id.hexxlock.com")
+	withIssuer(t, "https://id.example.com")
 	svc := NewFrontchannelLogoutService(&stubFCLLister{err: errors.New("db down")}, zap.NewNop())
 	assert.Nil(t, svc.BuildIFrames(context.Background(), uuid.New(), "sid-val"))
 }

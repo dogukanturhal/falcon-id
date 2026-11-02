@@ -90,6 +90,57 @@ func (r *JITAccessRepository) UpdateStatus(ctx context.Context, id uuid.UUID, st
 	return nil
 }
 
+// FinalizeGrant atomically persists revoke/expiry,
+// removes the time-boxed projection and records a durable
+// SpiceDB delete. The grant supplies the expected state, preventing a stale
+// expiry/revoke from overwriting a concurrent transition.
+func (r *JITAccessRepository) FinalizeGrant(ctx context.Context, grant *models.JITAccessGrant, status models.JITAccessStatus) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("FinalizeGrant: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT id FROM iam_users WHERE id=$1 FOR UPDATE", grant.UserID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(ctx, `UPDATE iam_jit_access_grants SET status=$1
+		WHERE id=$2 AND tenant_id=$3 AND status=$4`, status, grant.ID, grant.TenantID, grant.Status)
+	if err != nil {
+		return fmt.Errorf("FinalizeGrant: status: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("FinalizeGrant: grant state changed")
+	}
+	if grant.Status == models.JITAccessStatusActive {
+		if _, err := tx.Exec(ctx, `DELETE FROM iam_user_roles WHERE user_id=$1 AND role_id=$2 AND expires_at IS NOT NULL`, grant.UserID, grant.RoleID); err != nil {
+			return err
+		}
+		if err := EnqueueRoleRevokeTx(ctx, tx, grant.TenantID, grant.UserID, grant.RoleID); err != nil {
+			return fmt.Errorf("FinalizeGrant: outbox: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// QueueActivationRollback persists compensation even when an approved grant
+// was concurrently revoked before Activate could update its status. It must
+// not overwrite that terminal status. No UI projection was written yet; the
+// drainer rechecks standing/live grants before deleting the relationship.
+func (r *JITAccessRepository) QueueActivationRollback(ctx context.Context, grant *models.JITAccessGrant) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("QueueActivationRollback: begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, "SELECT id FROM iam_users WHERE id=$1 FOR UPDATE", grant.UserID); err != nil {
+		return err
+	}
+	if err := EnqueueRoleRevokeTx(ctx, tx, grant.TenantID, grant.UserID, grant.RoleID); err != nil {
+		return fmt.Errorf("QueueActivationRollback: outbox: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // Approve records the approver's identity, sets approved_at to the current
 // time, updates starts_at, and transitions the grant to the "approved" status.
 func (r *JITAccessRepository) Approve(ctx context.Context, id, approverID uuid.UUID, startsAt time.Time) error {
@@ -114,7 +165,7 @@ func (r *JITAccessRepository) Approve(ctx context.Context, id, approverID uuid.U
 // Activate transitions a grant from "approved" to "active".
 func (r *JITAccessRepository) Activate(ctx context.Context, id uuid.UUID) error {
 	result, err := r.pool.Exec(ctx,
-		`UPDATE iam_jit_access_grants SET status = 'active' WHERE id = $1`,
+		`UPDATE iam_jit_access_grants SET status = 'active' WHERE id = $1 AND status = 'approved'`,
 		id,
 	)
 	if err != nil {

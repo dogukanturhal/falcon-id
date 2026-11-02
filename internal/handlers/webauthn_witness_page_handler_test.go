@@ -16,6 +16,8 @@ package handlers
 // the template file or its parse-FS embedding lights up here.
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/services"
 )
 
 // ── ValidateWitnessCallbackURL ────────────────────────────────────────────────
@@ -346,5 +349,74 @@ func TestRenderWitnessEnrollPage_PlatformAdminFlagWithoutInternalTenantBlocked(t
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for IsPlatformAdmin=true but wrong tenant, got %d", w.Code)
+	}
+}
+
+// ── method selection (passkey | totp) ─────────────────────────────────────────
+
+type witnessInfoStub struct{ st services.WitnessTOTPStatus }
+
+func (s witnessInfoStub) Status(context.Context, *models.CurrentUser) services.WitnessTOTPStatus {
+	return s.st
+}
+
+func renderPageBootstrap(t *testing.T, st services.WitnessTOTPStatus, method string) witnessPageBootstrap {
+	t.Helper()
+	h := newWitnessPageHandler()
+	h.witnessInfo = witnessInfoStub{st: st}
+	r := witnessPageEngine(h, newPlatformAdminUser(t))
+	target := buildPageURL(witnessPageDeviceUUID, witnessPageEKHash,
+		"http%3A%2F%2F127.0.0.1%3A53217%2Fwitness-callback", "st4te")
+	if method != "" {
+		target += "&method=" + method
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	start := strings.Index(body, `id="bootstrap-data">`)
+	if start < 0 {
+		t.Fatal("bootstrap island not found")
+	}
+	raw := body[start+len(`id="bootstrap-data">`):]
+	raw = raw[:strings.Index(raw, "</script>")]
+	var bs witnessPageBootstrap
+	if err := json.Unmarshal([]byte(raw), &bs); err != nil {
+		t.Fatalf("bootstrap JSON: %v (%q)", err, raw)
+	}
+	return bs
+}
+
+func TestWitnessPageMethod(t *testing.T) {
+	allowed := services.WitnessTOTPStatus{HasTOTP: true, TOTPAllowed: true}
+	cases := []struct {
+		name       string
+		st         services.WitnessTOTPStatus
+		method     string
+		wantMethod string
+		wantNotice bool
+	}{
+		{"passkey user asking for totp still gets passkey", services.WitnessTOTPStatus{HasPasskey: true, HasTOTP: true, TOTPAllowed: true}, "totp", "passkey", false},
+		{"no passkey, totp enrolled, default -> totp", allowed, "", "totp", false},
+		{"no passkey, explicit totp -> totp", allowed, "totp", "totp", false},
+		{"no passkey but explicit passkey -> notice", allowed, "passkey", "passkey", true},
+		{"no passkey, no totp -> setup notice", services.WitnessTOTPStatus{TOTPAllowed: true}, "totp", "totp", true},
+		{"policy off, no passkey -> notice", services.WitnessTOTPStatus{HasTOTP: true}, "totp", "passkey", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bs := renderPageBootstrap(t, tc.st, tc.method)
+			if bs.Method != tc.wantMethod {
+				t.Errorf("method = %q, want %q", bs.Method, tc.wantMethod)
+			}
+			if (bs.Notice != "") != tc.wantNotice {
+				t.Errorf("notice = %q, wantNotice=%v", bs.Notice, tc.wantNotice)
+			}
+			if bs.State != "st4te" {
+				t.Errorf("state = %q", bs.State)
+			}
+		})
 	}
 }

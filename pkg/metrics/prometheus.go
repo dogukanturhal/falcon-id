@@ -92,6 +92,16 @@ var (
 		},
 	)
 
+	// AuthTokenReplacedByWriteFailed counts rotations whose replaced_by lineage
+	// pointer could not be recorded (that token loses lost-response recovery,
+	// or a pointer was already set). Sustained non-zero means a store problem.
+	AuthTokenReplacedByWriteFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "iam_auth_token_replaced_by_write_failed_total",
+			Help: "Refresh rotations whose replaced_by lineage pointer write failed",
+		},
+	)
+
 	// AuthMFAVerifications is an exported identifier.
 	AuthMFAVerifications = promauto.NewCounterVec(
 		prometheus.CounterOpts{

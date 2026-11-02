@@ -4,6 +4,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/dogukanturhal/falcon-id/internal/authorization"
 	"github.com/dogukanturhal/falcon-id/internal/models"
 	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/pkg/logger"
@@ -138,6 +140,11 @@ type roleServiceRoleRepo interface {
 	GetByName(ctx context.Context, tenantID uuid.UUID, name string) (*models.Role, error)
 	Create(ctx context.Context, role *models.Role) error
 	AssignPermissions(ctx context.Context, roleID uuid.UUID, permissionIDs []uuid.UUID, assignedBy *uuid.UUID) error
+	// GrantPermissionsByName is purely additive ("INSERT ... ON CONFLICT DO
+	// NOTHING"), unlike AssignPermissions which deletes a role's existing
+	// grants before inserting - used by AcmeAppRoleProvisioner's reconcile
+	// path so a top-up run can never drop a permission a role already has.
+	GrantPermissionsByName(ctx context.Context, roleID uuid.UUID, permissionNames []string) error
 	GetRolePermissions(ctx context.Context, roleID uuid.UUID) ([]models.Permission, error)
 	GetByID(ctx context.Context, id uuid.UUID) (*models.Role, error)
 	GetByIDAndTenant(ctx context.Context, id, tenantID uuid.UUID) (*models.Role, error)
@@ -158,6 +165,11 @@ type roleServicePermissionRepo interface {
 	GetUserPermissionIDs(ctx context.Context, userID, tenantID uuid.UUID) ([]uuid.UUID, error)
 	GetUserPermissionNames(ctx context.Context, userID, tenantID uuid.UUID) ([]string, error)
 	GetPermissionNamesByIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error)
+	// GetByID resolves a single permission (module/resource/action/name),
+	// used by the ADR-A10 grant-permission boundary check to learn the
+	// module a permission belongs to before deciding whether the grant is
+	// allowed.
+	GetByID(ctx context.Context, id uuid.UUID) (*models.Permission, error)
 }
 
 // RoleService is an exported type.
@@ -177,6 +189,10 @@ type RoleService struct {
 	// until next token refresh" window. Wired in cmd/services.go;
 	// nil-safe.
 	caeService *CAEService
+
+	// apiKeyUsage optional: blocks API-key-forbidden grants to roles that
+	// active tenant API keys hold. See guardAPIKeyRoleGrant.
+	apiKeyUsage RoleAPIKeyUsage
 }
 
 // SetCAEService wires the CAEP publisher into RoleService. Safe to
@@ -245,8 +261,24 @@ func (s *RoleService) publishEvent(ctx context.Context, topic string, key string
 	}
 }
 
+// isReservedRoleName reports names that carry admin rank elsewhere (tenant
+// administrator names and iam_admin); custom roles must not use them or they
+// would spoof the name-based rank checks.
+func isReservedRoleName(name string) bool {
+	n := strings.TrimSpace(name)
+	return authorization.IsTenantAdministratorRole(n) || strings.EqualFold(n, "iam_admin")
+}
+
+// MaxPriorityForUser returns the highest role priority the user holds in a tenant.
+func (s *RoleService) MaxPriorityForUser(ctx context.Context, userID, tenantID uuid.UUID) (int, error) {
+	return s.roleRepo.GetMaxPriorityForUser(ctx, userID, tenantID)
+}
+
 // Create creates a new role
 func (s *RoleService) Create(ctx context.Context, req *models.CreateRoleRequest, createdBy *uuid.UUID) (*models.RoleResponse, error) {
+	if isReservedRoleName(req.Name) {
+		return nil, fmt.Errorf("role name %q is reserved", strings.TrimSpace(req.Name))
+	}
 	// Check if role name already exists
 	existing, err := s.roleRepo.GetByName(ctx, req.TenantID, req.Name)
 	if err != nil {
@@ -344,6 +376,21 @@ func (s *RoleService) GetByID(ctx context.Context, id uuid.UUID) (*models.RoleRe
 	return role.ToResponse(), nil
 }
 
+// ErrRoleNotFound is returned by TenantOf when the role does not exist.
+var ErrRoleNotFound = errors.New("role not found")
+
+// TenantOf returns the tenant that owns a role, without loading its permissions.
+func (s *RoleService) TenantOf(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	role, err := s.roleRepo.GetByID(ctx, id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("TenantOf: %w", err)
+	}
+	if role == nil {
+		return uuid.Nil, ErrRoleNotFound
+	}
+	return role.TenantID, nil
+}
+
 // Update updates a role
 func (s *RoleService) Update(ctx context.Context, id uuid.UUID, req *models.UpdateRoleRequest, updatedBy *uuid.UUID) (*models.RoleResponse, error) {
 	role, err := s.roleRepo.GetByID(ctx, id)
@@ -353,6 +400,12 @@ func (s *RoleService) Update(ctx context.Context, id uuid.UUID, req *models.Upda
 
 	if role == nil {
 		return nil, fmt.Errorf("role not found")
+	}
+
+	if req.PermissionIDs != nil {
+		if err := s.guardAPIKeyRoleGrant(ctx, role, req.PermissionIDs); err != nil {
+			return nil, err
+		}
 	}
 
 	// System roles can only have permissions updated
@@ -740,6 +793,10 @@ func (s *RoleService) AssignPermissions(ctx context.Context, roleID uuid.UUID, p
 		return fmt.Errorf("role not found")
 	}
 
+	if err := s.guardAPIKeyRoleGrant(ctx, role, permissionIDs); err != nil {
+		return err
+	}
+
 	// C-3: system role modifications require platform admin (priority >= 100)
 	if role.IsSystem && assignedBy != nil {
 		callerMax, err := s.roleRepo.GetMaxPriorityForUser(ctx, *assignedBy, role.TenantID)
@@ -756,6 +813,17 @@ func (s *RoleService) AssignPermissions(ctx context.Context, roleID uuid.UUID, p
 		if err := s.checkCallerCoversPermissions(ctx, *assignedBy, role.TenantID, permissionIDs); err != nil {
 			return err
 		}
+	}
+
+	// ADR-A10 permission boundary (ties into 23-authorization-rbac-abac-
+	// rebac.md §3.2/§12.2): a tenant admin can never grant a permission
+	// outside their own entitlement/tenant-plane boundary, even via the
+	// PUT-permissions "replace the set" path — not just the dedicated
+	// internal/v1 grant-permission action endpoint. Checked per-permission
+	// so a partially-entitled request fails closed on the first violation
+	// rather than silently dropping the offending permission.
+	if err := s.checkGrantBoundaryForIDs(ctx, role.TenantID, permissionIDs); err != nil {
+		return err
 	}
 
 	if err := s.roleRepo.AssignPermissions(ctx, roleID, permissionIDs, assignedBy); err != nil {

@@ -13,7 +13,7 @@ import (
 
 // Onboarding contact verification (EMAIL, not SMS)
 //
-// The Mearax onboarding wizard mirrors Brevo's UX structure, which has a
+// The AcmeWeb onboarding wizard mirrors Brevo's UX structure, which has a
 // "Add your mobile number" / "Confirm your mobile number" step pair. This
 // deployment has NO SMS provider wired (no Twilio/SNS/carrier-webhook
 // client anywhere in pkg/config or internal/services) — sending a real

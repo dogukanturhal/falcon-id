@@ -1,0 +1,18 @@
+apiVersion: v2
+name: spicedb-schema
+description: >-
+  Dedicated, independently-synced owner of the cluster's SpiceDB schema
+  (t-582). A single global resource (SpiceDB's schema — REPLACE, not merge,
+  semantics on WriteSchema) must have exactly one writer; this chart is that
+  writer. Neither Talon nor falcon-id write schema anymore — see
+  files/spicedb.zed's header comment for the incident this fixes.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: HexxLock Platform Team
+    email: platform@example.com
+keywords:
+  - spicedb
+  - authorization
+  - schema

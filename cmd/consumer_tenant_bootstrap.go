@@ -45,8 +45,8 @@ type consumerTenantBootstrapRepo interface {
 //     rather than physical tenant-per-user explosion.
 //
 //   - HexxLock-specific: RealmDBProvisioner cost compounds with per-user
-//     tenants on a single-server cluster (per memory
-//     internal engineering notes). One consumer tenant
+//     tenants on a single-server cluster (per the
+//     operational notes). One consumer tenant
 //     means one realm/DB total for all gmail/outlook signups.
 //
 // Why this lives in the application boot path (same rationale as

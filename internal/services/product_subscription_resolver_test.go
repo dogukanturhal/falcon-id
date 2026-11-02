@@ -18,9 +18,16 @@ import (
 
 type mockSubscriptionInstanceRepo struct {
 	instances []models.ProductInstance
+	// err, when set, is returned by ListVisibleByTenant instead of any
+	// instances — simulates a DB/transport failure so callers can assert
+	// fail-closed behaviour (no products claim, never "all products").
+	err error
 }
 
 func (m *mockSubscriptionInstanceRepo) ListVisibleByTenant(_ context.Context, tenantID uuid.UUID) ([]models.ProductInstance, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	var result []models.ProductInstance
 	for _, pi := range m.instances {
 		if pi.TenantID != tenantID {
@@ -95,7 +102,7 @@ func TestProductSubscriptionResolver_MultipleProducts(t *testing.T) {
 	productRepo := &mockSubscriptionProductRepo{
 		products: map[uuid.UUID]*models.Product{
 			erpID: {ID: erpID, Slug: "examplesuite", Name: "Example Suite"},
-			pmsID: {ID: pmsID, Slug: "hotel-pms", Name: "Hotel PMS"},
+			pmsID: {ID: pmsID, Slug: "example-pms", Name: "Example PMS"},
 		},
 	}
 
@@ -106,7 +113,7 @@ func TestProductSubscriptionResolver_MultipleProducts(t *testing.T) {
 
 	slugs := []string{claims[0].ProductSlug, claims[1].ProductSlug}
 	assert.Contains(t, slugs, "examplesuite")
-	assert.Contains(t, slugs, "hotel-pms")
+	assert.Contains(t, slugs, "example-pms")
 }
 
 // TestProductSubscriptionResolver_NonActiveStillVisible covers Gap 2 of the
@@ -132,7 +139,7 @@ func TestProductSubscriptionResolver_NonActiveStillVisible(t *testing.T) {
 	productRepo := &mockSubscriptionProductRepo{
 		products: map[uuid.UUID]*models.Product{
 			pendingProductID: {ID: pendingProductID, Slug: "examplesuite", Name: "Example Suite"},
-			failedProductID:  {ID: failedProductID, Slug: "hotel-pms", Name: "Hotel PMS"},
+			failedProductID:  {ID: failedProductID, Slug: "example-pms", Name: "Example PMS"},
 		},
 	}
 
@@ -146,7 +153,7 @@ func TestProductSubscriptionResolver_NonActiveStillVisible(t *testing.T) {
 		byProduct[c.ProductSlug] = c
 	}
 	assert.Equal(t, "provisioning", byProduct["examplesuite"].State)
-	assert.Equal(t, "failed", byProduct["hotel-pms"].State)
+	assert.Equal(t, "failed", byProduct["example-pms"].State)
 }
 
 // TestProductSubscriptionResolver_ActiveStateOmitted asserts the zero-value
@@ -194,7 +201,7 @@ func TestProductSubscriptionResolver_ExcludesCancelled(t *testing.T) {
 	productRepo := &mockSubscriptionProductRepo{
 		products: map[uuid.UUID]*models.Product{
 			deletingID: {ID: deletingID, Slug: "examplesuite", Name: "Example Suite"},
-			deletedID:  {ID: deletedID, Slug: "hotel-pms", Name: "Hotel PMS"},
+			deletedID:  {ID: deletedID, Slug: "example-pms", Name: "Example PMS"},
 		},
 	}
 
@@ -227,6 +234,23 @@ func TestProductSubscriptionResolver_SkipsMissingProduct(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, claims, 1)
 	assert.Equal(t, "examplesuite", claims[0].ProductSlug)
+}
+
+// TestProductSubscriptionResolver_RepoErrorPropagates asserts that a
+// failure in the underlying instance repo (DB down, timeout, etc.) is
+// surfaced as an error rather than swallowed into an empty/partial claim
+// set. Callers (token_service, OAuthProviderService) rely on this error
+// return to fail closed — see TestGenerateMinimalToken_ResolverError_OmitsProductsClaim
+// and TestOAuthProductsClaim_ResolverError_OmitsProductsClaim.
+func TestProductSubscriptionResolver_RepoErrorPropagates(t *testing.T) {
+	tenantID := uuid.New()
+	instanceRepo := &mockSubscriptionInstanceRepo{err: fmt.Errorf("connection reset")}
+	productRepo := &mockSubscriptionProductRepo{products: map[uuid.UUID]*models.Product{}}
+
+	resolver := NewProductSubscriptionResolver(instanceRepo, productRepo)
+	claims, err := resolver.Resolve(context.Background(), tenantID)
+	require.Error(t, err)
+	assert.Nil(t, claims, "on error, resolver must not return a partial/empty-but-non-nil claim set")
 }
 
 func TestProductSubscriptionResolver_WithPlanID(t *testing.T) {

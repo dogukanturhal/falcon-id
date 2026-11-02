@@ -203,7 +203,7 @@ func TestGenerateDefinition_CustomRelations(t *testing.T) {
 
 	def := &ResourceTypeDefinition{
 		Name:        "hotel_booking",
-		ProductSlug: "hexxlock-hotel-pms",
+		ProductSlug: "example-pms",
 		Relations:   []string{"agent", "guest"},
 		Permissions: []string{"confirm", "cancel"},
 	}
@@ -242,7 +242,7 @@ func TestGetRegisteredTypes_ReturnsAll(t *testing.T) {
 	defs := []*ResourceTypeDefinition{
 		{Name: "crm_contact", ProductSlug: "examplesuite", Relations: []string{"owner"}, Permissions: []string{"view"}},
 		{Name: "hr_employee", ProductSlug: "examplesuite", Relations: []string{"owner"}, Permissions: []string{"view"}},
-		{Name: "hotel_room", ProductSlug: "hexxlock-hotel-pms", Relations: []string{"owner"}, Permissions: []string{"view"}},
+		{Name: "hotel_room", ProductSlug: "example-pms", Relations: []string{"owner"}, Permissions: []string{"view"}},
 	}
 
 	for _, def := range defs {

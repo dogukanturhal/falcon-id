@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -51,6 +52,7 @@ const (
 
 // OAuthProviderHandler handles OAuth2/OIDC provider endpoints
 type OAuthProviderHandler struct {
+	tokenService *services.TokenService
 	service      *services.OAuthProviderService
 	authService  *services.AuthService
 	logger       *zap.Logger
@@ -59,16 +61,66 @@ type OAuthProviderHandler struct {
 	// fclService renders OIDC Front-Channel Logout 1.0 iframes on
 	// /oauth/logout. Optional: when nil the logout page renders without
 	// iframes (cookie-only logout, as before FCL was wired).
-	fclService *services.FrontchannelLogoutService
+	fclService    *services.FrontchannelLogoutService
+	logoutService interface {
+		EndSession(context.Context, string) (*models.OAuthClient, *uuid.UUID, error)
+		GetClientByClientID(context.Context, string) (*models.OAuthClient, error)
+	}
+	// sessionTerminator revokes refresh tokens / ends the session row on a
+	// validly hinted RP-initiated logout. Optional: nil = cookie/Redis
+	// teardown only.
+	sessionTerminator logoutSessionTerminator
+}
+
+// logoutSessionTerminator is the explicit-end surface of RP-initiated logout.
+type logoutSessionTerminator interface {
+	// RevokeSessionTokens revokes the user's tokens (and families) bound to a session id.
+	RevokeSessionTokens(ctx context.Context, sessionID, userID uuid.UUID) error
+	// LogoutHintSID returns the sid and sub claims of a signature-verified id_token_hint.
+	LogoutHintSID(idTokenHint string) (sid, subject uuid.UUID, ok bool)
+	// EndLoginSession ends an iam_sessions row (sweeping its tokens).
+	EndLoginSession(ctx context.Context, rowID uuid.UUID, reason string) error
+	// EndHintedSession ends the session(s) named by a hint's sid when Redis has none.
+	EndHintedSession(ctx context.Context, hintSID, subject uuid.UUID) error
+}
+
+// oauthLogoutTerminator adapts the OAuth provider and auth services.
+type oauthLogoutTerminator struct {
+	service     *services.OAuthProviderService
+	authService *services.AuthService
+}
+
+func (t oauthLogoutTerminator) RevokeSessionTokens(ctx context.Context, id, userID uuid.UUID) error {
+	return t.service.RevokeSessionTokens(ctx, id, userID)
+}
+
+func (t oauthLogoutTerminator) LogoutHintSID(hint string) (uuid.UUID, uuid.UUID, bool) {
+	return t.service.LogoutHintSID(hint)
+}
+
+func (t oauthLogoutTerminator) EndHintedSession(ctx context.Context, hintSID, subject uuid.UUID) error {
+	return t.service.EndHintedSession(ctx, hintSID, subject)
+}
+
+func (t oauthLogoutTerminator) EndLoginSession(ctx context.Context, rowID uuid.UUID, reason string) error {
+	if t.authService == nil {
+		return nil
+	}
+	return t.authService.EndSession(ctx, rowID, reason)
 }
 
 // NewOAuthProviderHandler creates a new OAuthProviderHandler
 func NewOAuthProviderHandler(service *services.OAuthProviderService, authService *services.AuthService, logger *zap.Logger) *OAuthProviderHandler {
-	return &OAuthProviderHandler{
+	h := &OAuthProviderHandler{
 		service:     service,
 		authService: authService,
 		logger:      logger,
 	}
+	if service != nil {
+		h.logoutService = service
+		h.sessionTerminator = oauthLogoutTerminator{service: service, authService: authService}
+	}
+	return h
 }
 
 // SetTenantLookup sets the tenant lookup used to resolve the ?tenant= hint on /oauth/authorize.
@@ -79,6 +131,12 @@ func (h *OAuthProviderHandler) SetTenantLookup(lookup TenantLookup) {
 // SetSessionCache wires the Redis session cache used to store IdP-level SSO sessions.
 func (h *OAuthProviderHandler) SetSessionCache(cache *redispkg.SessionCache) {
 	h.sessionCache = cache
+}
+
+// SetTokenService wires the token service used to read the session id from the
+// freshly minted access token (all token versions, not just legacy claims).
+func (h *OAuthProviderHandler) SetTokenService(ts *services.TokenService) {
+	h.tokenService = ts
 }
 
 // SetFrontchannelLogout wires the FCL iframe-renderer used by EndSession.
@@ -401,7 +459,16 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 
 	// Get authenticated user from context
 	userID, exists := c.Get("user_id")
-	if !exists {
+	if !exists || req.Prompt == "login" {
+		if req.Prompt == "login" {
+			if cookie, err := c.Cookie("falcon_idp_session"); err == nil && h.sessionCache != nil {
+				if sid, err := uuid.Parse(cookie); err == nil {
+					_ = h.sessionCache.EndIdpSession(c.Request.Context(), sid)
+				}
+			}
+			clearAuthCookies(c)
+			clearIdpSessionCookie(c)
+		}
 		// Build the post-login redirect URL.
 		//
 		// RFC 9126 §2.2 — PAR entries are one-time-use AND short-TTL (≤60s).
@@ -422,6 +489,9 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 		} else {
 			redirectURL = c.Request.URL.String()
 		}
+		// The forced authentication is being fulfilled by the hosted form.
+		// Do not re-apply prompt=login after the form creates a fresh session.
+		redirectURL = loginResumeURL(redirectURL)
 		safeRedirect := security.ValidateRedirectURL(redirectURL, security.RedirectValidationConfig{
 			AllowRelativePaths: true,
 			DefaultPath:        "/dashboard",
@@ -466,7 +536,8 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 	if !client.IsFirstParty {
 		consent, err := h.service.GetConsent(c.Request.Context(), userUUID, client.ID)
 		if err != nil {
-			h.oauthError(c, "server_error", err.Error(), req.State, req.RedirectURI)
+			h.logger.Error("oauth authorize: consent lookup failed", zap.Error(err))
+			h.oauthError(c, "server_error", msgOAuthInternalErrorCap, req.State, req.RedirectURI)
 			return
 		}
 		if consent == nil || !h.scopesCovered(consent.Scopes, requestedScopes) {
@@ -561,6 +632,18 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 		}
 		stale := sessionAuthTime == 0 ||
 			time.Since(time.Unix(sessionAuthTime, 0)) > maxAge
+		// An in-place OTP/passkey step-up refreshes the DB session without
+		// reissuing the browser's old access-token cookie. Consult that
+		// authoritative timestamp before sending the user through MFA again.
+		if stale && currentUser != nil && h.authService != nil {
+			if sidVal, ok := c.Get("session_id"); ok {
+				if sid, ok := sidVal.(uuid.UUID); ok {
+					if session, err := h.authService.GetSessionByID(c.Request.Context(), sid); err == nil && session != nil && session.UserID == userUUID && session.AuthenticatedAt != nil {
+						stale = time.Since(*session.AuthenticatedAt) > maxAge
+					}
+				}
+			}
+		}
 		if stale {
 			// Build the resume URL from the parsed request (not the
 			// raw inbound URL) for the same PAR-vs-bare-query reason
@@ -658,7 +741,8 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 		// decision can never drift from the actual factor inventory.
 		hasFactor, ferr := h.service.UserHasAnyMFAFactor(c.Request.Context(), userUUID)
 		if ferr != nil {
-			h.oauthError(c, "server_error", "lookup user factor inventory for acr step-up: "+ferr.Error(), req.State, req.RedirectURI)
+			h.logger.Error("oauth authorize: factor inventory lookup for acr step-up failed", zap.Error(ferr))
+			h.oauthError(c, "server_error", msgOAuthInternalErrorCap, req.State, req.RedirectURI)
 			return
 		}
 		stepUpDest := "/auth/mfa/challenge"
@@ -695,16 +779,24 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 	// a single browser session instead of fanning out across the subject
 	// (migration 220). Missing/unparseable cookie silently degrades to no
 	// `sid` claim — spec-compliant since `sid` is OPTIONAL.
-	if cookieVal, err := c.Cookie("falcon_idp_session"); err == nil && cookieVal != "" {
-		if idpSessionID, parseErr := uuid.Parse(cookieVal); parseErr == nil {
-			req.IdpSessionID = &idpSessionID
+	// Only stamp the cookie's session when it provably belongs to the
+	// authenticated user (Redis owner == userUUID): the id later keys explicit
+	// session ends, so a cookie naming someone else's session must never end
+	// up on this user's tokens. Nil UUIDs and unresolvable sessions are
+	// ignored (sid is optional).
+	if cookieVal, err := c.Cookie("falcon_idp_session"); err == nil && cookieVal != "" && h.sessionCache != nil {
+		if idpSessionID, parseErr := uuid.Parse(cookieVal); parseErr == nil && idpSessionID != uuid.Nil {
+			if data, lookupErr := h.sessionCache.GetIdpSession(c.Request.Context(), idpSessionID); lookupErr == nil && data != nil && data.UserID == userUUID {
+				req.IdpSessionID = &idpSessionID
+			}
 		}
 	}
 
 	// Generate authorization code
 	code, err := h.service.CreateAuthorizationCode(c.Request.Context(), client, userUUID, req)
 	if err != nil {
-		h.oauthError(c, "server_error", err.Error(), req.State, req.RedirectURI)
+		h.logger.Error("oauth authorize: authorization code creation failed", zap.Error(err))
+		h.oauthError(c, "server_error", msgOAuthInternalErrorCap, req.State, req.RedirectURI)
 		return
 	}
 
@@ -722,16 +814,37 @@ func (h *OAuthProviderHandler) continueAuthorize(c *gin.Context, req *models.OAu
 	// `authorization_response_iss_parameter_supported=true` in
 	// internal/services/oauth_provider_service_tokens.go advertises this
 	// to spec-aware RP SDKs.
-	redirectURL := req.RedirectURI + "?code=" + code +
-		"&iss=" + url.QueryEscape(h.service.Issuer())
-	if req.State != "" {
-		redirectURL += queryParamState + req.State
-	}
+	redirectURL := buildAuthorizeSuccessRedirect(req.RedirectURI, code, req.State, h.service.Issuer())
 
 	// The redirect_uri is already validated by the OAuth service against
 	// the client's registered redirect URIs, so it's safe to redirect.
 	// HTML-bodied redirect — Safari iOS download-prompt fix.
 	writeOAuthHTMLRedirect(c, redirectURL)
+}
+
+// buildAuthorizeSuccessRedirect appends code, state and iss to redirectURI.
+// Parameters are set through url.Values so state is escaped (no parameter or
+// fragment injection through a hostile state) and a query already present on
+// the registered redirect_uri is preserved rather than producing a second "?".
+func buildAuthorizeSuccessRedirect(redirectURI, code, state, issuer string) string {
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		// Unparseable even though it was validated against the client's
+		// registered URIs: fall back to explicit escaping.
+		out := redirectURI + "?code=" + url.QueryEscape(code) + "&iss=" + url.QueryEscape(issuer)
+		if state != "" {
+			out += queryParamState + url.QueryEscape(state)
+		}
+		return out
+	}
+	q := u.Query()
+	q.Set("code", code)
+	if state != "" {
+		q.Set("state", state)
+	}
+	q.Set("iss", issuer)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // Token handles the OAuth2 token endpoint
@@ -856,6 +969,22 @@ func (h *OAuthProviderHandler) Token(c *gin.Context) {
 			dpopJKTStr,
 		)
 	case grantTypeTokenExchange:
+		// Operator token exchange (platform-admin console): audience
+		// hexxlock-ops is a logical name, not an RFC 8707 URI, so this
+		// branch must run before the generic audience handling below.
+		if req.Audience == services.OperatorTokenAudience && req.TargetTenantID == "" {
+			response, err = h.service.OperatorTokenExchange(
+				tokenCtx,
+				client,
+				req.SubjectToken,
+				req.SubjectTokenType,
+				req.RequestedTokenType,
+			)
+			if err == nil && response != nil {
+				response.IssuedTokenType = tokenTypeAccessToken
+			}
+			break
+		}
 		// RFC 8693 — Token Exchange. The `audience` form field is
 		// the §2.1 alternative to RFC 8707 `resource`; when present
 		// without an explicit `resource` we promote it into the
@@ -891,14 +1020,29 @@ func (h *OAuthProviderHandler) Token(c *gin.Context) {
 		if req.Scope != "" {
 			scopes = strings.Split(req.Scope, " ")
 		}
-		response, err = h.service.TokenExchangeGrant(
-			exchangeCtx,
-			client,
-			req.SubjectToken,
-			req.SubjectTokenType,
-			req.RequestedTokenType,
-			scopes,
-		)
+		if req.TargetTenantID != "" {
+			// Tenant token exchange: same grant, different trust model
+			// (active membership in the target tenant). Never issues a
+			// refresh token.
+			response, err = h.service.TenantTokenExchange(
+				exchangeCtx,
+				client,
+				req.SubjectToken,
+				req.SubjectTokenType,
+				req.RequestedTokenType,
+				req.TargetTenantID,
+				scopes,
+			)
+		} else {
+			response, err = h.service.TokenExchangeGrant(
+				exchangeCtx,
+				client,
+				req.SubjectToken,
+				req.SubjectTokenType,
+				req.RequestedTokenType,
+				scopes,
+			)
+		}
 		if err == nil && response != nil {
 			// RFC 8693 §2.2.1 mandates `issued_token_type` on a
 			// successful exchange. Set unconditionally for the
@@ -943,6 +1087,17 @@ func (h *OAuthProviderHandler) Token(c *gin.Context) {
 			h.tokenError(c, "invalid_dpop_proof", err.Error())
 			return
 		}
+		if errors.Is(err, services.ErrTenantExchangeRateLimited) {
+			c.JSON(http.StatusTooManyRequests, models.OAuthErrorResponse{
+				Error:            "slow_down",
+				ErrorDescription: "too many tenant token exchanges; retry later",
+			})
+			return
+		}
+		// Suspended tenant (R1-GAPS row 27): stable `tenant_suspended` code, 403.
+		if respondIfTenantSuspended(c, err) {
+			return
+		}
 		errStr := err.Error()
 		switch {
 		case strings.HasPrefix(errStr, "invalid_grant:"):
@@ -953,8 +1108,20 @@ func (h *OAuthProviderHandler) Token(c *gin.Context) {
 			h.tokenError(c, "invalid_request", strings.TrimPrefix(errStr, "invalid_request: "))
 		case strings.HasPrefix(errStr, "invalid_scope:"):
 			h.tokenError(c, "invalid_scope", strings.TrimPrefix(errStr, "invalid_scope: "))
+		case strings.HasPrefix(errStr, "insufficient_user_authentication:"):
+			// RFC 9470: the subject token's authentication is too weak for the
+			// requested tenant; the client re-authenticates with MFA.
+			h.tokenError(c, "insufficient_user_authentication", strings.TrimPrefix(errStr, "insufficient_user_authentication: "))
+		case strings.HasPrefix(errStr, "invalid_target:"):
+			h.tokenError(c, "invalid_target", strings.TrimPrefix(errStr, "invalid_target: "))
+		case strings.HasPrefix(errStr, "access_denied:"):
+			h.tokenError(c, "access_denied", strings.TrimPrefix(errStr, "access_denied: "))
 		default:
-			h.tokenError(c, "server_error", errStr)
+			// server_error-prefixed and every unclassified error: internal
+			// detail (DB errors, signer failures) stays in the log, never in
+			// the response.
+			h.logger.Error("oauth token request failed", zap.String("grant_type", req.GrantType), zap.Error(err))
+			h.tokenError(c, "server_error", "internal error")
 		}
 		return
 	}
@@ -1162,7 +1329,7 @@ type ScopeInfo struct {
 // Combined with the global APISecurityHeaders middleware adding
 // `X-Content-Type-Options: nosniff`, Safari iOS refuses to treat the 302
 // as an HTML navigation when the redirect chain crosses origins
-// (id.hexxlock.com → auth-internal.example.com → per-route upstream).
+// (id.example.com → auth-pomerium.internal.example.com → per-route upstream).
 // Instead it prompts the user to DOWNLOAD the target URL as a file.
 //
 // Writing the same minimal body stdlib uses for GET requests, with an
@@ -1246,13 +1413,15 @@ func buildAuthorizeURLFromRequest(req *models.OAuthAuthorizeRequest) string {
 func (h *OAuthProviderHandler) LoginPage(c *gin.Context) {
 	redirect := c.Query("redirect")
 
-	// Validate redirect is a relative path starting with /oauth/authorize
-	if redirect == "" || !strings.HasPrefix(redirect, "/oauth/authorize") {
+	// Validate redirect is a relative URL whose path is exactly /oauth/authorize
+	// (shared with the signup continuation; a bare prefix match let
+	// "/oauth/authorize-x" and dot-segment paths through).
+	if _, err := services.ParseAuthorizeContinuation(redirect); err != nil {
 		redirect = ""
 	}
 
 	// Tier-1 universal login: when OAUTH_LOGIN_REDIRECT_URL is set, hand the
-	// browser off to the dedicated login UI app (apps/login on id.hexxlock.com)
+	// browser off to the dedicated login UI app (apps/login on id.example.com)
 	// instead of rendering the in-process Go template. The target sees the
 	// authorize-continuation URL on `?redirect=` and navigates the browser
 	// back there once the falcon_idp_session cookie is set by /api/v1/auth/login.
@@ -1282,7 +1451,7 @@ func (h *OAuthProviderHandler) LoginPage(c *gin.Context) {
 			// authorization decision.
 			if u, err := url.Parse(redirect); err == nil {
 				if hint := u.Query().Get("login_hint"); hint != "" {
-					target += "&email=" + url.QueryEscape(hint)
+					target += "&email=" + url.QueryEscape(hint) + "&login_hint=" + url.QueryEscape(hint)
 				}
 				if lc := u.Query().Get("login_context"); lc != "" {
 					target += "&login_context=" + url.QueryEscape(lc)
@@ -1313,7 +1482,7 @@ func (h *OAuthProviderHandler) LoginPage(c *gin.Context) {
 		return
 	}
 
-	tmpl, err := template.ParseFS(templates.FS, "login.html")
+	tmpl, err := template.ParseFS(templates.FS, "login.html", "acmeapp-mark.html")
 	if err != nil {
 		h.logger.Error("Failed to parse login template", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": msgOAuthInternalError})
@@ -1322,11 +1491,15 @@ func (h *OAuthProviderHandler) LoginPage(c *gin.Context) {
 
 	c.Header(hdrOAuthContentType, contentTypeHTMLCharset)
 	c.Status(http.StatusOK)
+	loginHint := loginHintFrom(c.Query("login_hint"), redirect)
 	if err := tmpl.Execute(c.Writer, map[string]string{
-		"Redirect":  redirect,
-		"TenantID":  tenantID,
-		"Error":     c.Query("error"),
-		"CSRFToken": csrfToken,
+		"Brand":            hostedBrand(redirect),
+		"Redirect":         redirect,
+		"TenantID":         tenantID,
+		"Error":            c.Query("error"),
+		"CSRFToken":        csrfToken,
+		"LoginHint":        loginHint,
+		"ChangeAccountURL": changeAccountURL(redirect),
 	}); err != nil {
 		h.logger.Error("Failed to execute login template", zap.Error(err))
 	}
@@ -1372,7 +1545,9 @@ func (h *OAuthProviderHandler) LoginSubmit(c *gin.Context) {
 
 	response, err := h.authService.Login(c.Request.Context(), loginReq, ipAddress, userAgent)
 	if err != nil {
-		h.logger.Warn("OAuth login failed", zap.String("username", username), zap.Error(err))
+		// Username deliberately not logged: it is attacker-controlled input and
+		// PII, and a mistyped password would otherwise leak it into logs.
+		h.logger.Warn("OAuth login failed", zap.String("ip", ipAddress), zap.Error(err))
 		h.renderLoginError(c, redirect, tenantID, "Invalid email or password.")
 		return
 	}
@@ -1404,7 +1579,12 @@ func (h *OAuthProviderHandler) LoginSubmit(c *gin.Context) {
 		// See pkg/redis/session_cache.go IdpSessionData.SessionID for
 		// the full rationale.
 		var sessRowID uuid.UUID
-		if claims, vErr := h.service.ValidateAccessToken(response.AccessToken); vErr == nil {
+		if h.tokenService != nil {
+			if tc, tErr := h.tokenService.ValidateAccessToken(response.AccessToken); tErr == nil && tc != nil {
+				sessRowID = tc.SessionID
+			}
+		}
+		if claims, vErr := h.service.ValidateAccessToken(response.AccessToken); sessRowID == uuid.Nil && vErr == nil {
 			if sidRaw, ok := claims["session_id"].(string); ok {
 				if parsed, pErr := uuid.Parse(sidRaw); pErr == nil {
 					sessRowID = parsed
@@ -1423,21 +1603,9 @@ func (h *OAuthProviderHandler) LoginSubmit(c *gin.Context) {
 			// SSO will degrade to re-prompting on next authorize rather than failing.
 			h.logger.Warn("failed to store IdP session in Redis", zap.Error(err))
 		} else {
-			secure := isSecureEnvironment()
-			// falcon_idp_session is always SameSite=Lax — see
-			// establishIdpSession in auth_handler.go (d-254). This is the
-			// legacy /oauth/login form-submit path's own copy of the same
-			// cookie write and must stay in lockstep with it.
-			c.SetSameSite(http.SameSiteLaxMode)
-			c.SetCookie(
-				"falcon_idp_session",
-				idpSessionID.String(),
-				int((7 * 24 * time.Hour).Seconds()),
-				"/",
-				getCookieDomain(c),
-				secure,
-				true,
-			)
+			// Attributes live in middleware.SetIdpSessionCookie (shared with
+			// establishIdpSession and the sliding re-issue).
+			middleware.SetIdpSessionCookie(c, idpSessionID.String(), 7*24*time.Hour)
 		}
 	}
 
@@ -1446,6 +1614,47 @@ func (h *OAuthProviderHandler) LoginSubmit(c *gin.Context) {
 	// HTML-bodied redirect — Safari iOS download-prompt fix; see
 	// writeOAuthHTMLRedirect for the rationale.
 	writeOAuthHTMLRedirect(c, redirect)
+}
+
+// maxLoginHintLen mirrors the binding on OAuthAuthorizeRequest.LoginHint.
+const maxLoginHintLen = 254
+
+// loginHintFrom returns the OIDC login_hint (OIDC Core 1.0 §3.1.2.1) to echo
+// on the hosted login page: the explicit /oauth/login param, else the one
+// carried by the (already validated) authorize continuation. It is only ever
+// echoed back verbatim (HTML-escaped by the template) and never used to look
+// anything up, so it cannot be used to probe account existence. Control
+// characters and over-long values are dropped.
+func loginHintFrom(explicit, redirect string) string {
+	hint := explicit
+	if hint == "" {
+		if u, err := url.Parse(redirect); err == nil {
+			hint = u.Query().Get("login_hint")
+		}
+	}
+	hint = strings.TrimSpace(hint)
+	if hint == "" || len(hint) > maxLoginHintLen {
+		return ""
+	}
+	for _, r := range hint {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return hint
+}
+
+// changeAccountURL is the "Use a different account" target: the same login
+// page with login_hint removed from the authorize continuation.
+func changeAccountURL(redirect string) string {
+	u, err := url.Parse(redirect)
+	if err != nil || redirect == "" {
+		return "/oauth/login"
+	}
+	q := u.Query()
+	q.Del("login_hint")
+	u.RawQuery = q.Encode()
+	return "/oauth/login?redirect=" + url.QueryEscape(u.String())
 }
 
 // renderLoginError re-renders the login page with an error message.
@@ -1457,7 +1666,7 @@ func (h *OAuthProviderHandler) renderLoginError(c *gin.Context, redirect, tenant
 		return
 	}
 
-	tmpl, err := template.ParseFS(templates.FS, "login.html")
+	tmpl, err := template.ParseFS(templates.FS, "login.html", "acmeapp-mark.html")
 	if err != nil {
 		h.logger.Error("Failed to parse login template", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": msgOAuthInternalError})
@@ -1467,6 +1676,7 @@ func (h *OAuthProviderHandler) renderLoginError(c *gin.Context, redirect, tenant
 	c.Header(hdrOAuthContentType, contentTypeHTMLCharset)
 	c.Status(http.StatusOK)
 	if err := tmpl.Execute(c.Writer, map[string]string{
+		"Brand":     hostedBrand(redirect),
 		"Redirect":  redirect,
 		"TenantID":  tenantID,
 		"Error":     errMsg,
@@ -1593,6 +1803,7 @@ func (h *OAuthProviderHandler) EndSession(c *gin.Context) {
 	postLogoutRedirectURI := c.Query("post_logout_redirect_uri")
 	state := c.Query("state")
 	clientIDParam := c.Query("client_id")
+	client, validHint := h.resolveEndSessionClient(c, idTokenHint, clientIDParam)
 
 	// Order matters:
 	//   1. Read the falcon_idp_session cookie BEFORE clearing it
@@ -1617,6 +1828,7 @@ func (h *OAuthProviderHandler) EndSession(c *gin.Context) {
 	// (sid, tenantID) BEFORE the Redis entry is deleted so we can emit
 	// per-RP iframes scoped to this session. The iframe URL carries
 	// `iss` + `sid` ONLY (FCL §3) — never any session secret.
+	revokedIdpSessions := map[uuid.UUID]bool{}
 	var (
 		idpSid     string
 		idpTenant  uuid.UUID
@@ -1628,8 +1840,20 @@ func (h *OAuthProviderHandler) EndSession(c *gin.Context) {
 				idpSid = sessionID.String()
 				idpTenant = data.TenantID
 				hasIdpData = true
+				// A VALID id_token_hint makes this an authenticated, explicit
+				// RP-initiated logout: end the iam_sessions row (which sweeps
+				// the tokens bound to it and their families) and the tokens
+				// bound to the opaque idp id. Without a valid hint this URL
+				// is a bare GET anyone can make a victim's browser load
+				// (logout CSRF), so it only tears down the browser's own
+				// cookie + Redis entry, as before. Best effort: the teardown
+				// below must still run.
+				if validHint {
+					h.endLoginSession(c, sessionID, data.SessionID, data.UserID)
+					revokedIdpSessions[sessionID] = true
+				}
 			}
-			if delErr := h.sessionCache.DeleteIdpSession(c.Request.Context(), sessionID); delErr != nil {
+			if delErr := h.sessionCache.EndIdpSession(c.Request.Context(), sessionID); delErr != nil {
 				h.logger.Warn("EndSession: DeleteIdpSession failed",
 					zap.String("session_id", sessionID.String()),
 					zap.Error(delErr))
@@ -1640,10 +1864,29 @@ func (h *OAuthProviderHandler) EndSession(c *gin.Context) {
 		}
 	}
 
+	// Valid hint but no (or a different) Redis entry: the hint itself names
+	// the session, so revoke the tokens bound to its sid claim.
+	if validHint {
+		if hintSID, subject, ok := h.logoutHintSID(idTokenHint); ok && !revokedIdpSessions[hintSID] && h.sessionTerminator != nil {
+			if err := h.sessionTerminator.EndHintedSession(c.Request.Context(), hintSID, subject); err != nil {
+				h.logger.Warn("EndSession: end hinted session failed",
+					zap.String("session_id", hintSID.String()), zap.Error(err))
+			}
+		}
+	}
+
 	clearAuthCookies(c)
 	clearIdpSessionCookie(c)
 
-	client := h.resolveEndSessionClient(c, idTokenHint, clientIDParam)
+	// A verified RP hint permits immediate logout, without a rendered
+	// interstitial. Cookie clears are valid on HTTP redirects; server-side
+	// invalidation above and prompt=login at the RP prevent SSO bounce-back.
+	if validHint && client != nil && client.ClientID == "acmeapp-bff" && h.redirectAfterValidLogout(c, client, postLogoutRedirectURI, state) {
+		return
+	}
+	if renderAcmeAppLogoutFallback(c, client, postLogoutRedirectURI) {
+		return
+	}
 
 	// FCL iframe set — built only when we have an IdP session to scope to.
 	// Without (sid, tenantID) we can't safely target session-required RPs,
@@ -1665,24 +1908,90 @@ func (h *OAuthProviderHandler) EndSession(c *gin.Context) {
 
 // resolveEndSessionClient looks up the OAuthClient from the id_token_hint or client_id parameter.
 // Returns nil when neither yields a valid client (non-fatal — cookies are still cleared).
-func (h *OAuthProviderHandler) resolveEndSessionClient(c *gin.Context, idTokenHint, clientIDParam string) *models.OAuthClient {
+func (h *OAuthProviderHandler) resolveEndSessionClient(c *gin.Context, idTokenHint, clientIDParam string) (*models.OAuthClient, bool) {
+	if h.logoutService == nil {
+		return nil, false
+	}
 	if idTokenHint != "" {
-		client, _, err := h.service.EndSession(c.Request.Context(), idTokenHint)
+		client, subject, err := h.logoutService.EndSession(c.Request.Context(), idTokenHint)
 		if err != nil {
 			h.logger.Warn("EndSession: invalid id_token_hint", zap.Error(err))
-		} else if client != nil {
-			return client
+		} else if client != nil && subject != nil && (clientIDParam == "" || clientIDParam == client.ClientID) {
+			if cookie, err := c.Cookie("falcon_idp_session"); err == nil && h.sessionCache != nil {
+				if sid, err := uuid.Parse(cookie); err == nil {
+					if data, err := h.sessionCache.GetIdpSession(c.Request.Context(), sid); err != nil || (data != nil && data.UserID != *subject) {
+						return client, false
+					}
+				}
+			}
+			return client, true
 		}
 	}
 	if clientIDParam != "" {
-		client, err := h.service.GetClientByClientID(c.Request.Context(), clientIDParam)
+		client, err := h.logoutService.GetClientByClientID(c.Request.Context(), clientIDParam)
 		if err != nil {
 			h.logger.Warn("EndSession: invalid client_id param", zap.Error(err))
 		} else {
-			return client
+			return client, false
 		}
 	}
-	return nil
+	return nil, false
+}
+
+// endLoginSession is the explicit-end action of a validly hinted RP-initiated
+// logout. It revokes the tokens bound to the opaque idp session id and, when the
+// iam_sessions row is known, ends that row with reason "logout" (which sweeps
+// its tokens and rotation families in the same statement). Failures are logged,
+// never fatal to the logout response.
+func (h *OAuthProviderHandler) endLoginSession(c *gin.Context, idpSessionID, rowID, userID uuid.UUID) {
+	if h.sessionTerminator == nil {
+		return
+	}
+	ctx := c.Request.Context()
+	if err := h.sessionTerminator.RevokeSessionTokens(ctx, idpSessionID, userID); err != nil {
+		h.logger.Warn("EndSession: revoke session tokens failed",
+			zap.String("session_id", idpSessionID.String()), zap.Error(err))
+	}
+	if rowID != uuid.Nil {
+		if err := h.sessionTerminator.EndLoginSession(ctx, rowID, "logout"); err != nil {
+			h.logger.Warn("EndSession: end session row failed",
+				zap.String("session_id", rowID.String()), zap.Error(err))
+		}
+	}
+}
+
+// logoutHintSID returns the `sid` claim of a signature-verified id_token_hint.
+func (h *OAuthProviderHandler) logoutHintSID(idTokenHint string) (uuid.UUID, uuid.UUID, bool) {
+	if h.sessionTerminator == nil {
+		return uuid.Nil, uuid.Nil, false
+	}
+	return h.sessionTerminator.LogoutHintSID(idTokenHint)
+}
+
+// redirectAfterValidLogout never trusts an unregistered URI and appends state
+// with URL parsing (registered URIs may already have a query string).
+func (h *OAuthProviderHandler) redirectAfterValidLogout(c *gin.Context, client *models.OAuthClient, target, state string) bool {
+	if client == nil || target == "" {
+		return false
+	}
+	for _, registered := range client.PostLogoutRedirectURIs {
+		if registered != target {
+			continue
+		}
+		u, err := url.Parse(target)
+		if err != nil {
+			return false
+		}
+		if state != "" {
+			q := u.Query()
+			q.Set("state", state)
+			u.RawQuery = q.Encode()
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Redirect(http.StatusFound, u.String())
+		return true
+	}
+	return false
 }
 
 // tryPostLogoutRedirect redirects to postLogoutRedirectURI if it is registered for the client.
@@ -1697,12 +2006,12 @@ func (h *OAuthProviderHandler) resolveEndSessionClient(c *gin.Context, idTokenHi
 // via the Playwright reproducer at
 // talon/e2e/playwright/cookietrace.mjs — DID NOT apply the
 // Set-Cookie clears across the cross-site navigation. The IdP
-// cookies stayed alive on id.hexxlock.com, the RP's /login page
+// cookies stayed alive on id.example.com, the RP's /login page
 // auto-fired /api/auth/oidc-start, the still-valid falcon_idp_session
 // silently re-authenticated, and the user landed back on /home.
 // Symptom: "logout button just refreshes the page".
 //
-// A SAME-ORIGIN HTML response (200 from id.hexxlock.com) lets the
+// A SAME-ORIGIN HTML response (200 from id.example.com) lets the
 // browser commit the Set-Cookie clears against the *active*
 // origin's cookie jar with no redirect-chain ambiguity. We then
 // use a `<meta http-equiv="refresh" content="0;url=…">` tag to
@@ -2189,6 +2498,13 @@ func (h *OAuthProviderHandler) CreateClient(c *gin.Context) {
 		return
 	}
 
+	if !c.GetBool(middleware.CtxKeyTrustedRegistration) {
+		if err := services.ValidateTenantClientScopes(req.Scopes); err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid_scope", "error_description": err.Error()})
+			return
+		}
+	}
+
 	tenantID := middleware.GetTenantID(c)
 	if tenantID == uuid.Nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant ID not found"})
@@ -2281,10 +2597,21 @@ func (h *OAuthProviderHandler) UpdateClient(c *gin.Context) {
 		return
 	}
 
+	if !c.GetBool(middleware.CtxKeyTrustedRegistration) {
+		if err := services.ValidateTenantClientScopes(req.Scopes); err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"error": "invalid_scope", "error_description": err.Error()})
+			return
+		}
+	}
+
 	userID := h.getUserIDFromContext(c)
 
 	client, err := h.service.UpdateClient(c.Request.Context(), id, &req, userID)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "invalid_client_metadata") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		h.logger.Error("Failed to update OAuth client", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": msgOAuthInternalErrorCap})
 		return

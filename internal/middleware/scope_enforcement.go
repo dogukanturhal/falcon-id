@@ -94,3 +94,18 @@ func scopeStringFromCtx(c *gin.Context) string {
 	s, _ := v.(string)
 	return s
 }
+
+// RequireAnyScopeOrInternalKey is RequireAnyScope for routes that still accept
+// the legacy shared X-Internal-Key credential. A service JWT must carry at
+// least one of the scopes; the legacy key (a deployment secret, not
+// obtainable by end users) carries no scopes and is let through unchanged.
+func RequireAnyScopeOrInternalKey(anyOf ...string) gin.HandlerFunc {
+	anyScope := RequireAnyScope(anyOf...)
+	return func(c *gin.Context) {
+		if c.GetString(CtxKeyAuthMethod) == "internal_key" {
+			c.Next()
+			return
+		}
+		anyScope(c)
+	}
+}

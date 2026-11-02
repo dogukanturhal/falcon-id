@@ -45,6 +45,14 @@ type StepUpMiddleware struct {
 	repo     StepUpVerificationRepo
 	logger   *zap.Logger
 	disabled bool
+	// pr enforces PLATFORM_ADMIN_REQUIRE_PHISHING_RESISTANT_MFA for platform
+	// admins; zero value = off.
+	pr phishingResistantPolicy
+}
+
+// SetPhishingResistantPolicy wires the platform-admin passkey requirement.
+func (m *StepUpMiddleware) SetPhishingResistantPolicy(required bool, sessions idpSessionReader) {
+	m.pr = phishingResistantPolicy{required: required, sessions: sessions}
 }
 
 // NewStepUpMiddleware creates a new StepUpMiddleware.
@@ -96,6 +104,11 @@ func (m *StepUpMiddleware) RequireStepUp(action string, maxAge time.Duration) gi
 	return func(c *gin.Context) {
 		if m.disabled {
 			c.Next()
+			return
+		}
+
+		// Platform admins must step up with a passkey when the flag is on.
+		if m.pr.deny(c, requireUserFromContextQuiet(c), action) {
 			return
 		}
 

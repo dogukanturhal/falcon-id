@@ -21,7 +21,13 @@ type PoolConfig struct {
 	// MaxOpenConns is the maximum number of open connections to the database.
 	MaxOpenConns int
 
-	// MaxIdleConns is the maximum number of idle connections in the pool.
+	// MinConns is the number of connections a pgxpool keeps open (pinned) even
+	// when idle. Keep it low: every pinned connection counts against the
+	// server's max_connections for the whole life of the pod.
+	MinConns int
+
+	// MaxIdleConns is the maximum number of idle connections in a database/sql
+	// pool. It does not affect pgxpool (see MinConns).
 	MaxIdleConns int
 
 	// ConnMaxLifetime is the maximum amount of time a connection may be reused.
@@ -38,7 +44,8 @@ type PoolConfig struct {
 // for most platform services.
 func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{
-		MaxOpenConns:      50,
+		MaxOpenConns:      10,
+		MinConns:          0,
 		MaxIdleConns:      10,
 		ConnMaxLifetime:   5 * time.Minute,
 		ConnMaxIdleTime:   1 * time.Minute,
@@ -49,21 +56,40 @@ func DefaultPoolConfig() PoolConfig {
 // LoadPoolConfig reads pool configuration from environment variables, falling
 // back to defaults for any value not set. Environment variables:
 //
-//	DB_MAX_OPEN_CONNS    - maximum open connections (default: 50)
-//	DB_MAX_IDLE_CONNS    - maximum idle connections (default: 10)
+//	DB_MAX_OPEN_CONNS    - maximum open connections (default: 10)
+//	DB_MIN_CONNS         - pgxpool connections kept open when idle (default: 0)
+//	DB_MAX_IDLE_CONNS    - database/sql max idle connections (default: 10)
 //	DB_CONN_MAX_LIFETIME - connection max lifetime (default: 5m)
 //	DB_CONN_MAX_IDLE_TIME - connection max idle time (default: 1m)
 //	DB_HEALTH_CHECK_PERIOD - health check period for pgxpool (default: 1m)
 func LoadPoolConfig() PoolConfig {
+	return LoadPoolConfigPrefixed("DB_")
+}
+
+// LoadPoolConfigPrefixed reads pool configuration from <prefix>MAX_OPEN_CONNS,
+// <prefix>MIN_CONNS, <prefix>MAX_IDLE_CONNS, <prefix>CONN_MAX_LIFETIME,
+// <prefix>CONN_MAX_IDLE_TIME and <prefix>HEALTH_CHECK_PERIOD. Each value falls
+// back to the matching DB_* variable, then to the default. This lets a second
+// database (e.g. CONTROL_PLANE_DB_) get its own, smaller pool.
+func LoadPoolConfigPrefixed(prefix string) PoolConfig {
 	defaults := DefaultPoolConfig()
 
 	return PoolConfig{
-		MaxOpenConns:      getEnvInt("DB_MAX_OPEN_CONNS", defaults.MaxOpenConns),
-		MaxIdleConns:      getEnvInt("DB_MAX_IDLE_CONNS", defaults.MaxIdleConns),
-		ConnMaxLifetime:   getEnvDuration("DB_CONN_MAX_LIFETIME", defaults.ConnMaxLifetime),
-		ConnMaxIdleTime:   getEnvDuration("DB_CONN_MAX_IDLE_TIME", defaults.ConnMaxIdleTime),
-		HealthCheckPeriod: getEnvDuration("DB_HEALTH_CHECK_PERIOD", defaults.HealthCheckPeriod),
+		MaxOpenConns:      getEnvIntPrefixed(prefix, "MAX_OPEN_CONNS", defaults.MaxOpenConns),
+		MinConns:          getEnvIntPrefixed(prefix, "MIN_CONNS", defaults.MinConns),
+		MaxIdleConns:      getEnvIntPrefixed(prefix, "MAX_IDLE_CONNS", defaults.MaxIdleConns),
+		ConnMaxLifetime:   getEnvDurationPrefixed(prefix, "CONN_MAX_LIFETIME", defaults.ConnMaxLifetime),
+		ConnMaxIdleTime:   getEnvDurationPrefixed(prefix, "CONN_MAX_IDLE_TIME", defaults.ConnMaxIdleTime),
+		HealthCheckPeriod: getEnvDurationPrefixed(prefix, "HEALTH_CHECK_PERIOD", defaults.HealthCheckPeriod),
 	}
+}
+
+func getEnvIntPrefixed(prefix, name string, fallback int) int {
+	return getEnvInt(prefix+name, getEnvInt("DB_"+name, fallback))
+}
+
+func getEnvDurationPrefixed(prefix, name string, fallback time.Duration) time.Duration {
+	return getEnvDuration(prefix+name, getEnvDuration("DB_"+name, fallback))
 }
 
 // Apply configures the given *sql.DB connection pool with the values from
@@ -79,7 +105,7 @@ func (c PoolConfig) Apply(db *sql.DB) {
 // this PoolConfig. This is used by services that connect via pgxpool.
 func (c PoolConfig) ApplyToPgxPool(config *pgxpool.Config) {
 	config.MaxConns = int32(c.MaxOpenConns) //nolint:gosec // value is bounded by pool size config, safe conversion
-	config.MinConns = int32(c.MaxIdleConns) //nolint:gosec // value is bounded by pool size config, safe conversion
+	config.MinConns = int32(c.MinConns) //nolint:gosec // value is bounded by pool size config, safe conversion
 	config.MaxConnLifetime = c.ConnMaxLifetime
 	config.MaxConnIdleTime = c.ConnMaxIdleTime
 	config.HealthCheckPeriod = c.HealthCheckPeriod
@@ -89,8 +115,9 @@ func (c PoolConfig) ApplyToPgxPool(config *pgxpool.Config) {
 // useful for startup logging.
 func (c PoolConfig) String() string {
 	return fmt.Sprintf(
-		"PoolConfig{MaxOpenConns: %d, MaxIdleConns: %d, ConnMaxLifetime: %s, ConnMaxIdleTime: %s, HealthCheckPeriod: %s}",
+		"PoolConfig{MaxOpenConns: %d, MinConns: %d, MaxIdleConns: %d, ConnMaxLifetime: %s, ConnMaxIdleTime: %s, HealthCheckPeriod: %s}",
 		c.MaxOpenConns,
+		c.MinConns,
 		c.MaxIdleConns,
 		c.ConnMaxLifetime,
 		c.ConnMaxIdleTime,

@@ -23,19 +23,19 @@ func TestValidateRFC8707Resource(t *testing.T) {
 		errSubstr string
 	}{
 		// happy paths
-		{"https URL", "https://api.hexxlock.com", false, ""},
-		{"https URL with path", "https://api.hexxlock.com/v1/users", false, ""},
-		{"https URL with query", "https://api.hexxlock.com/v1/users?x=1", false, ""},
+		{"https URL", "https://api.example.com", false, ""},
+		{"https URL with path", "https://api.example.com/v1/users", false, ""},
+		{"https URL with query", "https://api.example.com/v1/users?x=1", false, ""},
 		{"http URL (in-cluster)", "http://falcon-id.falcon-id.svc.cluster.local", false, ""},
-		{"https with port", "https://api.hexxlock.com:8443/v1", false, ""},
+		{"https with port", "https://api.example.com:8443/v1", false, ""},
 
 		// fragment rejected
-		{"fragment present", "https://api.hexxlock.com/v1#section", true, "MUST NOT contain a URI fragment"},
-		{"empty fragment marker", "https://api.hexxlock.com/v1#", true, "MUST NOT contain a URI fragment"},
+		{"fragment present", "https://api.example.com/v1#section", true, "MUST NOT contain a URI fragment"},
+		{"empty fragment marker", "https://api.example.com/v1#", true, "MUST NOT contain a URI fragment"},
 
 		// not absolute
 		{"relative path", "/v1/users", true, "must be an absolute URI"},
-		{"scheme-relative", "//api.hexxlock.com", true, "must be an absolute URI"},
+		{"scheme-relative", "//api.example.com", true, "must be an absolute URI"},
 
 		// scheme restriction
 		{"file://", "file:///etc/passwd", true, "scheme \"file\" is not permitted"},
@@ -44,8 +44,8 @@ func TestValidateRFC8707Resource(t *testing.T) {
 		{"data URI", "data:text/plain;base64,SGVsbG8=", true, "scheme \"data\" is not permitted"},
 
 		// case-insensitive scheme handling
-		{"HTTPS uppercase", "HTTPS://api.hexxlock.com", false, ""},
-		{"Http mixed case", "Http://api.hexxlock.com", false, ""},
+		{"HTTPS uppercase", "HTTPS://api.example.com", false, ""},
+		{"Http mixed case", "Http://api.example.com", false, ""},
 	}
 
 	for _, tc := range tests {

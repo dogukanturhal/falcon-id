@@ -3,6 +3,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -329,4 +330,15 @@ func (h *ImpersonationHandler) GetActiveImpersonation(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, session)
+}
+
+// SessionTenantID returns the tenant of an impersonation session. The
+// operator-chain wrappers use it to scope the tenant-bound handlers above to
+// the session's own tenant.
+func (h *ImpersonationHandler) SessionTenantID(ctx context.Context, sessionID uuid.UUID) (uuid.UUID, error) {
+	session, err := h.impersonationService.GetImpersonationSession(ctx, sessionID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return session.TenantID, nil
 }

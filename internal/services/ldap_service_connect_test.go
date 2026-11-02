@@ -108,7 +108,7 @@ func TestConnect_TLS_SetsServerNameFromHost(t *testing.T) {
 	// Verify the TLS config is built correctly by checking the struct fields
 	// directly. We cannot test a real LDAPS dial without infrastructure.
 	cfg := &models.LDAPConfig{
-		Host:          "ldap.internal.hexxlock.com",
+		Host:          "ldap.internal.example.com",
 		Port:          636,
 		UseTLS:        true,
 		SkipTLSVerify: true,
@@ -125,13 +125,13 @@ func TestConnect_TLS_SetsServerNameFromHost(t *testing.T) {
 		tlsConfig.ServerName = cfg.Host
 	}
 
-	assert.Equal(t, "ldap.internal.hexxlock.com", tlsConfig.ServerName,
+	assert.Equal(t, "ldap.internal.example.com", tlsConfig.ServerName,
 		"ServerName should be set from Host when ServerName is empty")
 	assert.True(t, tlsConfig.InsecureSkipVerify)
 
 	// Also verify address formatting
 	address := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	assert.Equal(t, "ldap.internal.hexxlock.com:636", address)
+	assert.Equal(t, "ldap.internal.example.com:636", address)
 }
 
 func TestConnect_TLS_MinVersionAllowsTLS10(t *testing.T) {
@@ -203,7 +203,7 @@ func TestValidateLDAPConfig_DevAllowsAdministrator(t *testing.T) {
 	cfg := &models.LDAPConfig{
 		Host:         "127.0.0.1",
 		Port:         389,
-		BindDN:       "CN=Administrator,CN=Users,DC=hexxlock,DC=corp",
+		BindDN:       "CN=Administrator,CN=Users,DC=example,DC=corp",
 		BindPassword: "Admin123!",
 	}
 

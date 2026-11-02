@@ -347,16 +347,16 @@ func StandardMappings() map[string]SecretMapping {
 			EnvVar:    "CLOUDFLARE_API_TOKEN",
 			Required:  false,
 		},
-		"iyzico_api_key": {
-			VaultPath: "example/payment-providers/iyzico",
+		"examplepay_api_key": {
+			VaultPath: "example/payment-providers/examplepay",
 			VaultKey:  "api-key",
-			EnvVar:    "IYZICO_API_KEY",
+			EnvVar:    "EXAMPLEPAY_API_KEY",
 			Required:  false,
 		},
-		"iyzico_secret_key": {
-			VaultPath: "example/payment-providers/iyzico",
+		"examplepay_secret_key": {
+			VaultPath: "example/payment-providers/examplepay",
 			VaultKey:  "secret-key",
-			EnvVar:    "IYZICO_SECRET_KEY",
+			EnvVar:    "EXAMPLEPAY_SECRET_KEY",
 			Required:  false,
 		},
 		"docusign_integration_key": {

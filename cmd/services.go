@@ -19,10 +19,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/dogukanturhal/platform-shared/hooks"
 
+	"github.com/dogukanturhal/falcon-id/internal/middleware"
 	"github.com/dogukanturhal/falcon-id/internal/models"
 	"github.com/dogukanturhal/falcon-id/internal/repositories"
 	"github.com/dogukanturhal/falcon-id/internal/security"
 	"github.com/dogukanturhal/falcon-id/internal/services"
+	"github.com/dogukanturhal/falcon-id/internal/tenantstatus"
 	"github.com/dogukanturhal/falcon-id/pkg/config"
 	"github.com/dogukanturhal/falcon-id/pkg/crypto"
 	"github.com/dogukanturhal/falcon-id/pkg/hibp"
@@ -34,48 +36,72 @@ import (
 
 // Services holds all service instances.
 type Services struct {
-	Audit           *services.AuditService
-	Token           *services.TokenService
-	Role            *services.RoleService
-	Permission      *services.PermissionService
-	User            *services.UserService
-	UserPreferences *services.UserPreferencesService
-	LDAP            *services.LDAPService
-	ADSync          *services.ADSyncService
-	Auth            *services.AuthService
-	SocialAuth      *services.SocialAuthService
-	Email           *services.EmailService
-	MFA             *services.MFAService
-	MFAEnrollment   *services.MFAEnrollmentService
-	PasswordReset   *services.PasswordResetService
-	PasswordPolicy  *services.PasswordPolicyService
-	RateLimit       *services.RateLimitService
-	IPRule          *services.IPRuleService
-	APIKey          *services.APIKeyService
-	ServiceAccount  *services.ServiceAccountService
-	OAuthProvider   *services.OAuthProviderService
-	SAML            *services.SAMLService
-	SAMLSP          *services.SAMLSPService
-	SAMLMetadata    *services.SAMLMetadataService
-	SCIM            *services.SCIMService
-	Group           *services.GroupService
-	Organization    *services.OrganizationService
-	Impersonation   *services.ImpersonationService
-	Webhook         *services.WebhookService
-	Device          *services.DeviceService
-	Recovery        *services.RecoveryService
-	PushMFA         *services.PushMFAService
-	MagicLink       *services.MagicLinkService
-	Invitation      *services.InvitationService
-	Consent         *services.ConsentService
-	Risk            *services.RiskService
-	OPA             *services.OPAService
-	Authorization   *services.AuthorizationService
-	AuthzEngine     services.AuthorizationEngine
-	Tenant          *services.TenantService
-	AppAccess       *services.AppAccessService
-	Realm           *services.RealmService
-	ConfigProvider  *services.ConfigProvider
+	Audit            *services.AuditService
+	Token            *services.TokenService
+	Role             *services.RoleService
+	SoD              *services.SoDService
+	SoDReevaluator   *services.SoDReevaluator
+	Permission       *services.PermissionService
+	RoleTemplate     *services.RoleTemplateService
+	User             *services.UserService
+	UserPreferences  *services.UserPreferencesService
+	LDAP             *services.LDAPService
+	ADSync           *services.ADSyncService
+	Auth             *services.AuthService
+	SocialAuth       *services.SocialAuthService
+	Email            *services.EmailService
+	MFA              *services.MFAService
+	MFAEnrollment    *services.MFAEnrollmentService
+	PasswordReset    *services.PasswordResetService
+	PasswordPolicy   *services.PasswordPolicyService
+	RateLimit        *services.RateLimitService
+	IPRule           *services.IPRuleService
+	APIKey           *services.APIKeyService
+	TenantAPIKey     *services.TenantAPIKeyService // nil unless DEVELOPER_KEYS_ENABLED and wired
+	ServiceAccount   *services.ServiceAccountService
+	OAuthProvider    *services.OAuthProviderService
+	SAML             *services.SAMLService
+	SAMLSP           *services.SAMLSPService
+	SAMLMetadata     *services.SAMLMetadataService
+	SCIM             *services.SCIMService
+	AccessTerminator *services.UserAccessTerminator
+	Group            *services.GroupService
+	Organization     *services.OrganizationService
+	Impersonation    *services.ImpersonationService
+	Webhook          *services.WebhookService
+	Device           *services.DeviceService
+	Recovery         *services.RecoveryService
+	PushMFA          *services.PushMFAService
+	MagicLink        *services.MagicLinkService
+	Invitation       *services.InvitationService
+	Consent          *services.ConsentService
+	Risk             *services.RiskService
+	OPA              *services.OPAService
+	Authorization    *services.AuthorizationService
+	AuthzEngine      services.AuthorizationEngine
+	Tenant           *services.TenantService
+	AppAccess        *services.AppAccessService
+	Realm            *services.RealmService
+	ConfigProvider   *services.ConfigProvider
+	// Entitlement is the fail-closed tenant module entitlement source
+	// (the product roadmap §4.1) backing GET /api/v1/tenant/entitlements,
+	// PUT/GET /internal/v1/tenants/{id}/module-entitlements, and the
+	// example.tenant.modules.sync Kafka consumer
+	// (internal/entitlementsync).
+	Entitlement *services.TenantEntitlementService
+
+	// TenantStatusRepo / TenantStatusGate back tenant suspension enforcement
+	// (R1-GAPS row 27, internal/tenantstatus): the repo applies
+	// example.tenant.status events, the gate is the cached read side.
+	TenantStatusRepo *tenantstatus.Repository
+	TenantStatusGate *tenantstatus.Gate
+	// AcmeAppRoleProvisioner creates the AcmeApp role catalog for a
+	// tenant. Wired into signup (see postSignupProvisioner above) and also
+	// exposed here so the admin backfill endpoint
+	// (the platform role-backfill endpoint) can provision the
+	// same catalog for pre-existing tenants without re-deriving a divergent
+	// role list.
+	AcmeAppRoleProvisioner *services.AcmeAppRoleProvisioner
 	// Product & licensing
 	Product         *services.ProductService
 	License         *services.LicenseService
@@ -96,23 +122,29 @@ type Services struct {
 	RegistrationPolicy *services.RegistrationPolicyService
 	StaleAppDetection  *services.StaleAppDetectionService
 	// Identity & access
-	Delegation         *services.DelegationService
-	TempAccessPass     *services.TempAccessPassService
-	GuestUser          *services.GuestUserService
-	JITAccess          *services.JITAccessService
-	AccessReview       *services.AccessReviewService
-	EmailDomain        *services.EmailDomainService
-	TenantBranding     *services.TenantBrandingService
-	TenantQuota        *services.TenantQuotaService
-	IDPRouting         *services.IDPRoutingService
-	IDPTenantOverride  *services.IDPTenantOverrideService
-	WebAuthn           *services.WebAuthnService
-	TokenExchange      *services.TokenExchangeService
-	ManagedIdentity    *services.ManagedIdentityService
-	SCP                *services.SCPService
-	Signup             *services.SignupService
-	RealmFederation    *services.RealmFederationService
-	RealmDBProvisioner *services.RealmDBProvisioner
+	Delegation     *services.DelegationService
+	TempAccessPass *services.TempAccessPassService
+	GuestUser      *services.GuestUserService
+	JITAccess      *services.JITAccessService
+	// PlatformJIT — R1 platform plane: JIT elevation + break-glass
+	// (iam_platform_roles / iam_jit_elevations, migration 0016).
+	PlatformJIT            *services.PlatformJITService
+	PlatformAuth           *services.PlatformAuthority
+	AccessReview           *services.AccessReviewService
+	EmailDomain            *services.EmailDomainService
+	TenantBranding         *services.TenantBrandingService
+	TenantQuota            *services.TenantQuotaService
+	IDPRouting             *services.IDPRoutingService
+	IDPTenantOverride      *services.IDPTenantOverrideService
+	WebAuthn               *services.WebAuthnService
+	Witness                *services.WitnessService
+	TokenExchange          *services.TokenExchangeService
+	ManagedIdentity        *services.ManagedIdentityService
+	SCP                    *services.SCPService
+	Signup                 *services.SignupService
+	SignupTrialProvisioner *services.PostSignupProvisioner
+	RealmFederation        *services.RealmFederationService
+	RealmDBProvisioner     *services.RealmDBProvisioner
 	// Platform & compliance
 	ConditionalAccess      *services.ConditionalAccessService
 	CompliancePolicyEngine *services.CompliancePolicyEngine
@@ -127,14 +159,20 @@ type Services struct {
 	// credential stuffing, MFA fatigue) lives behind Redis streams and
 	// is wired separately when that infra is up. Pipeline may be nil;
 	// the GET/POST/PUT query endpoints still serve from the repo.
-	ITDR                *services.ITDRService
-	RoutingWebhook      *services.RoutingWebhookService
-	SpiceDBReconciler   *services.SpiceDBReconciler
-	SeatQuotaReconciler *services.SeatQuotaReconciler
-	TenantBootstrap     *services.TenantBootstrapService
-	Discover            *services.DiscoverService
-	AuthHooks           *services.AuthHooksService
-	ProvisioningStatus  *services.ProvisioningStatusService
+	ITDR                    *services.ITDRService
+	RoutingWebhook          *services.RoutingWebhookService
+	SpiceDBReconciler       *services.SpiceDBReconciler
+	RoleRevokeDrainer       *services.RoleRevokeDrainer
+	SeatQuotaReconciler     *services.SeatQuotaReconciler
+	TemplateRoleProvisioner *services.TemplateRoleProvisioner
+	ModuleAccess            *services.ModuleAccessProvisioner
+	EmployeeAccess          *services.EmployeeAccessService
+	EmployeeAccessExpiry    *services.EmployeeAccessExpiryWorker
+	HREmploymentSync        *services.HREmploymentSyncService
+	TenantBootstrap         *services.TenantBootstrapService
+	Discover                *services.DiscoverService
+	AuthHooks               *services.AuthHooksService
+	ProvisioningStatus      *services.ProvisioningStatusService
 	// Identifier-first realm discovery
 	RealmDiscovery *services.RealmDiscoveryService
 	// Host-based tenant discovery — host→tenant resolution for the
@@ -146,6 +184,11 @@ type Services struct {
 	// (PATCH /api/v1/onboarding/slug). nil when TENANT_MANAGEMENT_INTERNAL_URL
 	// or outbound S2S creds are unset — route registration short-circuits.
 	OnboardingSlug *services.OnboardingSlugService
+
+	// TenantWorkspaceName replaces the signup placeholder workspace name
+	// (S2S rename from business + platform-admin backfill); never nil.
+	TenantWorkspaceName *services.TenantWorkspaceNameService
+
 	// OnboardingStatus backs the onboarding wizard's entry-time re-entry
 	// guard (GET /api/v1/auth/onboarding/status), reading
 	// slug_confirmed_at from tenant-management. Same nil-safe posture as
@@ -206,6 +249,17 @@ type Services struct {
 	// KeyManager — DB-persisted signing keys with AES-256-GCM at-rest encryption.
 	// Replaces the ephemeral JWTKeyProvider for production deployments (Keycloak/Auth0 pattern).
 	KeyManager *keys.KeyManager
+	// OriginRegistry is the Stage 3 dynamic, tenant-registry-derived CORS/
+	// CSRF origin set (internal/middleware.DynamicOriginRegistry), refreshed
+	// in the background off tenant-management's tenant list + per-tenant
+	// app_host (platform-core !80). Wired into middleware.CORSWithRegistry
+	// (cmd/routes.go) and CSRFMiddleware.SetOriginRegistry (cmd/handlers.go).
+	// Nil-safe throughout: nil (or a lister-less registry, when
+	// TENANT_MANAGEMENT_INTERNAL_URL/outbound OAuth creds are unset)
+	// contributes nothing, and CORS/CSRF fall back to their existing
+	// static allowlists exactly as before Stage 3 — see
+	// DynamicOriginRegistry's fail-closed doc comment.
+	OriginRegistry *middleware.DynamicOriginRegistry
 }
 
 // initServices initializes all services and wires dependencies.
@@ -236,6 +290,15 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// Core services
 	auditService := services.NewAuditService(repos.Token, infra.DB.Pool)
 	tokenService := services.NewTokenService(cfg, repos.Token, repos.User)
+	// OPS_STRICT_PLATFORM_ROLES (default off): platform-admin authority comes
+	// from iam_platform_roles instead of tenant membership / legacy tenant
+	// roles. Off = every path below is unchanged.
+	platformAuthority := services.NewPlatformAuthority(cfg.OpsStrictPlatformRoles, cfg.OpsBreakGlassEmail, repos.PlatformAuthority)
+	tokenService.SetPlatformAuthority(platformAuthority)
+	middleware.SetPlatformAuthority(platformAuthority)
+	if cfg.OpsStrictPlatformRoles {
+		logger.Warn("OPS_STRICT_PLATFORM_ROLES is ON: platform-admin authority now comes from iam_platform_roles only")
+	}
 	tokenService.SetJWTKeyProvider(jwtKeyProvider)
 	if keyManager != nil {
 		tokenService.SetKeyManager(keyManager)
@@ -247,8 +310,26 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// tokenService.RevokeAllUserOAuthTokens.
 	tokenService.SetOAuthClientRepository(repos.OAuthClient)
 	roleService := services.NewRoleService(repos.Role, repos.Permission, auditService)
+	if cfg.DeveloperKeysEnabled {
+		// WO#20: refuse API-key-forbidden grants to roles active tenant API keys hold.
+		roleService.SetAPIKeyRoleUsage(repos.APIKey)
+	}
 	permissionService := services.NewPermissionService(repos.Permission, auditService)
+	// ADR-A10 SoD (Separation of Duties) evaluation + rule matrix
+	// (23-authorization-rbac-abac-rebac.md §5.2/§8.3). Warn mode only in
+	// R1 — see sod_service.go doc comment.
+	sodService := services.NewSoDService(repos.SoD, repos.SoD, repos.Permission)
+	// Continuous SoD re-evaluation (spec 23 5.2): daily full pass (started in
+	// startBackgroundTasks, leader-locked) + on rule change. Warn mode only.
+	sodReevaluator := services.NewSoDReevaluator(repos.SoD, repos.Permission, auditService, infra.DB.Pool)
+	sodService.SetRuleChangeHook(sodReevaluator.ReevaluateTenantAsync)
 	userService := services.NewUserService(cfg, repos.User, repos.Role, tokenService, auditService)
+	// example.iam.user.* lifecycle events -> Kafka -> business HR employee sync (RHR-B4).
+	wireIAMUserEventPublisher(cfg, userService)
+	// ADR-A10 SoD: evaluate on every user role-assignment write (§5.2 —
+	// "evaluation on EVERY role-assignment write"). SetUserRoles is the
+	// primary such write path (Phase 2 team-management "set roles" UI).
+	userService.SetSoDService(sodService)
 	// Per-user opaque preferences (iam_users.preferences JSONB — migration
 	// 0003). Service owns the registry of valid product slugs + JSON merge
 	// patch logic; handler at /api/v1/users/me/preferences exposes the
@@ -273,10 +354,45 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 
 	configProvider := initConfigProvider(cfg, repos, infra, tokenService)
 
+	// Feed ConfigProvider.FrontendURL a trustworthy per-tenant source:
+	// tenant-management's app_host (platform-core !80, not yet merged —
+	// see buildTenantManagementAppHostHTTPClient's doc comment). nil when
+	// creds/URL are missing or the client can't be built — FrontendURL's
+	// existing local-cache -> Redis -> DB -> static-default chain is
+	// unchanged in that case (SetAppHostResolver no-ops on a nil resolver).
+	if appHostHTTP := buildTenantManagementAppHostHTTPClient(cfg, logger.Log); appHostHTTP != nil {
+		appHostReader := newHTTPTenantManagementAppHostReader(cfg.TenantManagementInternalURL, appHostHTTP)
+		configProvider.SetAppHostResolver(appHostReader)
+		logger.Info("ConfigProvider.FrontendURL wired to tenant-management app_host resolution")
+	} else {
+		logger.Warn("ConfigProvider.FrontendURL app-host resolver disabled: outbound S2S client to tenant-management unavailable; frontend_url stays local-cache/Redis/DB/static-default only")
+	}
+
+	// Stage 3: dynamic, tenant-registry-derived CORS/CSRF origin set. Built
+	// from a SEPARATE app-host reader instance (its own HTTP client) than
+	// the one just wired into configProvider above — decoupling keeps a
+	// slow/broken origin-list refresh from ever affecting FrontendURL
+	// resolution, and vice versa. See buildTenantManagementOriginLister's
+	// doc comment for the fail-closed contract and why the registry is
+	// always constructed (never nil), even when its underlying lister is
+	// nil.
+	originLister := buildTenantManagementOriginLister(cfg, logger.Log)
+	originRegistry := middleware.NewDynamicOriginRegistry(originLister, 5*time.Minute, 10*time.Second, logger.Log)
+	if originLister == nil {
+		logger.Warn("Stage 3 dynamic CORS/CSRF origin registry has no tenant-management lister configured; CORS/CSRF stay on their static allowlists only")
+	}
+
 	wireTokenServiceRedis(tokenService, authService, userService, roleService, socialAuthService, repos, infra, cfg)
 
 	// Email and MFA services
 	emailService := services.NewEmailService(cfg)
+	// Without this, EmailService.ResolveFrontendURL's configProvider branch
+	// is always nil and every emitted link/sender silently uses the static
+	// FRONTEND_URL env var regardless of tenant — this wiring was missing
+	// entirely before this change, so ConfigProvider.FrontendURL (and by
+	// extension the app-host resolution wired above) was dead code from
+	// EmailService's perspective.
+	emailService.SetConfigProvider(configProvider)
 
 	// Email transactional outbox + drainer for NON-CREDENTIAL mail.
 	// Behind FALCON_ID_EMAIL_OUTBOX_ENABLED (default false) so the
@@ -305,6 +421,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	mfaService := services.NewMFAService(cfg, repos.User, repos.MFA, emailService, ldapService)
 	passwordResetService := services.NewPasswordResetService(cfg, repos.User, repos.Token, emailService, auditService)
 	passwordResetService.SetSessionRepo(repos.Session)
+	passwordResetService.SetOAuthRevoker(tokenService)
 	passwordPolicyService := services.NewPasswordPolicyService(repos.PasswordPolicy)
 	rateLimitService := services.NewRateLimitService(repos.RateLimit)
 
@@ -349,6 +466,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	ipRuleService := services.NewIPRuleService(repos.IPRule)
 	apiKeyService := services.NewAPIKeyService(repos.APIKey)
 	serviceAccountService := services.NewServiceAccountService(repos.ServiceAccount, repos.Role, cfg)
+	serviceAccountService.SetTokenSigner(tokenService)
 
 	oauthProviderService, err := services.NewOAuthProviderService(repos.OAuthClient, repos.User, cfg)
 	if err != nil {
@@ -391,9 +509,39 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// row is cut and the rotated token re-bound to it. Without this
 	// wiring the OAuth provider falls back to legacy behaviour
 	// (preserves IdpSessionID verbatim, surface symptom: user sees
-	// stale OS / country attribution in accounts.hexxlock.com Active
+	// stale OS / country attribution in accounts.example.com Active
 	// Sessions UI). See OAuthProviderService.sessionContextSvc doc.
 	oauthProviderService.SetSessionContextService(authService)
+
+	// Tenant suspension enforcement (R1-GAPS row 27). One shared gate (short-TTL
+	// cache over iam_tenant_status; fails OPEN for unknown tenants) is consulted
+	// by login, session creation, token issue/refresh, bearer-token validation
+	// and the IdP SSO cookie path. Populated by the example.tenant.status
+	// consumer started in background.go.
+	tenantStatusRepo := tenantstatus.NewRepository(infra.DB.Pool)
+	tenantStatusGate := tenantstatus.NewGate(tenantStatusRepo, 0, logger.Log)
+	tokenService.SetTenantSuspensionChecker(tenantStatusGate)
+	authService.SetTenantSuspensionChecker(tenantStatusGate)
+	oauthProviderService.SetTenantSuspensionChecker(tenantStatusGate)
+	oauthProviderService.SetPlatformAuthority(platformAuthority)
+	if infra.SpiceDBClient != nil {
+		// Operator token exchange (audience hexxlock-ops); stays refused until
+		// OPS_OPERATOR_EXCHANGE_CLIENT_IDS lists a client.
+		oauthProviderService.SetOperatorExchange(infra.SpiceDBClient)
+	}
+
+	// WO#20 tenant API keys (developer access); nil while the flag is off.
+	tenantAPIKeyService := buildTenantAPIKeyService(cfg, infra, repos, auditService, oauthProviderService, tenantStatusGate, logger.Log)
+
+	// RFC 8693 tenant token exchange (target_tenant_id): an external
+	// accountant exchanges their token for a short-lived client-tenant token,
+	// gated on an active iam_user_memberships row. Per-user rate limit via
+	// Redis when available (a typed-nil limiter must not reach the interface).
+	if infra.RateLimiter != nil {
+		oauthProviderService.SetTenantExchange(repos.UserMembership, infra.RateLimiter)
+	} else {
+		oauthProviderService.SetTenantExchange(repos.UserMembership, nil)
+	}
 	logger.Info("OAuth refresh-rotation session-drift detection enabled (cuts new iam_sessions row on country/OS-class drift)")
 
 	// Wire IdP-session AuthTime lookup so /oauth/token-minted tokens
@@ -425,6 +573,9 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 
 	scimService := services.NewSCIMService(repos.SCIM, repos.User, repos.Role, cfg)
 	groupService := services.NewGroupService(repos.Group, repos.User, repos.Role)
+	// ADR-A10 SoD: a group's role set change affects every member's
+	// effective permissions — see GroupService.SetRoles.
+	groupService.SetSoDService(sodService)
 
 	// Wire GroupService as the subject-claims provider so OIDC id_tokens
 	// and (scope-gated) access_tokens emit `groups` and `roles`. Without
@@ -518,13 +669,21 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// Initialize OPA service
 	opaService, err := services.NewOPAService(cfg)
 	if err != nil {
+		if cfg.UseABAC {
+			// SECURITY: ABAC is on but its embedded policies are broken: fail boot loudly.
+			logger.Fatal("Failed to initialize OPA service while USE_ABAC is enabled", zap.Error(err))
+		}
 		logger.Warn("Failed to initialize OPA service, ABAC will be unavailable", zap.Error(err))
+		opaService = nil
 	} else {
-		logger.Info("OPA service initialized", zap.String("policy_path", cfg.OPAPolicyPath))
+		logger.Info("OPA service initialized")
 	}
 
 	// Initialize authorization service
 	authorizationService := services.NewAuthorizationService(repos.Permission, repos.User, opaService, auditService)
+
+	authorizationService.SetTenantSuspensionChecker(tenantStatusGate)
+	authorizationService.SetSoDViolationLister(sodService)
 
 	// Wire SpiceDB to authorization service
 	if infra.SpiceDBClient != nil {
@@ -614,7 +773,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// the OAuth 2.1 /oauth/token mint path (via oauthProviderService) so every token
 	// issuance path carries the `products` claim. Without the OAuth wiring, tokens
 	// from authorization_code + refresh_token + token-exchange grants silently
-	// dropped the claim — downstream product-entitlement middleware (e.g. mearax
+	// dropped the claim — downstream product-entitlement middleware (e.g. acmeweb
 	// productSlug gate in falcon-id-client) then had no source for /app/* gating
 	// decisions and bounced every user to /unauthorized.
 	productSubscriptionResolver := services.NewProductSubscriptionResolver(repos.ProductInstance, repos.Product)
@@ -671,11 +830,40 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 
 	guestUserService := services.NewGuestUserService(repos.GuestUser, repos.Role, auditService)
 
-	// JITAccessService SpiceDB interface uses uuid-based relationship methods,
-	// incompatible with pkg/spicedb.Client's string-based signature. Pass nil.
+	// JITAccessService's SpiceDB interface matches *spicedb.Client.WriteUserRoleUntil/
+	// DeleteUserRole directly (uuid-based role#member writes) so the real client
+	// satisfies it with no adapter. SpiceDB is the actual enforcement boundary
+	// for a JIT grant — AuthorizationEngine.CheckPermission is SpiceDB-only — so
+	// this must never be nil in an environment that serves traffic.
 	jitAccessService := services.NewJITAccessService(
 		repos.JITAccess,
-		nil, // jitSpiceDBClient — interface incompatible with pkg/spicedb.Client
+		repos.JITEligible,
+		repos.StepUpVerification,
+		repos.User,
+		infra.SpiceDBClient,
+		auditService,
+		logger.Log,
+	)
+	var revokeClient interface {
+		DeleteUserRole(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (string, error)
+	}
+	if infra.SpiceDBClient != nil {
+		revokeClient = infra.SpiceDBClient
+	}
+	roleRevokeDrainer := services.NewRoleRevokeDrainer(infra.DB.Pool, revokeClient, logger.Log)
+	userService.SetRoleRevokeDrainer(roleRevokeDrainer)
+	jitAccessService.SetRoleRevokeDrainer(roleRevokeDrainer)
+
+	// PlatformJITService — R1 platform plane: JIT elevation + break-glass.
+	// infra.SpiceDBClient (*spicedb.Client) satisfies platformSpiceDBClient
+	// structurally via WritePlatformElevation/DeletePlatformElevation
+	// (pkg/spicedb/platform.go) — no adapter needed, same pattern as
+	// jitAccessService above. repos.PlatformElevation itself satisfies
+	// platformUserTenantLookup via GetUserTenantID.
+	platformJITService := services.NewPlatformJITService(
+		repos.PlatformElevation,
+		repos.PlatformElevation,
+		infra.SpiceDBClient,
 		auditService,
 		logger.Log,
 	)
@@ -753,6 +941,27 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		logger.Info("CAEService wired to OAuth/Auth/MFA/Role/PasswordReset services (continuous access evaluation)")
 	}
 
+	// Single access-termination path (sessions, OAuth tokens, IdP SSO cookies,
+	// JWT blacklist, BCL, CAE). Redis-backed deps are passed only when present
+	// so the terminator's nil checks see true nil interfaces. BCL and the CAEP
+	// emitter are attached later (handlers.go / emitter init).
+	var (
+		termSSO       services.UserAccessTerminatorSSOCache
+		termBlacklist services.UserAccessTerminatorBlacklist
+	)
+	if infra.SessionCache != nil {
+		termSSO = infra.SessionCache
+	}
+	if infra.TokenBlacklist != nil {
+		termBlacklist = infra.TokenBlacklist
+	}
+	accessTerminator := services.NewUserAccessTerminator(repos.Session, tokenService, termSSO, termBlacklist, nil, caeService, services.UserBlacklistTTL(cfg), logger.Log)
+	userService.SetAccessTerminator(accessTerminator)
+	authService.SetAccessTerminator(accessTerminator)
+	mfaService.SetAccessTerminator(accessTerminator)
+	passwordResetService.SetAccessTerminator(accessTerminator)
+	scimService.SetAccessTerminator(accessTerminator)
+
 	// Phase 2 (talon-service-tokens) — wire the audit emitter into
 	// OAuthProviderService so ClientCredentialsGrant publishes a
 	// SecurityCategoryAuthentication event for every machine-token
@@ -768,8 +977,9 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// pattern. Nil-safe — when EmailService isn't configured the
 	// notifier's internal IsConfigured guard short-circuits and the
 	// underlying CAE/DB writes remain authoritative.
+	var securityNotifier *services.SecurityNotificationService
 	if emailService != nil {
-		securityNotifier := services.NewSecurityNotificationService(emailService, nil)
+		securityNotifier = services.NewSecurityNotificationService(emailService, nil)
 		authService.SetSecurityNotificationService(securityNotifier)
 		mfaService.SetSecurityNotificationService(securityNotifier)
 		logger.Info("SecurityNotificationService wired to Auth + MFA services (Phase C — out-of-band email on security events)")
@@ -827,6 +1037,44 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		authService.SetWebAuthnService(webAuthnService)
 	}
 
+	// ZTNA enrollment witness state + TOTP fallback (migration 0039). The
+	// shared TOTP replay claim and the witness state both live in Redis; with
+	// no Redis the witness endpoints fail closed (503).
+	var witnessService *services.WitnessService
+	if witnessRedis := witnessRedisClient(infra); witnessRedis != nil {
+		mfaService.SetTOTPReplayStore(witnessRedis)
+		if repos.WebAuthn != nil {
+			var policy witnessPolicySource = allowAllWitnessPolicy{}
+			if repos.Realm != nil {
+				policy = repos.Realm
+			}
+			witnessService = services.NewWitnessService(services.WitnessServiceDeps{
+				Redis:       witnessRedis,
+				Users:       repos.User,
+				Passkeys:    repos.WebAuthn,
+				Policy:      policy,
+				MFA:         mfaService,
+				Minter:      tokenService,
+				Audit:       auditService,
+				Notifier:    securityNotifier,
+				TOTPEnabled: cfg.WitnessTOTPEnabled,
+				Logger:      logger.Log,
+			})
+			logger.Info("Device witness service wired", zap.Bool("totp_fallback_enabled", cfg.WitnessTOTPEnabled))
+		}
+	}
+	if repos.Realm != nil && realmService != nil {
+		realmService.SetWitnessPolicyRepository(repos.Realm)
+		realmService.SetSessionPolicyRepository(repos.Realm)
+	}
+	if repos.Realm != nil && infra.SessionCache != nil {
+		realmRepo := repos.Realm
+		infra.SessionCache.SetRealmCapResolver(func(ctx context.Context, tenantID uuid.UUID) (time.Duration, bool, error) {
+			secs, ok, err := realmRepo.SessionAbsoluteTTLSecondsByTenant(ctx, tenantID)
+			return time.Duration(secs) * time.Second, ok, err
+		})
+	}
+
 	// TokenExchangeService requires GenerateServiceToken which TokenService doesn't
 	// implement. Pass nil; the service issues tokens via its own JWT generation
 	// path when the token service is absent.
@@ -849,6 +1097,10 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 
 	// Signup service — uses adapters defined in signup_adapters.go and
 	// tenant_management_registrar.go
+	signupOTPKey, err := services.DeriveSignupOTPKey(cfg.TokenHashSalt)
+	if err != nil {
+		logger.Fatal("Failed to derive signup OTP key", zap.Error(err))
+	}
 	signupService := services.NewSignupService(
 		repos.SignupRequest,
 		emailService,
@@ -858,6 +1110,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		&signupUserLookupAdapter{repo: repos.User},
 		cfg.ConsumerEmailDomain,
 		cfg.SignupDefaultPlanCode,
+		signupOTPKey,
 	)
 
 	realmFederationService := services.NewRealmFederationService(repos.RealmFederation, auditService)
@@ -935,7 +1188,32 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	if infra.SpiceDBClient != nil {
 		spiceDBReconciler = services.NewSpiceDBReconciler(infra.SpiceDBClient, infra.DB.Pool, cfg)
 		tenantBootstrapService = services.NewTenantBootstrapService(infra.SpiceDBClient)
+		// Wildcard role grants (e.g. core:parties:*) expand against the catalog.
+		tenantBootstrapService.SetPermissionCatalog(repos.Permission)
+		// Keep SpiceDB role-membership writes synchronous with the team
+		// role-assignment path (UserService.SetUserRoles) instead of relying
+		// solely on spiceDBReconciler's scheduled pass (24h in production).
+		userService.SetSpiceDBClient(infra.SpiceDBClient)
 	}
+
+	// Role templates (the product roadmap §4.1): module-published versioned
+	// starter-role catalogs, distinct from the hardcoded AcmeApp
+	// catalog (services.AcmeAppRoleProvisioner, wired further below).
+	// templateRoleProvisioner materializes/reconciles tenant roles from
+	// iam_role_templates; wired into permissionService (manifest validation
+	// on POST /internal/v1/permissions/register) and into
+	// provisioningConsumer (the "module granted" trigger — see
+	// services.WithTemplateRoleProvisioner). tenantBootstrapService may be
+	// nil (SpiceDB relation sync then skipped), same nil-safety as above.
+	roleTemplateValidator := services.NewRoleTemplateValidator(repos.RoleTemplate)
+	templateRoleProvisioner := services.NewTemplateRoleProvisioner(
+		repos.Role,
+		repos.RoleTemplate,
+		repos.Permission,
+		tenantBootstrapService,
+	)
+	permissionService.SetRoleTemplateSupport(repos.RoleTemplate, roleTemplateValidator, templateRoleProvisioner)
+	roleTemplateService := services.NewRoleTemplateService(repos.RoleTemplate, permissionService, templateRoleProvisioner)
 
 	// Discover service — wires all repos needed for Home Realm Discovery
 	idpTenantOverrideForDiscover := services.NewIDPTenantOverrideService(repos.IDPTenantOverride, repos.IDP)
@@ -1010,6 +1288,11 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		logger.Log.Warn("onboarding status endpoint disabled: outbound S2S client to tenant-management unavailable")
 	}
 
+	// Placeholder workspace name ("My Company") replacement: S2S rename for
+	// business's first-legal-entity hook, mirror of saved names into
+	// tenant-management, and the platform-admin backfill.
+	tenantWorkspaceNameService := buildTenantWorkspaceNameService(cfg, repos.Tenant, logger.Log)
+
 	// Auth hooks service — backed by hook engine from platform-services/shared
 	hookEngine := hooks.NewHookEngine(logger.Log)
 	authHooksService := services.NewAuthHooksService(hookEngine, logger.Log)
@@ -1055,6 +1338,14 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		)
 	}
 
+	// Employee-class (ESS) seats never count against the seat quota (R-HR WP-21): the quota
+	// paths ask the membership ledger, and the expiry worker switches lapsed accounts off.
+	userService.SetSeatFreeChecker(repos.UserMembership)
+	userService.SetSeatMembershipLifecycle(repos.UserMembership)
+	employeeAccessService := services.NewEmployeeAccessService(repos.User, repos.UserMembership, tenantBootstrapService, logger.Log)
+	employeeAccessExpiry := services.NewEmployeeAccessExpiryWorker(infra.DB.Pool, repos.UserMembership, employeeAccessService, cfg.EmployeeAccessExpiryInterval)
+	hrEmploymentSync := services.NewHREmploymentSyncService(repos.HREmploymentSync, repos.User, userService, repos.UserMembership, templateRoleProvisioner, tenantBootstrapService)
+
 	// GAP 8: Product manifest → Permission auto-registration
 	productService.SetPermissionRegistrar(permissionService)
 	logger.Info("Product permission auto-registration enabled")
@@ -1064,8 +1355,9 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	logger.Info("HRD login discovery enabled for email-based tenant resolution")
 
 	// GAP 2: Module entitlement → Permission filtering
+	var entitlementChecker services.ModuleEntitlementChecker
 	if repos.ProductInstance != nil && repos.Product != nil {
-		entitlementChecker := services.NewDefaultModuleEntitlementChecker(repos.ProductInstance, repos.Product)
+		entitlementChecker = services.NewDefaultModuleEntitlementChecker(repos.ProductInstance, repos.Product)
 		services.SetEngineModuleEntitlementChecker(authorizationEngine, entitlementChecker)
 		permissionService.SetModuleEntitlementChecker(entitlementChecker)
 		roleService.SetModuleEntitlementChecker(entitlementChecker)
@@ -1088,14 +1380,14 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	//
 	// dbProvisioner/spiceDB are nil for now: no product currently requires
 	// per-tenant DB provisioning or SpiceDB relationship writes for its
-	// entitlement to be meaningful. Mearax in particular is shared-schema —
+	// entitlement to be meaningful. AcmeWeb in particular is shared-schema —
 	// the one existing exampletenant iam_product_instances row has all
 	// database_* columns null (see the GitOps repository
-	// migration-bundle-mearax-product-and-hexxlock-entitlement.yaml, which
+	// migration-bundle-acmeweb-product-and-hexxlock-entitlement.yaml, which
 	// documents the same reasoning). With both nil, stepCreate/
 	// stepConfigureAuth/stepRegisterService each no-op their real work — but
 	// Reconcile() only ever advances ONE state per call (verified against a
-	// real Postgres in internal/services/mearax_entitlement_e2e_test.go); a
+	// real Postgres in internal/services/acmeweb_entitlement_e2e_test.go); a
 	// fresh "pending" instance still has to pass through creating→
 	// migrating→seeding→configuring_auth→registering_service→active, one
 	// tick at a time. A product that DOES need real per-tenant DB
@@ -1103,7 +1395,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// safely rely on this orchestrator.
 	//
 	// ReconcileInterval is set to 5s (default is 30s) specifically so a
-	// self-service signup's mearax entitlement converges to "active" in
+	// self-service signup's acmeweb entitlement converges to "active" in
 	// single-digit seconds after the async Reconcile() kicked off by
 	// ProvisioningConsumer.HandleSubscriptionActivated advances it past the
 	// first state — at the 30s default, the full 5-step walk could take up
@@ -1128,7 +1420,11 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// would use (Provision → async Reconcile). Reused below by the
 	// post-signup hook so self-service signup never fabricates an "active"
 	// row directly.
-	provisioningConsumer := services.NewProvisioningConsumer(productInstanceService, provisioningOrchestrator)
+	provisioningConsumer := services.NewProvisioningConsumer(
+		productInstanceService,
+		provisioningOrchestrator,
+		services.WithTemplateRoleProvisioner(templateRoleProvisioner, repos.Product),
+	)
 
 	// GAP 6: DNS domain verification worker
 	domainVerificationWorker := services.NewDomainVerificationWorker(repos.EmailDomainRegistry, nil)
@@ -1174,7 +1470,26 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		userRepo:        repos.User,
 		tenantBootstrap: tenantBootstrapService,
 	})
-	// Grant the tenant's Mearax product entitlement on signup completion —
+	// Wire the AcmeApp marketing role model provisioner: creates
+	// Owner/Admin/Marketing Manager/Editor/Analyst/Billing for the new
+	// tenant and assigns the founding user Owner, in addition to the
+	// org_admin grant above. Without this, only today's manually-seeded
+	// tenants have real marketing roles and every future signup is stuck
+	// with org_admin's flat all-or-nothing team permissions.
+	//
+	// Constructed once and also returned on the Services struct (below) so
+	// the same instance backs the admin backfill endpoint
+	// (the platform role-backfill endpoint) that provisions the
+	// role catalog for tenants that existed before this provisioner was
+	// wired into signup - see cmd/handlers.go.
+	acmeappRoleProvisioner := services.NewAcmeAppRoleProvisioner(
+		repos.Role,
+		repos.Permission,
+		repos.User,
+		tenantBootstrapService,
+	)
+	postSignupProvisioner.SetAcmeAppRoleProvisioner(acmeappRoleProvisioner)
+	// Grant the tenant's AcmeWeb product entitlement on signup completion —
 	// otherwise every self-service tenant gets a tenant + user but no
 	// iam_product_instances row, and its first login 403s at
 	// /unauthorized?reason=product_not_entitled (falcon-id-client
@@ -1182,7 +1497,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// exclusively from ACTIVE iam_product_instances rows). Routed through
 	// provisioningConsumer so self-service signup uses the identical
 	// pending→reconcile pipeline a billing webhook would use.
-	postSignupProvisioner.SetProductEntitlementProvisioner(provisioningConsumer, models.WellKnownProductMearax)
+	postSignupProvisioner.SetProductEntitlementProvisioner(provisioningConsumer, models.WellKnownProductAcmeWeb)
 	// Cardless trial start (business accounts only — see TrialStarter's and
 	// step 7's doc comments in signup_post_provisioner.go for why this is
 	// distinct from the product-entitlement step above, and why it stays
@@ -1200,23 +1515,6 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// both sites read cfg.SignupDefaultPlanCode exactly once, so they can't
 	// drift apart onto different plans.
 	postSignupProvisioner.SetDefaultPlanCode(cfg.SignupDefaultPlanCode)
-	// downstream post-signup provisioner (mailbox <username>@downstream.com for
-	// personal accounts; custom tenant domain for business accounts). Opt-in:
-	// only wired when the admin endpoint + operator token + consumer tenant/
-	// domain UUIDs are configured, so non-mail deployments are unaffected.
-	if hxURL := os.Getenv("DOWNSTREAM_ADMIN_URL"); hxURL != "" {
-		hxTok := os.Getenv("DOWNSTREAM_ADMIN_TOKEN")
-		hxTenant := os.Getenv("DOWNSTREAM_CONSUMER_TENANT_ID")
-		hxDomain := os.Getenv("DOWNSTREAM_CONSUMER_DOMAIN_ID")
-		if hxTok != "" && hxTenant != "" && hxDomain != "" {
-			postSignupProvisioner.SetdownstreamProvisioner(
-				services.NewdownstreamProvisioner(hxURL, hxTok, hxTenant, hxDomain, repos.User),
-			)
-			logger.Info("downstream post-signup provisioner enabled", zap.String("admin_url", hxURL))
-		} else {
-			logger.Warn("DOWNSTREAM_ADMIN_URL set but token/tenant/domain missing — downstream provisioner disabled")
-		}
-	}
 	// SSF emitter — Phase 2 flips from NoOp to the real CAEPEmitter
 	// when KeyManager is wired (it always is in production; nil only
 	// in test fixtures). The CAEPEmitter implements SSFEventEmitter
@@ -1243,6 +1541,7 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 			postSignupProvisioner.SetSSFEmitter(caepEmitter)
 			authService.SetCAEPEmitter(caepEmitter)
 			passwordResetService.SetCAEPEmitter(caepEmitter)
+			accessTerminator.SetCAEPEmitter(caepEmitter)
 			if webAuthnService != nil {
 				webAuthnService.SetCAEPEmitter(caepEmitter)
 			}
@@ -1284,6 +1583,14 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 	// password login, see AuthService.IssueSessionForNewUser) instead of
 	// forcing the client through a second hosted-login round trip.
 	signupService.SetSessionIssuer(authService)
+	signupService.SetPreferencesWriter(userPreferencesService)
+
+	// A signup that started from an OIDC /oauth/authorize request resumes it
+	// after verification: the continuation is validated against the registered
+	// clients (shared with the login redirect) and stored server-side, with
+	// SIGNUP_DEFAULT_APP_URL as the fallback destination.
+	signupService.SetContinuationValidator(oauthProviderService)
+	signupService.SetDefaultAppURL(cfg.SignupDefaultAppURL)
 
 	// Lets InitiateSignup's up-front "claim your subdomain" step (and the
 	// live GET /signup/check-slug endpoint) verify slug availability
@@ -1352,53 +1659,130 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		)
 	}
 
+	// TenantEntitlementService: fail-closed entitlement source
+	// (the product roadmap §4.1). Redis-backed fresh(60s)+LKG cache is only
+	// wired when infra.RedisClient is configured; with no Redis, every
+	// read goes straight to Postgres (still correct, just uncached) --
+	// there is no scenario where entitlements silently "fail open" for
+	// lack of a cache.
+	// NOTE: entitlementCacheSvc is passed as a genuinely nil interface
+	// (never a nil *EntitlementCacheService boxed in a non-nil interface)
+	// when Redis is unconfigured — see
+	// services.NewTenantEntitlementService's nil-cache handling.
+	var entitlementService *services.TenantEntitlementService
+	if infra.RedisClient != nil {
+		entitlementService = services.NewTenantEntitlementService(
+			repos.ModuleEntitlement,
+			redis.NewEntitlementCacheService(infra.RedisClient, logger.Log),
+		)
+	} else {
+		entitlementService = services.NewTenantEntitlementService(repos.ModuleEntitlement, nil)
+	}
+	// Mirror entitlements into SpiceDB tenant#entitled_module (spec 23 4.2).
+	// Guarded so a nil *spicedb.Client is never boxed into the interface.
+	if infra.SpiceDBClient != nil {
+		entitlementService.SetSpiceDBSyncer(infra.SpiceDBClient)
+	}
+
+	// Module access: entitlement -> role templates + owner grants. The same
+	// provisioner backs the PutSnapshot hook, the startup reconcile, the
+	// platform endpoint and the first-template-registration reconcile.
+	// tenantBootstrapService is passed only when non-nil so a nil pointer is
+	// never boxed into the interface.
+	var moduleAccessSpiceDB interface {
+		BootstrapUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) (string, error)
+	}
+	if tenantBootstrapService != nil {
+		moduleAccessSpiceDB = tenantBootstrapService
+	}
+	moduleAccessProvisioner := services.NewModuleAccessProvisioner(
+		templateRoleProvisioner,
+		repos.Role,
+		repos.User,
+		moduleAccessSpiceDB,
+		repos.ModuleEntitlement,
+		repositories.NewAdvisoryLocker(infra.DB.Pool),
+	)
+	var moduleAccessRolePermSpiceDB interface {
+		BootstrapRolePermissions(ctx context.Context, tenantID, roleID uuid.UUID, permissions []string) (*services.BootstrapResult, error)
+	}
+	if tenantBootstrapService != nil {
+		moduleAccessRolePermSpiceDB = tenantBootstrapService
+	}
+	var moduleAccessSessions services.SessionCache
+	if infra.SessionCache != nil {
+		moduleAccessSessions = infra.SessionCache
+	}
+	moduleAccessProvisioner.SetOwnerPermissionSync(repos.Permission, moduleAccessRolePermSpiceDB, moduleAccessSessions)
+	entitlementService.SetModuleGrantHook(moduleAccessProvisioner)
+	permissionService.SetModuleAccessReconciler(moduleAccessProvisioner)
+
+	// The role picker treats a module as entitled when the legacy
+	// product-manifest check OR the entitlement projection says so. The
+	// authz engine keeps the legacy checker only: business enforces
+	// entitlements at runtime.
+	if entitlementChecker != nil {
+		projectionChecker := services.NewProjectionOrLegacyChecker(entitlementChecker, entitlementService)
+		permissionService.SetModuleEntitlementChecker(projectionChecker)
+		roleService.SetModuleEntitlementChecker(projectionChecker)
+	}
+
 	logger.Info("All services initialized",
 		zap.Int("total_services", 82),
 	)
 
 	return &Services{
-		Audit:           auditService,
-		Token:           tokenService,
-		UserPreferences: userPreferencesService,
-		Role:            roleService,
-		Permission:      permissionService,
-		User:            userService,
-		LDAP:            ldapService,
-		ADSync:          adSyncService,
-		Auth:            authService,
-		SocialAuth:      socialAuthService,
-		Email:           emailService,
-		MFA:             mfaService,
-		MFAEnrollment:   mfaEnrollmentService,
-		PasswordReset:   passwordResetService,
-		PasswordPolicy:  passwordPolicyService,
-		RateLimit:       rateLimitService,
-		IPRule:          ipRuleService,
-		APIKey:          apiKeyService,
-		ServiceAccount:  serviceAccountService,
-		OAuthProvider:   oauthProviderService,
-		SAML:            samlService,
-		SAMLSP:          samlSPService,
-		SAMLMetadata:    samlMetadataService,
-		SCIM:            scimService,
-		Group:           groupService,
-		Organization:    orgService,
-		Impersonation:   impersonationService,
-		Webhook:         webhookService,
-		Device:          deviceService,
-		Recovery:        recoveryService,
-		PushMFA:         pushMFAService,
-		MagicLink:       magicLinkService,
-		Invitation:      invitationService,
-		Consent:         consentService,
-		Risk:            riskService,
-		OPA:             opaService,
-		Authorization:   authorizationService,
-		AuthzEngine:     authorizationEngine,
-		Tenant:          tenantService,
-		AppAccess:       appAccessService,
-		Realm:           realmService,
-		ConfigProvider:  configProvider,
+		Entitlement:            entitlementService,
+		TenantStatusRepo:       tenantStatusRepo,
+		TenantStatusGate:       tenantStatusGate,
+		Audit:                  auditService,
+		Token:                  tokenService,
+		UserPreferences:        userPreferencesService,
+		Role:                   roleService,
+		SoD:                    sodService,
+		SoDReevaluator:         sodReevaluator,
+		Permission:             permissionService,
+		RoleTemplate:           roleTemplateService,
+		User:                   userService,
+		AcmeAppRoleProvisioner: acmeappRoleProvisioner,
+		LDAP:                   ldapService,
+		ADSync:                 adSyncService,
+		Auth:                   authService,
+		SocialAuth:             socialAuthService,
+		Email:                  emailService,
+		MFA:                    mfaService,
+		MFAEnrollment:          mfaEnrollmentService,
+		PasswordReset:          passwordResetService,
+		PasswordPolicy:         passwordPolicyService,
+		RateLimit:              rateLimitService,
+		IPRule:                 ipRuleService,
+		APIKey:                 apiKeyService,
+		TenantAPIKey:           tenantAPIKeyService,
+		ServiceAccount:         serviceAccountService,
+		OAuthProvider:          oauthProviderService,
+		SAML:                   samlService,
+		SAMLSP:                 samlSPService,
+		SAMLMetadata:           samlMetadataService,
+		SCIM:                   scimService,
+		AccessTerminator:       accessTerminator,
+		Group:                  groupService,
+		Organization:           orgService,
+		Impersonation:          impersonationService,
+		Webhook:                webhookService,
+		Device:                 deviceService,
+		Recovery:               recoveryService,
+		PushMFA:                pushMFAService,
+		MagicLink:              magicLinkService,
+		Invitation:             invitationService,
+		Consent:                consentService,
+		Risk:                   riskService,
+		OPA:                    opaService,
+		Authorization:          authorizationService,
+		AuthzEngine:            authorizationEngine,
+		Tenant:                 tenantService,
+		AppAccess:              appAccessService,
+		Realm:                  realmService,
+		ConfigProvider:         configProvider,
 		// Product & licensing
 		Product:         productService,
 		License:         licenseService,
@@ -1419,46 +1803,58 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		RegistrationPolicy: registrationPolicyService,
 		StaleAppDetection:  staleAppDetectionService,
 		// Identity & access
-		Delegation:         delegationService,
-		TempAccessPass:     tempAccessPassService,
-		GuestUser:          guestUserService,
-		JITAccess:          jitAccessService,
-		AccessReview:       accessReviewService,
-		EmailDomain:        emailDomainService,
-		TenantBranding:     tenantBrandingService,
-		TenantQuota:        tenantQuotaService,
-		IDPRouting:         idpRoutingService,
-		IDPTenantOverride:  idpTenantOverrideService,
-		WebAuthn:           webAuthnService,
-		TokenExchange:      tokenExchangeService,
-		ManagedIdentity:    managedIdentityService,
-		SCP:                scpService,
-		Signup:             signupService,
-		RealmFederation:    realmFederationService,
-		RealmDBProvisioner: realmDBProvisioner,
+		Delegation:             delegationService,
+		TempAccessPass:         tempAccessPassService,
+		GuestUser:              guestUserService,
+		JITAccess:              jitAccessService,
+		PlatformJIT:            platformJITService,
+		PlatformAuth:           platformAuthority,
+		AccessReview:           accessReviewService,
+		EmailDomain:            emailDomainService,
+		TenantBranding:         tenantBrandingService,
+		TenantQuota:            tenantQuotaService,
+		IDPRouting:             idpRoutingService,
+		IDPTenantOverride:      idpTenantOverrideService,
+		WebAuthn:               webAuthnService,
+		Witness:                witnessService,
+		TokenExchange:          tokenExchangeService,
+		ManagedIdentity:        managedIdentityService,
+		SCP:                    scpService,
+		Signup:                 signupService,
+		SignupTrialProvisioner: postSignupProvisioner,
+		RealmFederation:        realmFederationService,
+		RealmDBProvisioner:     realmDBProvisioner,
 		// Platform & compliance
-		ConditionalAccess:      conditionalAccessService,
-		CompliancePolicyEngine: compliancePolicyEngine,
-		ComplianceScheduler:    complianceScheduler,
-		ComplianceReport:       complianceReportService,
-		ImmutableAudit:         immutableAuditService,
-		SessionAnalytics:       sessionAnalyticsService,
-		UsageMetering:          usageMeteringService,
-		ThreatCorrelation:      threatCorrelationService,
-		ITDR:                   itdrService,
-		RoutingWebhook:         routingWebhookService,
-		SpiceDBReconciler:      spiceDBReconciler,
-		SeatQuotaReconciler:    seatQuotaReconciler,
-		TenantBootstrap:        tenantBootstrapService,
-		Discover:               discoverService,
-		AuthHooks:              authHooksService,
-		ProvisioningStatus:     provisioningStatusService,
+		ConditionalAccess:       conditionalAccessService,
+		CompliancePolicyEngine:  compliancePolicyEngine,
+		ComplianceScheduler:     complianceScheduler,
+		ComplianceReport:        complianceReportService,
+		ImmutableAudit:          immutableAuditService,
+		SessionAnalytics:        sessionAnalyticsService,
+		UsageMetering:           usageMeteringService,
+		ThreatCorrelation:       threatCorrelationService,
+		ITDR:                    itdrService,
+		RoutingWebhook:          routingWebhookService,
+		SpiceDBReconciler:       spiceDBReconciler,
+		RoleRevokeDrainer:       roleRevokeDrainer,
+		SeatQuotaReconciler:     seatQuotaReconciler,
+		TemplateRoleProvisioner: templateRoleProvisioner,
+		ModuleAccess:            moduleAccessProvisioner,
+		EmployeeAccess:          employeeAccessService,
+		EmployeeAccessExpiry:    employeeAccessExpiry,
+		HREmploymentSync:        hrEmploymentSync,
+		TenantBootstrap:         tenantBootstrapService,
+		Discover:                discoverService,
+		AuthHooks:               authHooksService,
+		ProvisioningStatus:      provisioningStatusService,
 		// Identifier-first realm discovery
 		RealmDiscovery: realmDiscoveryService,
 		// Host-based tenant discovery for custom domains (SDK runtime)
 		HostDiscovery:    hostDiscoveryService,
 		OnboardingSlug:   onboardingSlugService,
 		OnboardingStatus: onboardingStatusService,
+		// Placeholder workspace-name replacement (S2S rename + admin backfill)
+		TenantWorkspaceName: tenantWorkspaceNameService,
 		// GDPR — synchronous request-creation + status side. The async
 		// consumer (GDPRConsumer) is wired separately when integration-bus
 		// is configured.
@@ -1483,7 +1879,35 @@ func initServices(repos *Repositories, infra *Infrastructure) *Services {
 		ComplianceLiveEvidence: complianceLiveEvidenceService,
 		JWTKeyProvider:         jwtKeyProvider,
 		KeyManager:             keyManager,
+		OriginRegistry:         originRegistry,
 	}
+}
+
+// signingKeyOptions maps config to KeyManager rotation options and enforces the
+// invariants that make publish-before-activate safe: the publish delay must exceed the
+// JWKS max-age plus the reload interval, and rotated keys must outlive the longest
+// access token.
+func signingKeyOptions(cfg *config.Config) keys.Options {
+	opts := keys.Options{
+		PublishDelay:   cfg.SigningKeyPublishDelay,
+		ReloadInterval: cfg.SigningKeyReloadInterval,
+		RetireAfter:    cfg.SigningKeyRetireAfter,
+	}.WithDefaults()
+	maxAge := cfg.JWKSMaxAge
+	if maxAge <= 0 {
+		maxAge = 300 * time.Second
+	}
+	if min := maxAge + opts.ReloadInterval + time.Minute; opts.PublishDelay < min {
+		logger.Warn("SIGNING_KEY_PUBLISH_DELAY too short for JWKS_MAX_AGE + SIGNING_KEY_RELOAD_INTERVAL, raising",
+			zap.Duration("configured", opts.PublishDelay), zap.Duration("effective", min))
+		opts.PublishDelay = min
+	}
+	if min := cfg.AccessTokenExpiry + time.Hour; opts.RetireAfter < min {
+		logger.Warn("SIGNING_KEY_RETIRE_AFTER shorter than ACCESS_TOKEN_EXPIRY + 1h, raising",
+			zap.Duration("configured", opts.RetireAfter), zap.Duration("effective", min))
+		opts.RetireAfter = min
+	}
+	return opts
 }
 
 // initKeyManager creates and initializes the DB-backed KeyManager.
@@ -1494,7 +1918,7 @@ func initKeyManager(infra *Infrastructure, cfg *config.Config) *keys.KeyManager 
 		signingKeyEncHex = cfg.EncryptionKey
 	}
 	if signingKeyEncHex == "" {
-		signingKeyEncHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" // gitleaks:allow — test fixture, not a real credential
+		signingKeyEncHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	}
 
 	var encBytes []byte
@@ -1508,15 +1932,25 @@ func initKeyManager(infra *Infrastructure, cfg *config.Config) *keys.KeyManager 
 
 	km, kmErr := keys.NewKeyManager(infra.DB.Pool, encBytes, logger.Log)
 	if kmErr != nil {
-		logger.Warn("Failed to create KeyManager, falling back to ephemeral JWTKeyProvider", zap.Error(kmErr))
-		return nil
+		return keyManagerUnavailable(cfg, "create", kmErr)
 	}
+	km.Configure(signingKeyOptions(cfg))
 	if initErr := km.Initialize(context.Background()); initErr != nil {
-		logger.Warn("Failed to initialize KeyManager, falling back to ephemeral JWTKeyProvider", zap.Error(initErr))
-		return nil
+		return keyManagerUnavailable(cfg, "initialize", initErr)
 	}
 	logger.Info("Database-backed key manager initialized (Keycloak/Auth0 pattern)")
 	return km
+}
+
+// keyManagerUnavailable refuses to start with an ephemeral per-pod signing key
+// outside development: such a pod would sign tokens no other replica can verify.
+func keyManagerUnavailable(cfg *config.Config, action string, err error) *keys.KeyManager {
+	if cfg.Environment == "development" {
+		logger.Warn("Failed to "+action+" KeyManager, falling back to ephemeral JWTKeyProvider (development only)", zap.Error(err))
+		return nil
+	}
+	logger.Fatal("Failed to "+action+" signing KeyManager; refusing ephemeral per-pod signing key outside development", zap.Error(err))
+	return nil
 }
 
 // initConfigProvider creates the ConfigProvider and wires it to the token service.
@@ -1762,6 +2196,90 @@ func buildTenantManagementStatusReaderHTTPClient(cfg *config.Config, log *zap.Lo
 	return httpClient
 }
 
+// buildTenantManagementAppHostHTTPClient builds the authenticated
+// *http.Client ConfigProvider.FrontendURL uses to call tenant-management's
+// S2S-scope-gated GET /api/v1/internal/tenants/{id}/app-host
+// (platform-core !80, not yet merged as of this writing).
+//
+// Requests platform:tenants:app-host:read EXPLICITLY — never rely on
+// NewIAMHTTPClient's Scope defaulting; a prior incident here (NewIAMHTTPClient
+// defaulting Scope to "service:register") 403'd every other S2S call for
+// ten days. This is a NEW scope, deliberately separate from the blanket
+// platform:tenants:read svc-falcon-id's falcon-id-oauth ServiceClientClaim
+// already carries (see buildTenantManagementStatusReaderHTTPClient above) —
+// unlike that function's reuse of an existing grant, this one requires a
+// SEPARATE the GitOps repository MR adding the
+// platform:tenants:app-host:read grant to svc-falcon-id's
+// ServiceClientClaim before any call through this client will succeed.
+// That the GitOps repository MR must merge (and the pod restart to pick up
+// the refreshed token) before this client's calls stop 403ing — minting a
+// fresh token only proves svc-falcon-id's OAuth client itself has the
+// scope, not that an already-running pod's cached hour-long token does.
+//
+// Returns nil (FrontendURL's app-host resolver stays unset — see
+// initServices in cmd/services.go) when outbound OAuth creds or
+// TENANT_MANAGEMENT_INTERNAL_URL are missing, matching every other builder
+// in this file's fallback posture.
+func buildTenantManagementAppHostHTTPClient(cfg *config.Config, log *zap.Logger) *http.Client {
+	if cfg.TenantManagementInternalURL == "" {
+		log.Warn("frontend-url app-host resolver disabled: TENANT_MANAGEMENT_INTERNAL_URL is empty")
+		return nil
+	}
+	if cfg.ServiceClientID == "" || cfg.ServiceClientSecret == "" || cfg.IAMServiceURL == "" {
+		log.Warn("frontend-url app-host resolver disabled: outbound OAuth creds missing",
+			zap.Bool("have_client_id", cfg.ServiceClientID != ""),
+			zap.Bool("have_client_secret", cfg.ServiceClientSecret != ""),
+			zap.Bool("have_iam_url", cfg.IAMServiceURL != ""),
+		)
+		return nil
+	}
+
+	httpClient, err := serviceauth.NewIAMHTTPClient(serviceauth.IAMHTTPClientConfig{
+		IAMURL:       cfg.IAMServiceURL,
+		ClientID:     cfg.ServiceClientID,
+		ClientSecret: cfg.ServiceClientSecret,
+		Scope:        "platform:tenants:app-host:read",
+	})
+	if err != nil {
+		log.Error("frontend-url app-host resolver disabled: NewIAMHTTPClient failed", zap.Error(err))
+		return nil
+	}
+
+	return httpClient
+}
+
+// buildTenantManagementOriginLister builds the Stage 3 middleware.
+// TenantOriginLister backing the dynamic CORS/CSRF origin registry
+// (Services.OriginRegistry). It uses TWO separate authenticated clients:
+//   - a platform:tenants:read client for the bulk tenant list (the SAME
+//     scope buildTenantManagementStatusReaderHTTPClient / the slug checker
+//     already request — no new grant needed for this half), and
+//   - a platform:tenants:app-host:read client for the per-active-tenant
+//     app_host lookup (the SAME NEW scope buildTenantManagementAppHostHTTPClient
+//     requests — one the GitOps repository ServiceClientClaim grant covers
+//     both this lister and ConfigProvider.FrontendURL's resolver).
+//
+// Returns nil (Services.OriginRegistry is still constructed by the caller,
+// just with a nil lister — see NewDynamicOriginRegistry — so CORS/CSRF
+// keep working off their static allowlists only) when either client can't
+// be built, matching every other builder in this file's fallback posture.
+func buildTenantManagementOriginLister(cfg *config.Config, log *zap.Logger) *httpTenantManagementOriginLister {
+	listClient := buildTenantManagementStatusReaderHTTPClient(cfg, log)
+	if listClient == nil {
+		log.Warn("dynamic CORS/CSRF origin registry disabled: tenant list client unavailable")
+		return nil
+	}
+
+	appHostHTTP := buildTenantManagementAppHostHTTPClient(cfg, log)
+	if appHostHTTP == nil {
+		log.Warn("dynamic CORS/CSRF origin registry disabled: app-host client unavailable")
+		return nil
+	}
+	appHostReader := newHTTPTenantManagementAppHostReader(cfg.TenantManagementInternalURL, appHostHTTP)
+
+	return newHTTPTenantManagementOriginLister(cfg.TenantManagementInternalURL, listClient, appHostReader, log)
+}
+
 // buildTenantManagementSlugCheckerHTTPClient builds the authenticated
 // *http.Client SignupService uses to call tenant-management's
 // S2S-scope-gated GET /api/v1/internal/tenants/slug-available/{slug}.
@@ -1884,7 +2402,7 @@ func buildQuotaClient(cfg *config.Config, log *zap.Logger) *quota.QuotaClient {
 //
 // Same svc-falcon-id OAuth2 client (falcon-id-oauth ServiceClientClaim) as
 // buildQuotaClient — one client, scope requested per call, mirroring
-// hexxlock/business's df5373d1 pattern which added quota:admin to its
+// the business service repository's df5373d1 pattern which added quota:admin to its
 // existing ServiceClientClaim for the identical reconcile call rather than
 // provisioning a second client_credentials client. the GitOps repository must
 // grant quota:admin on svc-falcon-id's claim alongside this change or every
@@ -1920,4 +2438,29 @@ func buildSeatQuotaReconcilerHTTPClient(cfg *config.Config, log *zap.Logger) *ht
 	}
 
 	return httpClient
+}
+
+// witnessPolicySource is the realm-policy read the witness service needs.
+type witnessPolicySource interface {
+	DeviceWitnessTOTPAllowed(ctx context.Context, tenantID uuid.UUID) (bool, error)
+}
+
+// allowAllWitnessPolicy is used when realms are not wired: the column default
+// is true, and the FALCON_WITNESS_TOTP_ENABLED kill switch still gates.
+type allowAllWitnessPolicy struct{}
+
+func (allowAllWitnessPolicy) DeviceWitnessTOTPAllowed(context.Context, uuid.UUID) (bool, error) {
+	return true, nil
+}
+
+// witnessRedisClient returns the go-redis client used for witness state and
+// the shared TOTP replay claim, or nil when Redis is not configured.
+func witnessRedisClient(infra *Infrastructure) goredis.Cmdable {
+	switch {
+	case infra.RedisClient != nil:
+		return infra.RedisClient.Redis()
+	case infra.SessionCache != nil:
+		return infra.SessionCache.Client().Redis()
+	}
+	return nil
 }

@@ -437,7 +437,7 @@ func (h *RiskHandler) ResolveSignal(c *gin.Context) {
 }
 
 // GetMyLoginEvents returns the current user's recent login risk events.
-// User-facing endpoint that powers accounts.hexxlock.com's "Sign-in security
+// User-facing endpoint that powers accounts.example.com's "Sign-in security
 // events" feed — Google-style audit trail of MFA-challenged + blocked logins
 // with cumulative score, level, IP, and outcome.
 //

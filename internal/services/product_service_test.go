@@ -99,13 +99,13 @@ func TestSlugify(t *testing.T) {
 		// Real-world product name examples
 		{
 			name:     "typical product name",
-			input:    "Example Suite",
-			expected: "example-suite",
+			input:    "Examplesuite",
+			expected: "examplesuite",
 		},
 		{
 			name:     "product name with version",
-			input:    "Example Service v2",
-			expected: "example-service-v2",
+			input:    "Falcon ID v2",
+			expected: "falcon-id-v2",
 		},
 		{
 			name:     "product name with ampersand",

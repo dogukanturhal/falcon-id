@@ -13,9 +13,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dogukanturhal/falcon-id/internal/models"
+	"github.com/dogukanturhal/falcon-id/internal/sessionsweep"
 )
 
 const msgGetLoginHistory = "GetLoginHistory: %w"
+
+// ErrRLSContextMismatch mirrors internal/shared/database.ErrRLSContextMismatch
+// (kept as a separate sentinel here to avoid a repositories -> shared/database
+// import): returned when a SET LOCAL RLS GUC read-back does not match the
+// value that was just set, indicating a connection-pooler bug or session leak.
+var ErrRLSContextMismatch = errors.New("RLS context guard: session variable does not match expected value")
 
 // sessionColumns is the canonical column list for iam_sessions queries.
 // All methods that read sessions MUST use this constant to avoid column drift.
@@ -63,7 +70,7 @@ func scanSessionFromRows(rows pgx.Rows) (models.Session, error) {
 
 // SessionRepository is an exported type.
 type SessionRepository struct {
-	db *pgxpool.Pool
+	db DBTX
 }
 
 // NewSessionRepository is an exported function.
@@ -117,13 +124,14 @@ func (r *SessionRepository) RevokeTenantSessions(ctx context.Context, userID, te
 		WHERE s.user_id = u.id
 		  AND s.user_id = $1
 		  AND u.tenant_id = $2
-		  AND s.is_active = true`
+		  AND s.is_active = true
+		RETURNING s.id, s.user_id`
 
-	result, err := r.db.Exec(ctx, query, userID, tenantID, reason)
+	n, err := sessionsweep.End(ctx, r.db, query, reason, "", userID, tenantID, reason)
 	if err != nil {
 		return 0, fmt.Errorf("RevokeTenantSessions: %w", err)
 	}
-	return result.RowsAffected(), nil
+	return n, nil
 }
 
 // RegenerateSession atomically ends an old session and creates a new one with
@@ -139,9 +147,9 @@ func (r *SessionRepository) RegenerateSession(ctx context.Context, oldSessionID 
 
 	// 1. End the old session
 	endResult, err := tx.Exec(ctx,
-		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = 'session_regenerated'
+		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
 		 WHERE id = $1 AND is_active = true`,
-		oldSessionID,
+		oldSessionID, models.SessionEndReasonRegenerated,
 	)
 	if err != nil {
 		return fmt.Errorf("RegenerateSession: end old session: %w", err)
@@ -198,6 +206,73 @@ func (r *SessionRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.
 	}
 	if err != nil {
 		return nil, fmt.Errorf("GetByID: %w", err)
+	}
+	return session, nil
+}
+
+// GetByIDWithRealmContext is the RLS-bootstrap-safe variant of GetByID for
+// the one genuine pre-tenant-context lookup on this table: TokenService's
+// database fallback for the session-blacklist check (used when Redis
+// returns a non-availability error). iam_sessions' RLS policy
+// (strict_realm_sessions) is realm-scoped only — it has no tenant
+// predicate — so this lookup does not need a tenant-bypass exception, only
+// realm context. That realm context comes from the token's own `rid`
+// claim, which is already signature-verified by the time this is called
+// (ValidateAccessTokenWithContext extracts and validates claims before
+// invoking the blacklist check), so trusting it here does not weaken
+// anything: an attacker who could forge realmID here could already forge
+// a whole valid JWT.
+//
+// This opens its own short-lived transaction and issues SET LOCAL, with a
+// read-back guard, exactly like RLSMiddleware does for the main request
+// transaction — this call typically runs *before* RLSMiddleware/RequireAuth
+// finish establishing the request-scoped transaction (it's invoked from
+// inside OptionalAuth/RequireAuth's own token validation), so it cannot
+// simply reuse "pgx_tx" from gin context.
+func (r *SessionRepository) GetByIDWithRealmContext(ctx context.Context, id uuid.UUID, realmID uuid.UUID) (*models.Session, error) {
+	return r.getByIDWithRealmContext(ctx, id, realmID, "")
+}
+
+// GetByIDWithRealmContextForShare is GetByIDWithRealmContext with FOR SHARE:
+// it waits for an in-flight transaction holding the row lock (a concurrent
+// session end) and reads the committed result. Used by the post-mint re-check
+// in the refresh grant.
+func (r *SessionRepository) GetByIDWithRealmContextForShare(ctx context.Context, id uuid.UUID, realmID uuid.UUID) (*models.Session, error) {
+	return r.getByIDWithRealmContext(ctx, id, realmID, " FOR SHARE")
+}
+
+func (r *SessionRepository) getByIDWithRealmContext(ctx context.Context, id uuid.UUID, realmID uuid.UUID, lockClause string) (*models.Session, error) {
+	if realmID == uuid.Nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: realmID is required (RLS bootstrap: iam_sessions policy is realm-scoped)")
+	}
+
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_realm_id', $1, true)", realmID.String()); err != nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: set realm GUC: %w", err)
+	}
+	var actual string
+	if err := tx.QueryRow(ctx, "SELECT current_setting('app.current_realm_id', true)").Scan(&actual); err != nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: read back realm GUC: %w", err)
+	}
+	if actual != realmID.String() {
+		return nil, fmt.Errorf("%w: expected realm %s, got %q", ErrRLSContextMismatch, realmID, actual)
+	}
+
+	query := `SELECT ` + sessionColumns + ` FROM iam_sessions WHERE id = $1` + lockClause
+	session, err := scanSession(tx.QueryRow(ctx, query, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, tx.Commit(ctx)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("GetByIDWithRealmContext: commit: %w", err)
 	}
 	return session, nil
 }
@@ -321,29 +396,31 @@ func (r *SessionRepository) AppendAuthMethod(ctx context.Context, id uuid.UUID, 
 	return result.RowsAffected() == 1, nil
 }
 
-// EndSession is an exported function.
+// EndSession ends one session and, for an explicit reason, revokes the refresh
+// tokens bound to it (and their rotation families) in the same statement.
+//
+// Idempotent: ending an already-ended session is not an error, and still
+// sweeps the tokens, so a retried logout/revoke closes a half-finished one.
+// A session that lapsed (non-explicit reason) and is then explicitly ended has
+// its reason upgraded, so the refresh-time backstop sees the explicit end.
 func (r *SessionRepository) EndSession(ctx context.Context, id uuid.UUID, reason string) error {
-	result, err := r.db.Exec(ctx,
-		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2 WHERE id = $1 AND is_active = true`,
-		id, reason,
-	)
-	if err != nil {
-		return fmt.Errorf("EndSession: %w", err)
+	if id == uuid.Nil {
+		return nil
 	}
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("EndSession: session %s not found or already ended", id)
+	update := `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
+		 WHERE id = $1 AND (is_active = true OR end_reason IN (` + sessionsweep.NonExplicitReasons + `))
+		 RETURNING id, user_id`
+	if _, err := sessionsweep.End(ctx, r.db, update, reason, "$1", id, reason); err != nil {
+		return fmt.Errorf("EndSession: %w", err)
 	}
 	return nil
 }
 
 // EndAllUserSessions is an exported function.
 func (r *SessionRepository) EndAllUserSessions(ctx context.Context, userID uuid.UUID, reason string) error {
-	_, err := r.db.Exec(ctx,
-		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
-		 WHERE user_id = $1 AND is_active = true`,
-		userID, reason,
-	)
-	if err != nil {
+	update := `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $2
+		 WHERE user_id = $1 AND is_active = true RETURNING id, user_id`
+	if _, err := sessionsweep.End(ctx, r.db, update, reason, "", userID, reason); err != nil {
 		return fmt.Errorf("EndAllUserSessions: %w", err)
 	}
 	return nil
@@ -351,12 +428,9 @@ func (r *SessionRepository) EndAllUserSessions(ctx context.Context, userID uuid.
 
 // EndAllUserSessionsExcept is an exported function.
 func (r *SessionRepository) EndAllUserSessionsExcept(ctx context.Context, userID uuid.UUID, exceptID uuid.UUID, reason string) error {
-	_, err := r.db.Exec(ctx,
-		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $3
-		 WHERE user_id = $1 AND id != $2 AND is_active = true`,
-		userID, exceptID, reason,
-	)
-	if err != nil {
+	update := `UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $3
+		 WHERE user_id = $1 AND id != $2 AND is_active = true RETURNING id, user_id`
+	if _, err := sessionsweep.End(ctx, r.db, update, reason, "", userID, exceptID, reason); err != nil {
 		return fmt.Errorf("EndAllUserSessionsExcept: %w", err)
 	}
 	return nil
@@ -365,8 +439,9 @@ func (r *SessionRepository) EndAllUserSessionsExcept(ctx context.Context, userID
 // CleanupExpiredSessions is an exported function.
 func (r *SessionRepository) CleanupExpiredSessions(ctx context.Context) (int64, error) {
 	result, err := r.db.Exec(ctx,
-		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = 'expired'
+		`UPDATE iam_sessions SET is_active = false, ended_at = NOW(), end_reason = $1
 		 WHERE is_active = true AND expires_at < NOW()`,
+		models.SessionEndReasonExpired,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("CleanupExpiredSessions: %w", err)
@@ -405,9 +480,9 @@ func (r *SessionRepository) CleanupStaleSessions(ctx context.Context, inactivity
 	threshold := time.Now().Add(-inactivityTimeout)
 	result, err := r.db.Exec(ctx,
 		`UPDATE iam_sessions
-		 SET is_active = false, ended_at = NOW(), end_reason = 'inactivity_timeout'
+		 SET is_active = false, ended_at = NOW(), end_reason = $2
 		 WHERE is_active = true AND last_activity_at < $1`,
-		threshold,
+		threshold, models.SessionEndReasonInactivityTimeout,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("CleanupStaleSessions: %w", err)

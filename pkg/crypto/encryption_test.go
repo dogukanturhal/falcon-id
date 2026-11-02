@@ -365,8 +365,8 @@ func TestDecrypt_WithDifferentKey(t *testing.T) {
 }
 
 func TestRotateKey(t *testing.T) {
-	oldKey := "0123456789abcdef0123456789abcdef" // gitleaks:allow — test fixture, not a real credential
-	newKey := "fedcba9876543210fedcba9876543210" // gitleaks:allow — test fixture, not a real credential
+	oldKey := "0123456789abcdef0123456789abcdef"
+	newKey := "fedcba9876543210fedcba9876543210"
 	plaintext := "Secret data that needs rotation"
 
 	// Encrypt with old key

@@ -65,7 +65,7 @@ func FuzzLoginInput(f *testing.F) {
 	seeds := []seed{
 		// Happy path
 		{"alice", "correct-horse-battery-staple", "acme-corp"},
-		{"admin", "REDACTED-ROTATED", "exampletenant"},
+		{"admin", "fuzz-fake-password-1", "exampletenant"},
 
 		// Empty fields
 		{"", "", ""},

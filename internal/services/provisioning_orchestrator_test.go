@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -56,7 +57,7 @@ func (m *mockInstanceRepo) GetByTenantAndProduct(_ context.Context, tenantID, pr
 			return pi, nil
 		}
 	}
-	return nil, fmt.Errorf("no rows in result set")
+	return nil, fmt.Errorf("mockInstanceRepo.GetByTenantAndProduct: %w", pgx.ErrNoRows)
 }
 
 func (m *mockInstanceRepo) ListByTenant(_ context.Context, tenantID uuid.UUID, _, _ int) ([]models.ProductInstance, int64, error) {
@@ -413,10 +414,11 @@ func TestProductInstanceService_Provision(t *testing.T) {
 	assert.Equal(t, tenantID, pi.TenantID)
 	assert.Equal(t, productID, pi.ProductID)
 
-	// Second provision for same tenant+product should fail (duplicate).
-	_, err = svc.Provision(ctx, productID, req)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "already has an instance")
+	// Second provision for same tenant+product reuses the existing instance
+	// (a trial root is the shell paid/comp activation builds on).
+	again, err := svc.Provision(ctx, productID, req)
+	require.NoError(t, err)
+	assert.Equal(t, pi.ID, again.ID)
 }
 
 func TestProductInstanceService_Deprovision(t *testing.T) {

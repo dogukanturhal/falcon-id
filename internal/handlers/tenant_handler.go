@@ -672,3 +672,56 @@ func getPlanLimits(plan string) PlanLimits {
 		return getPlanLimits(planProfessional)
 	}
 }
+
+// tenantMemberResponse is the body of GET /internal/v1/tenants/:id/members/:userId.
+// Intentionally a single boolean: no profile fields, no PII.
+type tenantMemberResponse struct {
+	Active bool `json:"active"`
+}
+
+// GetTenantMember answers "is user X an active member of tenant Y" for S2S callers
+// (e.g. business validating a lead owner before core.users has synced). 404 when the
+// user does not belong to the tenant (or does not exist — indistinguishable on purpose);
+// 200 {"active":bool} otherwise. Point lookup only: there is no listing/enumeration.
+//
+// Mounted on the ServiceAuth()-gated /internal/v1/tenants group with
+// RequireScope("iam:members:read"); :id and :userId are both taken from the path, never
+// from X-Tenant-ID.
+//
+// @Summary Check active tenant membership
+// @Tags Internal
+// @Security ApiKeyAuth
+// @Param id path string true "Tenant ID"
+// @Param userId path string true "User ID"
+// @Success 200 {object} tenantMemberResponse
+// @Failure 404 {object} map[string]string
+// @Router /internal/v1/tenants/{id}/members/{userId} [get]
+func (h *TenantHandler) GetTenantMember(c *gin.Context) {
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tenant_id", "code": "INVALID_TENANT_ID"})
+		return
+	}
+	userID, err := uuid.Parse(c.Param("userId"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id", "code": "INVALID_USER_ID"})
+		return
+	}
+	if h.userRepo == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "user repository not configured"})
+		return
+	}
+
+	found, active, err := h.userRepo.GetMemberActiveState(c.Request.Context(), tenantID, userID)
+	if err != nil {
+		h.logger.Error("failed to look up tenant member", zap.Error(err),
+			zap.String("tenant_id", tenantID.String()))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up member"})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "member not found", "code": "MEMBER_NOT_FOUND"})
+		return
+	}
+	c.JSON(http.StatusOK, tenantMemberResponse{Active: active})
+}

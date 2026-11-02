@@ -115,7 +115,7 @@ func (s *AuthService) CompleteWebAuthnMFA(
 		logger.Warn("MFA attempts exhausted; consuming session",
 			zap.String("session_id", mfaSessionID), zap.Int64("attempts", attempts))
 		_ = s.consumeMFASession(ctx, mfaSessionID)
-		return nil, fmt.Errorf("MFA session exhausted: too many failed attempts, please sign in again")
+		return nil, &MFAFlowError{Code: "mfa_rate_limited"}
 	}
 
 	// 2. Parse IDs

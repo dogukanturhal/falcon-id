@@ -498,7 +498,11 @@ func (m *TenantConnectionManager) GetConnectionWithContext(ctx context.Context, 
 		return nil, fmt.Errorf("GetConnectionWithContext: %w", err)
 	}
 
-	// For shared strategy, set tenant context
+	// For shared strategy, tenant context must be set with SET LOCAL inside an
+	// explicit transaction (see BeginTenantTx doc comment above SetTenantContext).
+	// GetConnectionWithContext hands back a bare *sql.Conn with no transaction,
+	// so it cannot safely do this itself; SetTenantContext now fails loudly
+	// rather than silently issuing a leaking session-scoped SET.
 	if info.Strategy == StrategyShared {
 		if err := m.SetTenantContext(ctx, conn, tenantID); err != nil {
 			conn.Close() //nolint:errcheck,gosec
@@ -509,22 +513,25 @@ func (m *TenantConnectionManager) GetConnectionWithContext(ctx context.Context, 
 	return conn, nil
 }
 
-// SetTenantContext sets the current tenant ID in the database session
-func (m *TenantConnectionManager) SetTenantContext(ctx context.Context, conn *sql.Conn, tenantID uuid.UUID) error {
-	_, err := conn.ExecContext(ctx, "SET app.current_tenant_id = $1", tenantID.String())
-	if err != nil {
-		return fmt.Errorf("SetTenantContext: ExecContext failed: %w", err)
-	}
-	return nil
+// SetTenantContext is intentionally disabled. It used to run a bare
+// (session-scoped) "SET app.current_tenant_id" on a pooled *sql.Conn outside
+// any transaction. Behind a transaction-pooling PgBouncer, that GUC is not
+// guaranteed to apply to, or be cleared from, the physical backend the
+// caller thinks it owns: the pooler can hand the same backend to a
+// different tenant's transaction before or immediately after this call,
+// leaking tenant context across tenants. SET LOCAL cannot fix this because
+// SET LOCAL is only valid inside an explicit transaction. Use BeginTenantTx,
+// which opens the transaction first and issues SET LOCAL inside it, instead.
+func (m *TenantConnectionManager) SetTenantContext(_ context.Context, _ *sql.Conn, _ uuid.UUID) error {
+	return fmt.Errorf("SetTenantContext: disabled — session-scoped SET leaks tenant context across a transaction-pooling PgBouncer; use BeginTenantTx instead")
 }
 
-// SetTenantContextOnDB sets tenant context on a regular DB (for transactions)
-func (m *TenantConnectionManager) SetTenantContextOnDB(ctx context.Context, db *sql.DB, tenantID uuid.UUID) error {
-	_, err := db.ExecContext(ctx, "SET app.current_tenant_id = $1", tenantID.String())
-	if err != nil {
-		return fmt.Errorf("SetTenantContextOnDB: ExecContext failed: %w", err)
-	}
-	return nil
+// SetTenantContextOnDB is intentionally disabled for the same reason as
+// SetTenantContext above: a bare SET on a *sql.DB (not a single reserved
+// connection, and not inside a transaction) has no reliable scope at all
+// under transaction pooling. Use BeginTenantTx instead.
+func (m *TenantConnectionManager) SetTenantContextOnDB(_ context.Context, _ *sql.DB, _ uuid.UUID) error {
+	return fmt.Errorf("SetTenantContextOnDB: disabled — session-scoped SET leaks tenant context across a transaction-pooling PgBouncer; use BeginTenantTx instead")
 }
 
 // ClearTenantContext clears the tenant context from the session
@@ -769,9 +776,14 @@ func (m *TenantConnectionManager) BeginTenantTx(ctx context.Context, tenantID uu
 		return nil, fmt.Errorf("BeginTenantTx: BeginTx failed: %w", err)
 	}
 
-	// Set tenant context for shared strategy
+	// Set tenant context for shared strategy. SET LOCAL (not SET) is required:
+	// this connection is served through a transaction-pooling PgBouncer, so a
+	// bare SET persists on the physical backend past this logical
+	// transaction and leaks the tenant GUC into whichever tenant's request
+	// the pooler hands that backend to next. SET LOCAL is scoped to this
+	// transaction and is unset automatically on COMMIT/ROLLBACK.
 	if info.Strategy == StrategyShared {
-		if _, err := tx.ExecContext(ctx, "SET app.current_tenant_id = $1", tenantID.String()); err != nil {
+		if _, err := tx.ExecContext(ctx, "SELECT set_config('app.current_tenant_id', $1, true)", tenantID.String()); err != nil {
 			tx.Rollback() //nolint:errcheck,gosec
 			return nil, fmt.Errorf("failed to set tenant context: %w", err)
 		}

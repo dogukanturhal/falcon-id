@@ -3,6 +3,8 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -47,6 +49,9 @@ type AuthMiddleware struct {
 	config         *config.Config
 	circuitBreaker *circuitBreakerState
 	sessionCache   *redispkg.SessionCache
+	// tenantSuspension rejects IdP-SSO cookie sessions of suspended tenants
+	// (R1-GAPS row 27). Optional; nil disables the check.
+	tenantSuspension services.TenantSuspensionChecker
 	// stepUpRepo backs RequireFreshAuthForAction. When set, the
 	// middleware consults iam_step_up_verifications for an in-place
 	// step-up record matching (session_id, action) before failing.
@@ -78,7 +83,42 @@ type AuthMiddleware struct {
 	// Leave nil to disable — the middleware is gated by cfg.DPoPEnabled
 	// at construction.
 	dpop *DPoPMiddleware
+	// idpUsers backs the SSO-cookie eligibility check (disabled / deleted /
+	// locked users must not be resurrected by a surviving cookie). Optional.
+	idpUsers idpUserLookup
+	// idpSessions backs the "is the iam_sessions row behind this SSO cookie
+	// still live" check. Optional.
+	idpSessions idpSessionReader
 }
+
+// idpSessionReader is the session-row read the SSO cookie path needs;
+// satisfied by *repositories.SessionRepository.
+type idpSessionReader interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*models.Session, error)
+	GetByIDWithRealmContext(ctx context.Context, id uuid.UUID, realmID uuid.UUID) (*models.Session, error)
+}
+
+// SetIdpSessionReader wires the session-row reader used to verify that an SSO
+// cookie's backing login session has not ended.
+func (m *AuthMiddleware) SetIdpSessionReader(r idpSessionReader) {
+	m.idpSessions = r
+}
+
+// idpUserLookup is the user read the SSO cookie path needs; satisfied by
+// *repositories.UserRepository.
+type idpUserLookup interface {
+	GetByID(ctx context.Context, id uuid.UUID) (*models.User, error)
+}
+
+// SetIdpUserLookup wires the user lookup used to re-check account status on
+// the IdP SSO cookie path.
+func (m *AuthMiddleware) SetIdpUserLookup(l idpUserLookup) {
+	m.idpUsers = l
+}
+
+// idpBackingCheckTTL bounds how long a successful session-row/user check is
+// reused by the SSO cookie path.
+const idpBackingCheckTTL = 45 * time.Second
 
 const (
 	// Circuit breaker configuration
@@ -86,6 +126,12 @@ const (
 	circuitBreakerResetTimeout = 30 * time.Second // Try to close circuit after 30 seconds
 	circuitBreakerOpenDuration = 60 * time.Second // Keep circuit open for 60 seconds minimum
 )
+
+// SetTenantSuspensionChecker wires the tenant-suspension gate used by the IdP
+// SSO cookie path (bearer tokens are gated in TokenService validation).
+func (m *AuthMiddleware) SetTenantSuspensionChecker(c services.TenantSuspensionChecker) {
+	m.tenantSuspension = c
+}
 
 // NewAuthMiddleware is an exported function.
 func NewAuthMiddleware(tokenService *services.TokenService, cfg *config.Config) *AuthMiddleware {
@@ -354,6 +400,17 @@ func (m *AuthMiddleware) handleTokenValidationError(c *gin.Context, err error, c
 		return
 	}
 
+	// Suspended tenant (R1-GAPS row 27): distinct, stable code so clients can
+	// show "organization suspended" instead of looping on re-auth.
+	if errors.Is(err, services.ErrTenantSuspended) {
+		logger.Log.Info("Token rejected: tenant suspended", zap.String("client_ip", clientIP))
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+			"error":             "tenant_suspended",
+			"error_description": "This organization's account is suspended. Contact your administrator or support.",
+		})
+		return
+	}
+
 	logger.Log.Info("Token validation failed",
 		zap.Error(err),
 		zap.String("client_ip", clientIP),
@@ -378,12 +435,21 @@ func setAuthContext(c *gin.Context, claims *models.Claims) {
 		AuthMethod:      models.AuthMethodAccessToken,
 		AuthTime:        claims.AuthTime,
 	}
+	applyStrictPlatformAuthority(c, currentUser)
 
 	c.Set(CurrentUserKey, currentUser)
 	c.Set(CurrentSessionKey, claims.SessionID)
 	c.Set("user_id", claims.UserID)
 	c.Set("tenant_id", claims.TenantID)
 	c.Set("session_id", claims.SessionID)
+	// RLS bootstrap: internal/shared/database.RLSMiddleware reads "realm_id"
+	// (via its realm fallback path) to set app.current_realm_id for the
+	// request's transaction. Without this, every authenticated request would
+	// silently run with realm_id unset, which is fail-open for any RLS
+	// policy that is realm-scoped only (e.g. iam_sessions' strict_realm_sessions).
+	if claims.RealmID != uuid.Nil {
+		c.Set("realm_id", claims.RealmID)
+	}
 
 	if claims.ImpersonatorID != nil {
 		c.Set(ImpersonatorIDKey, *claims.ImpersonatorID)
@@ -526,7 +592,7 @@ func (m *AuthMiddleware) RequireFreshAuth(maxAge time.Duration) gin.HandlerFunc 
 // of forcing a disruptive full OAuth-redirect re-login.
 //
 // Flow:
-//  1. User clicks "Disable Email MFA" on accounts.hexxlock.com
+//  1. User clicks "Disable Email MFA" on accounts.example.com
 //  2. POST /mfa/disable/email → freshAuth rejects (stale auth_time)
 //  3. Frontend portalFetch detects step-up challenge → opens modal
 //  4. User provides single factor (passkey via WebAuthn OR OTP)
@@ -703,11 +769,23 @@ func (m *AuthMiddleware) RequirePermission(permissions ...string) gin.HandlerFun
 
 // checkPermissions checks if user has any of the required permissions via SpiceDB.
 // SECURITY: SpiceDB is the sole authority. Fail-closed when authzEngine is nil.
-// Exception: Platform admins (exampletenant tenant) bypass SpiceDB for platform-scoped permissions.
+// Exception: Platform admins (exampletenant tenant, holding platform_admin
+// or iam_admin) bypass SpiceDB for platform-scoped permissions.
 func (m *AuthMiddleware) checkPermissions(c *gin.Context, user *models.CurrentUser, permissions ...string) bool {
 	// Platform admins have implicit access to all platform-scoped permissions.
 	// This avoids requiring every platform:* permission to be seeded in SpiceDB.
-	if user.IsPlatformAdmin && user.TenantID.String() == models.HexxlockInternalTenantID {
+	//
+	// SECURITY (R0 platform-admin audit finding F1): tenant membership alone
+	// used to be sufficient here, which meant every account in the
+	// exampletenant tenant — including non-admin service accounts —
+	// implicitly got every platform:* permission. Require the platform-plane
+	// role too; a bare tenant match no longer bypasses SpiceDB.
+	//
+	// OPS_STRICT_PLATFORM_ROLES: platformPlaneRoleOK swaps the legacy tenant
+	// role (platform_admin / iam_admin) for the live iam_platform_roles
+	// verdict; with the flag off it is exactly the old role check.
+	if user.IsPlatformAdmin && user.TenantID.String() == models.HexxlockInternalTenantID &&
+		platformPlaneRoleOK(user) {
 		return true
 	}
 
@@ -786,6 +864,15 @@ func (m *AuthMiddleware) RequireRole(roles ...string) gin.HandlerFunc {
 
 		hasRole := false
 		for _, required := range roles {
+			// OPS_STRICT_PLATFORM_ROLES: the platform-plane role names are
+			// decided by iam_platform_roles, not by tenant-role membership.
+			if strictPlatformRoles() && isPlatformPlaneRoleName(required) {
+				if user.PlatformAuthorityVerified {
+					hasRole = true
+					break
+				}
+				continue
+			}
 			if user.HasRole(required) {
 				hasRole = true
 				break
@@ -841,7 +928,7 @@ func (m *AuthMiddleware) OptionalAuth() gin.HandlerFunc {
 			// the RequireAuth path worked. Live repro 2026-05-24
 			// immediately after the max_age enforcement landed in
 			// falcon-id!241: dogukanturhal password+OTP login looped on
-			// every max_age=300 OIDC request from accounts.hexxlock.com
+			// every max_age=300 OIDC request from accounts.example.com
 			// because /oauth/authorize is mounted under OptionalAuth +
 			// every just-minted token was misclassified as stale.
 			//
@@ -911,8 +998,21 @@ func (m *AuthMiddleware) resolveIdpSessionCookie(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	// GetIdpSession returns nil (and deletes the record) once the absolute
+	// cap from AuthTime has passed, so an over-age cookie falls through to login.
 	data, err := m.sessionCache.GetIdpSession(c.Request.Context(), sessionID)
 	if err != nil || data == nil {
+		return
+	}
+	if !m.idpSessionStillValid(c, sessionID, data) {
+		return
+	}
+	m.slideIdpSessionCookie(c, sessionID, data)
+	// Suspended tenant: the SSO cookie must not resurrect an identity
+	// (R1-GAPS row 27). Leave the context unauthenticated; downstream
+	// RequireAuth then returns the 403 tenant_suspended via token validation
+	// or 401 when there is no bearer token at all.
+	if m.tenantSuspension != nil && m.tenantSuspension.IsSuspended(c.Request.Context(), data.TenantID) {
 		return
 	}
 	c.Set("user_id", data.UserID)
@@ -934,7 +1034,7 @@ func (m *AuthMiddleware) resolveIdpSessionCookie(c *gin.Context) {
 	// as on the legacy code path. Affected users will re-login within
 	// the 7-day session TTL and resume on the new code path.
 	c.Set("session_id", data.SessionID)
-	c.Set(CurrentUserKey, &models.CurrentUser{
+	idpUser := &models.CurrentUser{
 		ID:         data.UserID,
 		TenantID:   data.TenantID,
 		Username:   data.Username,
@@ -955,8 +1055,96 @@ func (m *AuthMiddleware) resolveIdpSessionCookie(c *gin.Context) {
 		// callers); IsPlatformAdmin is orthogonal to those role/permission
 		// grants and safe to derive from the already-trusted session tenant.
 		IsPlatformAdmin: data.TenantID.String() == models.HexxlockInternalTenantID,
-	})
+	}
+	applyStrictPlatformAuthority(c, idpUser)
+	c.Set(CurrentUserKey, idpUser)
 	c.Set(CurrentSessionKey, data.SessionID)
+}
+
+// idpSessionStillValid enforces that an SSO cookie is still backed by a live
+// login session and an eligible user. On a definitive failure it deletes the
+// SSO record and clears the cookie; on a lookup error it just refuses (fail
+// closed) and leaves the record for the next attempt.
+func (m *AuthMiddleware) idpSessionStillValid(c *gin.Context, idpID uuid.UUID, data *redispkg.IdpSessionData) bool {
+	ctx := c.Request.Context()
+	reject := func() bool {
+		_ = m.sessionCache.DeleteIdpSession(ctx, idpID)
+		SetIdpSessionCookie(c, "", -time.Second)
+		return false
+	}
+	// Records written before the row id was stored carry no session binding to
+	// verify; they cannot be proven live, so force a fresh login.
+	if data.SessionID == uuid.Nil {
+		return reject()
+	}
+	if m.sessionCache.IdpBackingKnownGood(ctx, data.SessionID) {
+		return true
+	}
+	var user *models.User
+	if m.idpUsers != nil {
+		u, err := m.idpUsers.GetByID(ctx, data.UserID)
+		if err != nil {
+			return false
+		}
+		if u == nil || !u.EligibleForTokens(time.Now()) {
+			return reject()
+		}
+		user = u
+	}
+	if m.idpSessions != nil {
+		var (
+			sess *models.Session
+			err  error
+		)
+		if user != nil && user.RealmID != uuid.Nil {
+			sess, err = m.idpSessions.GetByIDWithRealmContext(ctx, data.SessionID, user.RealmID)
+		} else {
+			sess, err = m.idpSessions.GetByID(ctx, data.SessionID)
+		}
+		if err != nil {
+			return false
+		}
+		// A missing row is not proof of an ended session (realm-scoped RLS can
+		// hide it): accept, but do not cache. Reject only on a row that is
+		// provably someone else's or was explicitly ended.
+		if sess == nil {
+			return true
+		}
+		if sess.UserID != data.UserID ||
+			(!sess.IsActive && sess.EndReason != nil && models.IsExplicitSessionEnd(*sess.EndReason)) {
+			return reject()
+		}
+	}
+	m.sessionCache.MarkIdpBackingGood(ctx, data.SessionID, idpBackingCheckTTL)
+	return true
+}
+
+// idpCookieDefaultIdle is the cookie idle window when SESSION_TTL_DEFAULT is unset.
+const idpCookieDefaultIdle = 7 * 24 * time.Hour
+
+// slideIdpSessionCookie re-issues falcon_idp_session with a fresh Max-Age so
+// the browser cookie slides together with the server-side record. Without
+// this the cookie dies at its original sign-in Max-Age even though the Redis
+// record (which slides on read) is still valid. Max-Age =
+// min(idle TTL, absolute deadline - now). The issue time is not knowable, so
+// re-issue is limited to /oauth/authorize requests (silent-SSO hops).
+func (m *AuthMiddleware) slideIdpSessionCookie(c *gin.Context, sessionID uuid.UUID, data *redispkg.IdpSessionData) {
+	if c.Request.Method != http.MethodGet || !strings.HasSuffix(c.Request.URL.Path, "/oauth/authorize") {
+		return
+	}
+	maxAge := idpCookieDefaultIdle
+	if m.config != nil && m.config.SessionTTLDefault > 0 {
+		maxAge = m.config.SessionTTLDefault
+	}
+	if deadline, ok := m.sessionCache.IdpAbsoluteDeadline(data); ok {
+		if remaining := time.Until(deadline); remaining < maxAge {
+			maxAge = remaining
+		}
+	}
+	if maxAge < time.Second {
+		return
+	}
+	SetIdpSessionCookie(c, sessionID.String(), maxAge)
 }
 
 // GetCurrentUser extracts current user from context
