@@ -215,7 +215,7 @@ Checked against the code in this repository.
 | Client authentication | PAR and the token endpoint accept a client secret (Basic or form) or `tls_client_auth` read from a forwarded client-certificate header. `private_key_jwt` is not implemented. PKCE is optional for confidential clients. |
 | Certificate-bound access tokens (RFC 8705) | Not wired. Discovery says so. |
 | Not implemented | JARM, dynamic client registration, and the device authorization grant (a service exists but `/oauth/token` does not route to it). |
-| SpiceDB | Required in practice. The authorization engine treats it as the sole decision source and fails closed without it. A log line about "RBAC/ABAC fallback" when `SPICEDB_ENABLED=false` is out of date. |
+| SpiceDB | Required in practice. It is the only source for relationship (ReBAC) checks; there is no local fallback, and those checks fail closed when SpiceDB is unavailable. OPA rules (ABAC) and per-tenant roles are evaluated in addition to it, not instead of it. A log line about "RBAC/ABAC fallback" when `SPICEDB_ENABLED=false` is out of date. |
 | Placeholders | 100 `TODO` lines in 15 non-test Go files (outside `third_party/`). `internal/handlers/stub_handlers.go` holds 145 handler functions, most returning an empty 200 for platform-admin screens (storage, billing, network, compute, quotas, Cloudflare DNS). 23 places return 501 via `StatusNotImplemented`, including parts of `application_handler.go` and tenant transfer. Tenant onboarding does not yet seed default roles or send the welcome email. |
 
 ## Architecture
