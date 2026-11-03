@@ -77,8 +77,10 @@ func (p *PlatformAuthority) AdminClaim(ctx context.Context, userID, tenantID uui
 
 // VerifyAdmin is the strict-mode live check used by the request middleware:
 // does the principal hold platform_admin RIGHT NOW. Only call it when
-// Strict() is true. The break-glass account must additionally still hold its
-// standing legacy tenant role (legacyRoleHeld).
+// Strict() is true. The break-glass account is admin if it still holds its
+// standing legacy tenant role (legacyRoleHeld, only known on bearer-token
+// paths) OR a standing platform_admin row in iam_platform_roles (the IdP SSO
+// cookie path carries no roles). Never granted by email alone.
 func (p *PlatformAuthority) VerifyAdmin(ctx context.Context, userID, tenantID uuid.UUID, email string, legacyRoleHeld bool) bool {
 	if !p.Strict() {
 		return false
@@ -87,9 +89,24 @@ func (p *PlatformAuthority) VerifyAdmin(ctx context.Context, userID, tenantID uu
 		return false
 	}
 	if p.IsBreakGlassAccount(email) {
-		return legacyRoleHeld
+		// Standing grant: the break-glass row has no JIT elevation, so
+		// ActiveRoles (JIT/viewer only) never reports it.
+		standing, err := p.HoldsStandingBreakGlassAdmin(ctx, userID, email)
+		if err != nil {
+			logger.Log.Warn("platform authority: standing lookup failed (fail-closed)",
+				zap.String("user_id", userID.String()), zap.Error(err))
+		}
+		ok := legacyRoleHeld || standing
+		logger.Log.Debug("platform authority: verify admin",
+			zap.String("branch", "break_glass"), zap.Bool("legacy_role", legacyRoleHeld),
+			zap.Bool("standing_grant", standing), zap.Bool("allowed", ok))
+		return ok
 	}
-	return p.rolesContainAdmin(ctx, userID)
+	ok := p.rolesContainAdmin(ctx, userID)
+	logger.Log.Debug("platform authority: verify admin",
+		zap.String("branch", "jit"), zap.Bool("break_glass_configured", p != nil && p.breakGlassEmail != ""),
+		zap.Bool("allowed", ok))
+	return ok
 }
 
 func (p *PlatformAuthority) holdsAdmin(ctx context.Context, userID, tenantID uuid.UUID, email string) bool {
