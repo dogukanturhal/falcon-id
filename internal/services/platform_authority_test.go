@@ -122,3 +122,39 @@ func TestPlatformAuthority_StandingAdminOnlyForBreakGlass(t *testing.T) {
 		t.Error("store failure must surface (fail-closed)")
 	}
 }
+
+func TestPlatformAuthority_VerifyAdminBreakGlassTableGrant(t *testing.T) {
+	internal := uuid.MustParse(models.HexxlockInternalTenantID)
+	ctx := context.Background()
+	// Mirrors the real store: a standing row is NOT in ActiveRoles (no JIT
+	// elevation); only HasStandingRole sees it.
+	standing := fakeAuthorityStore{standing: []string{string(models.PlatformRoleAdmin)}}
+	jit := fakeAuthorityStore{roles: []string{string(models.PlatformRoleAdmin)}}
+	admin := jit
+	bg := "root@example.com"
+
+	// Cookie path: no legacy role in the token, standing grant -> allowed.
+	if !NewPlatformAuthority(true, bg, standing).VerifyAdmin(ctx, uuid.New(), internal, bg, false) {
+		t.Error("break-glass + table grant, no legacy role must be allowed")
+	}
+	// No legacy role and no grant -> denied (never by email alone).
+	if NewPlatformAuthority(true, bg, fakeAuthorityStore{}).VerifyAdmin(ctx, uuid.New(), internal, bg, false) {
+		t.Error("break-glass without legacy role or grant must be denied")
+	}
+	// Standing row for a non-break-glass account grants nothing.
+	if NewPlatformAuthority(true, bg, standing).VerifyAdmin(ctx, uuid.New(), internal, "other@example.com", false) {
+		t.Error("non-break-glass standing row must not grant admin")
+	}
+	// Non-break-glass: JIT grant still works, legacy role alone does not.
+	pa := NewPlatformAuthority(true, bg, admin)
+	if !pa.VerifyAdmin(ctx, uuid.New(), internal, "other@example.com", false) {
+		t.Error("non-break-glass with grant must be allowed")
+	}
+	if NewPlatformAuthority(true, bg, fakeAuthorityStore{}).VerifyAdmin(ctx, uuid.New(), internal, "other@example.com", true) {
+		t.Error("non-break-glass with legacy role only must be denied")
+	}
+	// Wrong tenant -> denied even with grant.
+	if NewPlatformAuthority(true, bg, standing).VerifyAdmin(ctx, uuid.New(), uuid.New(), bg, true) {
+		t.Error("wrong tenant must be denied")
+	}
+}
