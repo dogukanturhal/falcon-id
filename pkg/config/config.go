@@ -225,6 +225,11 @@ type Config struct {
 
 	// Frontend URL for verification links
 	FrontendURL string `mapstructure:"FRONTEND_URL"`
+	// PasswordResetURLBase is the origin the password-reset email link points
+	// at (<base>/login/reset-password?token=...). The reset page is served by
+	// the hosted login on the IdP host, which is not necessarily where
+	// FRONTEND_URL points. Empty falls back to FrontendURL.
+	PasswordResetURLBase string `mapstructure:"PASSWORD_RESET_URL_BASE"`
 	// ConsumerEmailDomain is the email domain provisioned for PERSONAL
 	// accounts (like Gmail's gmail.com) — a personal signup picks a username
 	// and gets <username>@<ConsumerEmailDomain>. Authoritative server-side so
@@ -1098,6 +1103,7 @@ func LoadConfig() (*Config, error) {
 
 	// Frontend
 	config.FrontendURL = viper.GetString("FRONTEND_URL")
+	config.PasswordResetURLBase = viper.GetString("PASSWORD_RESET_URL_BASE")
 	config.ConsumerEmailDomain = viper.GetString("CONSUMER_EMAIL_DOMAIN")
 	if config.ConsumerEmailDomain == "" {
 		config.ConsumerEmailDomain = "downstream.com"

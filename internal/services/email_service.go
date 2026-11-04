@@ -484,11 +484,16 @@ func (s *EmailService) SendMFACode(tenantID uuid.UUID, to, code, username string
 func (s *EmailService) SendPasswordReset(tenantID uuid.UUID, to, token, username string) error {
 	subject := "Reset Your Password - HexxLock"
 
-	// Use frontend URL from config
-	frontendURL := s.config.FrontendURL
+	// The reset page lives on the hosted login (IdP host); PASSWORD_RESET_URL_BASE
+	// overrides FRONTEND_URL for this link only.
+	frontendURL := s.config.PasswordResetURLBase
+	if frontendURL == "" {
+		frontendURL = s.config.FrontendURL
+	}
 	if frontendURL == "" {
 		frontendURL = defaultFrontendURL
 	}
+	frontendURL = strings.TrimRight(frontendURL, "/")
 	resetLink := fmt.Sprintf("%s/login/reset-password?token=%s", frontendURL, token)
 
 	body := fmt.Sprintf(`
